@@ -1,0 +1,275 @@
+# Entity Cloud // WebGPU
+
+Volumetric clouds and a weather system in WebGPU. Storm cells grow, drift with the wind, rain or snow,
+flash with lightning and decay. Their precipitation shafts hang below the cloud base and stay visible
+from far away: slanted by the wind, streaky, evaporating as virga, and lit from behind when the sun
+gets under the storm.
+
+Everything is in one static file, `index.html`: the engine classes, the WGSL, and the scenario as
+data. Open it in a WebGPU browser (Chrome/Edge 113+, or Brave with WebGPU enabled), straight from
+disk or served over HTTP:
+
+```bash
+python -m http.server 8769
+```
+
+Drop another scenario `.json` on the page to load it.
+
+## Cloud types
+
+The scenario includes the cloud types described in
+[Climavision's cloud guide](https://climavision.com/blog/the-mysteries-of-clouds-types-formation-and-weather-predictions/):
+
+| Cloud | Level | How it is made | Shown in |
+|---|---|---|---|
+| **Cumulus** | low | the convective layer: Perlin-Worley puffs with flat bases, cut by the weather map's coverage | fair cumulus, showers |
+| **Stratus** | low | `sheet` genus layer: flat and featureless, drizzles where it is thick | stratus deck, overcast rain |
+| **Altocumulus** | mid | `cellular` genus layer: separate Worley puffs, stretched across the wind into rows | mackerel sky, fair cumulus |
+| **Altostratus** | mid | thin `sheet` genus layer: a grey veil that the sun shows through | warm front, thunderstorm |
+| **Nimbostratus** | low to mid | thick, dark `sheet` genus layer with steady rain or snow | overcast rain, warm front |
+| **Cirrus** | high | streaky sheet above the slab, stretched along the wind | clear, warm front |
+| **Cumulonimbus** | all levels | `storm` cells: towers that narrow upwards, with an anvil spreading downwind | showers, thunderstorm |
+| **Shelf cloud** | low | analytic (`shelfLineDensity`): stacked laminar tiers along a `squall` line's bowed gust front. Each tier is lowest at its rounded lip, has a flat dark underside and a sunlit top sloping up into the storm base. Single storms can also get a small one with `shelf` | Shelf cloud view (at dusk, light under the shelf) |
+| **Mothership (supercell)** | all levels | analytic (`mothershipDensity`): a slowly spinning helix of plates around the `supercell` updraft. The plates have rounded lips, sunlit tops and dark undersides, and a wall cloud hangs under the stack. Inside the stack it replaces the noise cloud; the tower and anvil continue above it | Mothership view |
+| **Green clouds** | — | not a cloud type: `green` tints the light under a heavy storm core | the hero supercell |
+
+## How it works
+
+Each frame runs these passes. All distances are metres and heights are above sea level.
+
+1. **Weather maps** (`WGSL_WEATHER`, `WeatherPass`): a 512² map, 128 km across, that follows the
+   camera and snaps to its texels. Each texel holds four values:
+   - cloud coverage
+   - cloud top
+   - precipitation
+   - virga (how much of the precipitation evaporates before it reaches the ground)
+
+   The layer's coverage is large-scale noise advected by the wind. Every live storm cell then adds a
+   noisy disc of coverage and a domed top. It also adds a precipitation core, which sits on the
+   forward flank by default. The same pass writes three more maps:
+   - **anvil + shelf**: anvil coverage and altitude, spread downwind of tall cells; shelf coverage and
+     the wedge position along the gust front
+   - **layers**: the coverage of each cloud genus, which drift with the wind
+   - **style**: supercell plates, green tint, and how far the wall cloud lowers
+2. **Cloud shadow map** (`WGSL_SHADOW`): 384² texels.
+   - Sun transmittance is marched up through the cloud slab from the cloud base plane.
+   - Sky occlusion is integrated over the cloud column above each texel.
+
+   Terrain, precipitation and haze sample it, so cloud shadows sweep across the ground and sunlit gaps
+   cut crepuscular rays.
+3. **Ground state** (`WGSL_GROUND`, `GroundPass`): 256² texels of snow cover and wetness. Snow
+   builds up where precipitation reaches the ground below freezing (lapse rate 6.5 °C/km). Rain wets
+   the ground. Snow melts and the ground dries afterwards.
+4. **Scene** (`WGSL_SCENE`): the sky, then the terrain.
+   - The terrain mesh is a geometric grid: linear over the heightfield, then rings growing out to
+     260 km.
+   - Ground shading: section-line farm fields, centre-pivot circles, towns, forests, rivers and lakes,
+     and mountains with rock above the tree line.
+   - It is lit with cloud shadows, snow, wet darkening and reflections, and lightning.
+5. **Volumetrics** (`WGSL_MARCH`, `CloudPass`): a compute ray march at reduced resolution. Steps are
+   spaced quadratically (dense near the camera), with a jittered start. Each step integrates three
+   media, energy-conserving:
+   - **Clouds** (`cloudSample`): the convective layer and storms, shelf clouds, and up to four genus
+     layers, summed at each sample. Each genus has its own ambient-light scale, so nimbostratus is dark
+     and altostratus is pale.
+     - **Shape**: a baked 128³ Perlin-Worley shape volume, cut by coverage.
+     - **Detail**: a 32³ Worley volume erodes edges: wispy at the base, billowy at the top.
+     - **Vertical profile**: flat bases, rounded tops, an anvil band, and wind shear that leans the
+       towers.
+     - **Light**: a short march toward the sun, three multiple-scattering octaves (Wrenninge), and
+       ambient light that darkens under tall towers.
+   - **Rain and snow**: precipitation below the cloud base.
+     - **Slant**: each sample reads the weather where its precipitation left the cloud base, upwind
+       by `wind · drop · slant`, so the shafts slant.
+     - **Streaks**: falling curtains of stretched 3D noise.
+     - **Virga**: the shaft fades out above the ground.
+     - **Rain or snow**: rain below the freezing level and snow above it, each with its own extinction
+       and phase. Rain scatters strongly forward, so backlit shafts glow.
+   - **Haze**: height fog that is shadowed by the cloud map, and tends to the horizon sky colour far
+     away. Analytic haze covers the terrain beyond the march.
+   - **Cirrus**: a streaky sheet above the slab.
+
+   A **temporal resolve** reprojects the history using the transmittance-weighted depth, clips it to
+   the variance of the 3 × 3 neighbourhood, and blends.
+6. **Final** (`WGSL_FINAL`):
+   - Composite and ACES tonemap.
+   - Near-field rain streaks and snowflakes in a box that wraps around the camera. Their amount comes
+     from a one-texel GPU readback of the weather map above the camera.
+   - Lightning bolts.
+   - A weather radar inset. Rain shows in green, yellow and red, snow in blues, and virga aloft in
+     grey-blue.
+
+The sky and sun colours come from the sun elevation, using Kasten-Young air mass through Rayleigh
+and Mie extinction. They turn greyer and darker with cloud coverage.
+
+## Performance and LOD
+
+The HUD's `gpu` line shows the GPU time of each pass. It uses timestamp queries (`GpuProfiler`) when the adapter
+offers them.
+
+- **Checkerboard march** (low, medium and high quality): each frame marches half the volumetric pixels, alternating
+  between frames. The resolve rebuilds the other half by reprojecting the history, clamped to the four neighbours
+  marched this frame. This halves the march cost.
+- **Distance LOD**: `cloudSample(p, w, lod, feat)` has three levels:
+  - lod 0, within the preset's `detail` distance: detail-noise erosion, grooves, striations and scud
+  - lod 1, up to 2.5 × that distance: no erosion
+  - lod 2, beyond that, and always for light marches and the shadow map: shape only
+
+  Light marches take fewer, longer steps with distance.
+- **Step-count LOD**: short segments, such as rays looking down at nearby ground, get fewer march steps (at least
+  24).
+- **Empty space**: after two cloud-free samples, clouds are evaluated only every other step until one is hit.
+  Nothing is sampled below the lowest cloud or above the highest cloud top of this frame.
+- **Culling**:
+  - Each ray tests the bounding boxes of the motherships and shelf lines once, and only evaluates those it can meet.
+  - Shelf lines reject points against the line's chord before the curve solve.
+  - The anvil and style maps are only read at heights and places where those clouds can exist.
+  - The weather map skips storm cells beyond their reach, and skips each cell's noise where it cannot matter.
+- **Time slicing**: the cloud shadow map refreshes a quarter of its rows per frame. It refreshes fully when the map
+  moves, the sun moves, or the weather changes.
+
+On the test machine (Brave, about 1925 × 925 pixels), GPU time per frame dropped from 11–13 ms to 4–6 ms at medium,
+and from 25–28 ms to 10–12 ms at high.
+
+## Controls
+
+| Key | Action |
+|---|---|
+| drag / WASD / Space, C | look / move / up, down |
+| Shift, Alt, wheel | ×5, ×0.2, speed |
+| right click (or Ctrl + click) | grow a storm cell where the cursor meets the ground |
+| 1–9 | weather states: clear, fair cumulus, mackerel sky, warm front, stratus deck, showers, thunderstorm, snow squalls, overcast rain (they blend over `transition` seconds). A 10th, severe storms, is reached by auto-cycle and by the shelf and mothership views |
+| 0 | auto-cycle the weather states |
+| K | lightning from the nearest raining cell |
+| , . | weather time scale (×1 … ×160) |
+| T, arrows | next lighting preset; move the sun (azimuth, elevation) |
+| R | radar inset |
+| M | render mode: shaded, no volumetrics, clouds only, precipitation only |
+| Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, checkerboard, detail distance) |
+| V, L, P, H | next view, labels, pause weather, help |
+
+### Analytic storm structures
+
+Shelf lines and motherships are shapes, not noise. Entities report them through a `features(out)` hook (`out.ms`,
+`out.shelves`), and the frame uniform carries up to 4 motherships and 2 shelf lines (`ms`, `shelves`, `features`).
+The march, the light march and the shadow map evaluate them like any other cloud, so they cast shadows and are lit
+the same way. Their tops get more sky light than their undersides, which is what makes the plates and tiers read.
+
+## Scenario (`<script id="scenario">`)
+
+| Key | Contents |
+|---|---|
+| `terrain` | `size` (m), `resolution`, `base` height, `fieldSize` (m, farm sections), `pivots` (chance of a centre-pivot circle per section) |
+| `render` | `quality` (0–3), `shapeScale` / `detailScale` (m per noise tile), `detailStrength`, `maxTop` (top of the cloud slab), `maxDistance`, `weatherSize` (m), `rainExtinction` / `snowExtinction` (1/m at full intensity), `slant` (s/m), `fallSpeed` (streak scroll, m/s), `timeScale`, `particles` |
+| `clouds` | up to 4 cloud genus layers (below) |
+| `weather` | `start`, `transition` (s), `cycle` { `enabled`, `hold` }, `states` { name: state } |
+| `entities` | `{ type, id, label, ... }`, where `type` maps to a class in `ENTITY_TYPES` (below), applied in order |
+| `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure` } } |
+| `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity; optional `lighting` (preset) and `weather` (state) |
+
+Positions are metres: `[x, z]` on the map, with x east, z south, and the map centred on 0.
+
+### Cloud genus layer (`clouds`)
+
+| Key | Meaning |
+|---|---|
+| `name` | the key that weather states use in `layers` |
+| `kind` | `heap` (puffy), `sheet` (flat, featureless) or `cellular` (separate puffs) |
+| `base`, `top` | m above sea level |
+| `density` | extinction (1/m) |
+| `mapScale` | size of the coverage patches (m) |
+| `shapeScale` | noise tile (m) |
+| `stretch` | along the wind; < 1 makes rolls across it |
+| `erosion` | detail erosion of the edges |
+| `ambient` | light scale, < 1 is darker |
+| `precip` | drizzle at full coverage |
+
+The weather map writes each genus's coverage into one channel of a layer map (`layerTex`).
+
+### Weather state
+
+| Key | Meaning |
+|---|---|
+| `coverage` | cumulus (convective layer) coverage, 0–1 |
+| `base`, `top` | cumulus base and top (m) |
+| `layers` | `{ genus: coverage }` for the `clouds` genera; blended between states like everything else |
+| `density` | cloud extinction (1/m) |
+| `cirrus` | cirrus sheet coverage |
+| `wind` | `[x, z]` m/s. It advects the clouds, moves the cells, slants the shafts and blows the near-field rain and snow |
+| `temperature` | °C at sea level. It sets the freezing level and whether precipitation falls as rain, sleet or snow |
+| `haze` | aerosol amount |
+| `drizzle` | precipitation from the layer itself, where it is thick |
+| `storms` | multiplier on the spawners' rate |
+| `power` | multiplier on storm precipitation |
+| `lightning` | multiplier on flash rates |
+
+### Entity types
+
+| Type | Kind | Parameters |
+|---|---|---|
+| `tilt` | terrain | `dir` (downhill), `drop` (m across the map) |
+| `hills` | terrain | fractal noise: `amplitude`, `scale`, `octaves`, `seed`, `ridged` |
+| `mountain` | terrain | `pos`, `radius`, `height`, `roughness` |
+| `range` | terrain | ridged massif along `path`: `width`, `height`, `roughness`, `seed` |
+| `river` | terrain | carves and paints water along `path`: `width`, `depth`, `bank` |
+| `lake` | terrain | `pos`, `radius`, water `level` |
+| `town` | terrain | `pos`, `radius`, `density` (street blocks) |
+| `forest` | terrain | `pos`, `radius`, `density`, `seed` |
+| `storm` | weather | storm cell, below |
+| `supercell` | weather | a storm with a mothership plate stack: `stackRadius` (× radius), `stackDrop` / `stackHeight` (m below / above the cloud base), `plates`, `twist` (plates climbed per turn), `spin` (rad/s), `wallCloud` (m), `wallRadius` (× stack radius) |
+| `squall` | weather | a line of `count` storms from `from` to `to`, carried by the wind (`drift`, `velocity`); it starts over after `travel` m. Also takes `radius`, `top`, `precip`, `lightning`, `green`. Its shelf cloud runs along the gust front, `gap` × radius ahead of the cells and bowed out by `bow` m: `shelf` (strength), `lip` (m above ground), `shelfDepth`, `tiers` |
+| `spawner` | weather | spawns storm cells inside `area` [x0, z0, x1, z1]. `rate` (cells per weather hour, × the state's `storms`), `max`, `initial`, `seed`. `template` gives a `[min, max]` range per storm parameter (`radius`, `top`, `precip`, `core`, `grow`, `mature`, `decay`, `lightning`, `virga`, `drift`) |
+
+A `storm` cell has these parameters:
+
+- `pos`, `radius`, `top` (m)
+- `precip` (0–1)
+- `core` (precipitation core as a fraction of the radius), and `coreOffset` [x, z] (m; default: the
+  downwind flank)
+- `life` [grow, mature, decay] in weather seconds
+- `lightning` (flashes per minute while mature)
+- `virga` (0 reaches the ground, 1 evaporates at the base)
+- `drift` (× wind) and `velocity` [x, z]
+- `pinned` (stays in place and mature), `hold` (only stays mature)
+- `shelf` (0–1, shelf cloud on the gust front)
+- `laminar` (0–1, mothership plates)
+- `green` (0–1, green tint under the core)
+- `wallCloud` (m the base lowers under the updraft)
+
+The cell moves through its life like this:
+
+- **Growth**: the cell grows, and its top rises.
+- **Maturity**: precipitation starts.
+- **Decay**: coverage fades, the anvil lingers, and precipitation turns to virga.
+
+### Adding a new kind of entity
+
+1. Subclass `Entity` and override the hooks it needs:
+   - `stamp(field)`: shape `field.h` and paint land use with `field.paint(idx, channel, value)`, where
+     the channel is 0 town, 1 forest or 2 water.
+   - `spawn()`: register with the world. `world.add(def)` creates more entities at runtime.
+   - `update(dt, wdt, t)`: per frame. `dt` is real seconds and `wdt` is weather seconds. Set `dead` to
+     remove the entity.
+   - `cell()`: return `{ x, z, radius, top, coverage, precip, seed, virga, core, offset }` to put a
+     storm cell into the weather map, or `null`.
+2. Register it in `ENTITY_TYPES` and add it to the scenario's `entities`.
+
+## Layout (sections of the script in `index.html`)
+
+```
+config, math, noise                        constants, vectors / matrices, half floats, value noise, polylines
+Heightfield                                CPU terrain + land use: authoring, sampling, packing, raycast
+FRAME_LAYOUT, FrameBlock, WORLD_BINDINGS,   uniform block and bindings shared by JS and WGSL (the WGSL
+BindingSet                                 struct and declarations are generated from the same lists)
+WGSL_MATH / SKY / WEATHER_SAMPLE /         shared WGSL pieces, composed per pass
+DENSITY / SHADOW_SAMPLE
+WGSL_NOISE, WGSL_WEATHER, WGSL_SHADOW,     compute: noise volumes, weather + anvil maps, shadow map, ground state
+WGSL_GROUND
+WGSL_MARCH, WGSL_RESOLVE                   compute: volumetric march, temporal resolve
+WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
+Entity, ENTITY_TYPES                       terrain features, StormCell, Supercell, SquallLine, Spawner
+WeatherSystem, CloudLayers, Sky,           data-driven weather (states blend every value, including genus
+Lightning, World                           coverage), cloud genus layers, sky colours, lightning, world
+NoiseVolumes, WeatherPass, GroundPass, CloudPass, GpuProfiler, Renderer
+Input, FlyCamera, Hud, App, main
+```

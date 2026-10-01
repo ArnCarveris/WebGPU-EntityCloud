@@ -1,0 +1,3287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Entity Cloud</title>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #030507;
+            --panel: rgba(6, 12, 16, 0.78);
+            --line: rgba(110, 220, 255, 0.28);
+            --accent: #6edcff;
+            --ok: #62f08a;
+            --warn: #ffc94a;
+            --danger: #ff4a3d;
+            --text: #d6e6ee;
+            --muted: #7d95a3;
+        }
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            height: 100%;
+            overflow: hidden;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Rajdhani', sans-serif;
+            user-select: none;
+        }
+        canvas#view { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+        canvas#view.drag { cursor: grabbing; }
+        canvas#labels { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; }
+        .panel {
+            position: fixed;
+            background: var(--panel);
+            border: 1px solid var(--line);
+            padding: 8px 10px;
+            font-family: 'Share Tech Mono', monospace;
+            font-size: 12px;
+            line-height: 1.35;
+            pointer-events: none;
+        }
+        #hud { top: 12px; left: 12px; min-width: 340px; max-width: calc(100vw - 24px); white-space: pre; overflow: hidden; }
+        #hud .t { color: var(--accent); letter-spacing: 0.12em; }
+        #hud .on { color: var(--ok); }
+        #hud .off { color: var(--danger); }
+        #hud .w { color: var(--warn); }
+        #hud .m { color: var(--muted); }
+        #hud .snow { color: #cfe6ff; }
+        #help { bottom: 12px; left: 12px; white-space: pre; color: var(--muted); }
+        #help b { color: var(--text); font-weight: normal; }
+        #states { bottom: 12px; right: 12px; white-space: pre; color: var(--muted); }
+        #states b { color: var(--accent); font-weight: normal; }
+        #states .sel { color: var(--warn); }
+        #toast { top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--warn); font-size: 16px; display: none; text-align: center; }
+        #fallback { display: none; position: fixed; inset: 0; z-index: 50; align-items: center; justify-content: center; background: var(--bg); padding: 16px; }
+        #fallback.show { display: flex; }
+        .card { max-width: 480px; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--danger); padding: 14px 16px; }
+        .tag { font-family: 'Share Tech Mono', monospace; font-size: 11px; letter-spacing: 0.12em; color: var(--danger); }
+        h1 { margin: 4px 0 2px; font-size: 24px; letter-spacing: 0.04em; text-transform: uppercase; }
+        .desc { margin: 0 0 12px; font-size: 14px; color: var(--muted); }
+        #fallback pre { white-space: pre-wrap; font-family: 'Share Tech Mono', monospace; font-size: 12px; color: var(--danger); background: rgba(0,0,0,0.4); padding: 10px; margin: 10px 0 0; max-height: 40vh; overflow: auto; }
+        @media (max-width: 700px) { #help, #states { display: none; } #hud { font-size: 10px; min-width: 0; } }
+    </style>
+</head>
+<body>
+    <canvas id="view"></canvas>
+    <canvas id="labels"></canvas>
+    <div id="hud" class="panel"></div>
+    <div id="help" class="panel"></div>
+    <div id="states" class="panel"></div>
+    <div id="toast" class="panel"></div>
+    <div id="fallback">
+        <div class="card">
+            <div class="tag">SYSTEM FAULT</div>
+            <h1>WebGPU unavailable</h1>
+            <p class="desc">This demo needs WebGPU (Chrome/Edge 113+, or Brave with WebGPU enabled in brave://flags).</p>
+            <pre id="error-message">navigator.gpu is undefined</pre>
+        </div>
+    </div>
+
+<!--
+  Scenario: the whole world as data. Positions are metres, [x, z] on the map (x east, z south, map centred on 0); heights are
+  metres above sea level.
+    terrain   size (m), resolution (cells per side), base height, fieldSize (m, farm sections), pivots (chance of a centre-pivot circle)
+    render    quality (0-3), shapeScale / detailScale (m per noise tile), detailStrength, maxTop (m, top of the cloud slab),
+              maxDistance (m), weatherSize (m, weather map around the camera), rainExtinction / snowExtinction (1/m at full intensity),
+              slant (how far the wind blows falling precipitation), fallSpeed (m/s, streak scroll), timeScale (weather s per real s),
+              particles (near-field rain drops / snow flakes)
+    clouds    cloud genus layers besides cumulus (max 4): { name, kind (heap | sheet | cellular), base, top (m), density (1/m),
+              mapScale (m, coverage patches), shapeScale (m), stretch (along the wind; < 1 makes rolls across it), erosion,
+              ambient (light scale, < 1 darker), precip (drizzle at full coverage) }
+    weather   start, transition (s), cycle { enabled, hold (s) }, states { name: { coverage (cumulus), base, top, density, cirrus,
+              layers { genus: coverage }, wind [x, z] m/s, temperature (C at sea level), haze, drizzle, storms (spawn rate x),
+              power (storm precipitation x), lightning (x) } }
+    entities  { type, id, label, ... }, type in ENTITY_TYPES, applied in order:
+              terrain  tilt { dir, drop } | hills { amplitude, scale, octaves, seed, ridged } | mountain { pos, radius, height, roughness }
+                       range { path, width, height, roughness, seed } | river { path, width, depth, bank } | lake { pos, radius, level }
+                       town { pos, radius, density } | forest { pos, radius, density, seed }
+              weather  storm { pos, radius, top, precip, core, coreOffset, life [grow, mature, decay] s, lightning (per min), virga, drift,
+                               velocity, pinned, hold, shelf, laminar, green, wallCloud }
+                       supercell { ...storm, mothership plate stack: stackRadius, stackDrop, stackHeight, plates, twist, spin (rad/s),
+                                   wallCloud (m), wallRadius }
+                       squall { from, to, count, radius, top, precip, lightning, green, drift, velocity, travel (m),
+                                shelf cloud along the gust front: shelf (strength), lip (m above ground), shelfDepth, tiers, bow, gap }
+                       spawner { area [x0, z0, x1, z1], rate (cells per weather hour), max, initial, seed, template { key: [min, max] } }
+    lighting  start, presets { name: { azimuth, elevation, intensity, exposure } }
+    views     { name, pos [x, y, z], look [x, y, z] } or { name, follow (entity id), offset [x, height above ground, z], lookOffset };
+              optional lighting (preset name) and weather (state name)
+-->
+<script type="application/json" id="scenario">
+{
+    "name": "High Plains",
+    "terrain": { "size": 64000, "resolution": 512, "base": 1500, "fieldSize": 805, "pivots": 0.22 },
+    "render": {
+        "quality": 1, "shapeScale": 8000, "detailScale": 1400, "detailStrength": 0.5, "maxTop": 12500,
+        "maxDistance": 60000, "weatherSize": 128000, "rainExtinction": 0.0024, "snowExtinction": 0.0036,
+        "slant": 0.05, "fallSpeed": 40, "timeScale": 20, "particles": 24000
+    },
+
+    "clouds": [
+        { "name": "stratus",      "kind": "sheet",    "base": 1750, "top": 2300, "density": 0.03,  "mapScale": 26000, "shapeScale": 9000,
+          "stretch": 2.5, "erosion": 0.15, "ambient": 0.75, "precip": 0.12 },
+        { "name": "nimbostratus", "kind": "sheet",    "base": 2100, "top": 5600, "density": 0.02,  "mapScale": 40000, "shapeScale": 12000,
+          "stretch": 2,   "erosion": 0.2,  "ambient": 0.45, "precip": 0.55 },
+        { "name": "altostratus",  "kind": "sheet",    "base": 5800, "top": 6900, "density": 0.004, "mapScale": 50000, "shapeScale": 14000,
+          "stretch": 4,   "erosion": 0.1,  "ambient": 0.9,  "precip": 0 },
+        { "name": "altocumulus",  "kind": "cellular", "base": 5200, "top": 5750, "density": 0.035, "mapScale": 18000, "shapeScale": 5000,
+          "stretch": 0.45, "erosion": 0.35, "ambient": 1.0, "precip": 0 }
+    ],
+
+    "weather": {
+        "start": "showers",
+        "transition": 12,
+        "cycle": { "enabled": false, "hold": 45 },
+        "states": {
+            "clear":         { "coverage": 0.04, "base": 3600, "top": 4300, "density": 0.06, "cirrus": 0.4, "wind": [6, -2],
+                               "temperature": 24, "haze": 0.6, "drizzle": 0, "storms": 0, "power": 1, "lightning": 0 },
+            "fair cumulus":  { "coverage": 0.36, "base": 3800, "top": 5200, "density": 0.07, "cirrus": 0.15, "wind": [8, -3],
+                               "layers": { "altocumulus": 0.1 },
+                               "temperature": 24, "haze": 0.8, "drizzle": 0, "storms": 0.2, "power": 0.5, "lightning": 0 },
+            "mackerel sky":  { "coverage": 0.1, "base": 3800, "top": 4800, "density": 0.06, "cirrus": 0.5, "wind": [10, -2],
+                               "layers": { "altocumulus": 0.75 },
+                               "temperature": 20, "haze": 0.7, "drizzle": 0, "storms": 0, "power": 0.5, "lightning": 0 },
+            "warm front":    { "coverage": 0.08, "base": 3400, "top": 4400, "density": 0.06, "cirrus": 0.75, "wind": [11, 3],
+                               "layers": { "altostratus": 0.85, "altocumulus": 0.2, "nimbostratus": 0.2 },
+                               "temperature": 15, "haze": 1.2, "drizzle": 0, "storms": 0.1, "power": 0.6, "lightning": 0 },
+            "stratus deck":  { "coverage": 0.04, "base": 2600, "top": 3400, "density": 0.06, "cirrus": 0, "wind": [4, 2],
+                               "layers": { "stratus": 0.95 },
+                               "temperature": 12, "haze": 1.8, "drizzle": 0, "storms": 0, "power": 0.5, "lightning": 0 },
+            "showers":       { "coverage": 0.30, "base": 4100, "top": 6000, "density": 0.08, "cirrus": 0.25, "wind": [9, -4],
+                               "layers": { "altocumulus": 0.15 },
+                               "temperature": 22, "haze": 1.0, "drizzle": 0, "storms": 1, "power": 1, "lightning": 0.4 },
+            "thunderstorm":  { "coverage": 0.48, "base": 3700, "top": 6200, "density": 0.09, "cirrus": 0.5, "wind": [12, -5],
+                               "layers": { "altostratus": 0.2 },
+                               "temperature": 24, "haze": 1.2, "drizzle": 0, "storms": 2.2, "power": 1.4, "lightning": 1.6 },
+            "snow squalls":  { "coverage": 0.5, "base": 2700, "top": 4800, "density": 0.08, "cirrus": 0.1, "wind": [14, 4],
+                               "layers": { "stratus": 0.3, "altostratus": 0.4 },
+                               "temperature": 4, "haze": 0.9, "drizzle": 0.12, "storms": 1.6, "power": 1.1, "lightning": 0 },
+            "overcast rain": { "coverage": 0.25, "base": 2500, "top": 4300, "density": 0.06, "cirrus": 0, "wind": [7, -6],
+                               "layers": { "nimbostratus": 0.95, "stratus": 0.45 },
+                               "temperature": 16, "haze": 1.6, "drizzle": 0.2, "storms": 0.3, "power": 0.8, "lightning": 0.1 },
+            "severe storms": { "coverage": 0.5, "base": 3600, "top": 6200, "density": 0.09, "cirrus": 0.2, "wind": [12, -4],
+                               "layers": { "altostratus": 0.75 },
+                               "temperature": 25, "haze": 0.7, "drizzle": 0, "storms": 1.5, "power": 1.4, "lightning": 2 }
+        }
+    },
+
+    "entities": [
+        { "type": "tilt", "dir": [1, 0], "drop": 260 },
+        { "type": "hills", "amplitude": 60, "scale": 9000, "octaves": 5, "seed": 7 },
+        { "type": "hills", "amplitude": 14, "scale": 1400, "octaves": 3, "seed": 21, "ridged": true },
+        { "type": "range", "id": "front-range", "label": "Front Range", "labelPos": [-27000, -4000],
+          "path": [[-30000, -34000], [-27500, -16000], [-28500, 0], [-26500, 14000], [-29000, 34000]],
+          "width": 9000, "height": 2500, "roughness": 0.6, "seed": 4 },
+        { "type": "mountain", "label": "Longs Peak", "pos": [-28500, -9000], "radius": 4500, "height": 900, "roughness": 0.5 },
+        { "type": "mountain", "pos": [-25000, 21000], "radius": 4000, "height": 650, "roughness": 0.5 },
+        { "type": "river", "id": "platte", "label": "South Platte",
+          "path": [[-24000, 6000], [-15000, 4000], [-6000, 6500], [3000, 3000], [12000, 5500], [22000, 1500], [34000, 3000]],
+          "width": 90, "depth": 8, "bank": 900 },
+        { "type": "lake", "label": "Reservoir", "pos": [-11000, 15000], "radius": 1600, "level": 1520 },
+        { "type": "town", "id": "town", "label": "Brightfield", "pos": [-4000, 9000], "radius": 4200, "density": 0.95 },
+        { "type": "town", "label": "Greeley Flats", "pos": [11000, -9000], "radius": 2400, "density": 0.85 },
+        { "type": "town", "pos": [19000, 12000], "radius": 1500, "density": 0.7 },
+        { "type": "forest", "pos": [-24000, -2000], "radius": 9000, "density": 0.9, "seed": 3 },
+
+        { "type": "supercell", "id": "hero", "label": "Supercell", "pos": [1500, -2500], "radius": 6200, "top": 11800, "precip": 1.0,
+          "core": 0.4, "coreOffset": [2600, 2400], "life": [900, 2400, 1200], "lightning": 5, "virga": 0.12, "pinned": true,
+          "stackRadius": 1.0, "stackDrop": 1300, "stackHeight": 6000, "plates": 5, "twist": 0.5, "spin": 0.03,
+          "wallCloud": 700, "wallRadius": 0.3, "green": 0.45 },
+        { "type": "squall", "id": "squall", "label": "Squall line", "from": [-26000, -36000], "to": [-20000, 34000], "count": 7,
+          "radius": 4500, "top": 10500, "precip": 0.9, "shelf": 1, "lip": 650, "shelfDepth": 7000, "tiers": 3, "bow": 5000,
+          "lightning": 3, "drift": 0.6, "travel": 50000, "seed": 5 },
+        { "type": "storm", "label": "Virga cell", "pos": [-14000, -15000], "radius": 3800, "top": 7200, "precip": 0.55,
+          "core": 0.55, "life": [600, 1800, 900], "lightning": 0, "virga": 0.75, "pinned": true },
+        { "type": "spawner", "id": "plains-cells", "area": [-40000, -40000, 40000, 40000], "rate": 9, "max": 22, "initial": 9, "seed": 12,
+          "template": { "radius": [2200, 5200], "top": [5500, 11000], "precip": [0.25, 0.95], "core": [0.35, 0.6],
+                        "grow": [500, 1000], "mature": [900, 2400], "decay": [700, 1400], "lightning": [0, 4], "virga": [0, 0.6],
+                        "drift": [0.8, 1.2] } }
+    ],
+
+    "lighting": {
+        "start": "afternoon",
+        "presets": {
+            "storm dusk": { "azimuth": 272, "elevation": 3, "intensity": 11, "exposure": 0.7 },
+            "afternoon": { "azimuth": 62, "elevation": 14, "intensity": 12, "exposure": 0.44 },
+            "noon":      { "azimuth": 170, "elevation": 62, "intensity": 12, "exposure": 0.36 },
+            "golden":    { "azimuth": 285, "elevation": 7, "intensity": 11, "exposure": 0.55 },
+            "morning":   { "azimuth": 95, "elevation": 14, "intensity": 11, "exposure": 0.48 }
+        }
+    },
+
+    "views": [
+        { "name": "Airliner (photo view)", "pos": [9000, 7400, 22000], "look": [3200, 2500, 0] },
+        { "name": "Under the shaft",       "pos": [-1500, 1560, 9500], "look": [4000, 3000, 0] },
+        { "name": "Plains overview",       "pos": [-20000, 5200, 26000], "look": [4000, 2000, -6000] },
+        { "name": "Above the anvils",      "pos": [12000, 13800, 18000], "look": [0, 7000, -4000] },
+        { "name": "Front Range",           "pos": [-12000, 3600, 9000], "look": [-28000, 3200, -6000] },
+        { "name": "Town street level",     "pos": [-4200, 1640, 10500], "look": [0, 2600, -2000] },
+        { "name": "Shelf cloud",   "follow": "squall", "offset": [7000, 25, 1500], "lookOffset": [-4000, 2100, -2500],
+          "lighting": "storm dusk", "weather": "severe storms" },
+        { "name": "Mothership",    "follow": "hero", "offset": [-5500, 25, 8000], "lookOffset": [0, 3000, 0],
+          "lighting": "afternoon", "weather": "severe storms" }
+    ]
+}
+</script>
+
+<script>
+'use strict';
+// =====================================================================================================
+// Entity Cloud: volumetric clouds, storm cells and their precipitation shafts in WebGPU, as one static page.
+//
+//   1. Weather map (compute, every frame): a 2D map around the camera with cloud coverage, cloud top, precipitation and
+//      virga, built from the layer state (large-scale noise advected by the wind) plus every live storm cell entity.
+//   2. Cloud shadow map (compute): sun transmittance through the cloud slab, and the sky occlusion of the column above.
+//   3. Ground state (compute): snow cover and wetness accumulate under precipitation and melt / dry afterwards.
+//   4. Scene (render): sky, then the terrain (farm sections, pivots, towns, mountains) with cloud shadows, snow and wet ground.
+//   5. Volumetrics (compute, reduced resolution): one ray march through clouds (Perlin-Worley shape + Worley detail,
+//      light march + multiple-scattering octaves), rain and snow shafts falling from the cloud base (slanted by the wind,
+//      streaky curtains, virga evaporating before the ground, rain below the freezing level and snow above), and height
+//      haze with crepuscular rays from the shadow map; then temporal reprojection.
+//   6. Final (render): composite + tonemap, near-field rain streaks / snow flakes around the camera, lightning bolts, radar.
+//
+// The world is data (the scenario JSON above). Every entity is a class in ENTITY_TYPES: terrain features stamp the heightmap
+// and paint land use; storm cells live, drift with the wind, rain and flash; spawners keep the sky populated.
+// =====================================================================================================
+
+// ------------------------------------------------------------------------------------------------ config
+const DEG = Math.PI / 180;
+const NEAR = 1.0;
+const MAX_CELLS = 64;
+const CELL_FLOATS = 16;
+const MAX_LAYERS = 4;
+const MAX_MOTHERSHIPS = 4;           // analytic storm structures (see mothershipDensity / shelfLineDensity)
+const MAX_SHELVES = 2;                // stratiform / cellular cloud genera besides the convective layer
+const MAX_FLASHES = 4;
+const MAX_BOLT_SEGS = 256;
+const GRID_N = 512;                 // terrain mesh vertices per side (inner part covers the heightfield, outer rings run to the horizon)
+const NOISE_SHAPE = 128;
+const NOISE_DETAIL = 32;
+const WEATHER_RES = 512;
+const SHADOW_RES = 384;
+const GROUND_RES = 256;
+const RENDER_MODES = ['shaded', 'no volumetrics', 'clouds only', 'precipitation only'];
+// scale: volumetric resolution; steps / light: march and light-march steps; checker: march half the pixels per frame;
+// detail: distance (m) within which the detail noise erodes clouds (beyond, cheaper LODs)
+const QUALITY = [
+    { name: 'low', scale: 0.5, steps: 64, light: 3, checker: true, detail: 10000 },
+    { name: 'medium', scale: 0.5, steps: 96, light: 4, checker: true, detail: 16000 },
+    { name: 'high', scale: 0.75, steps: 128, light: 5, checker: true, detail: 22000 },
+    { name: 'ultra', scale: 1.0, steps: 160, light: 6, checker: false, detail: 30000 },
+];
+const SHADOW_SLICES = 4;              // the cloud shadow map refreshes 1/4 of its rows per frame while nothing jumps
+const RENDER_DEFAULTS = {
+    quality: 1, shapeScale: 11000, detailScale: 1700, detailStrength: 0.32, maxTop: 12500, maxDistance: 60000, weatherSize: 128000,
+    rainExtinction: 0.0011, snowExtinction: 0.0026, slant: 0.09, fallSpeed: 40, timeScale: 20, particles: 24000,
+};
+const WEATHER_DEFAULTS = {
+    coverage: 0.3, base: 3000, top: 4500, density: 0.04, cirrus: 0.2, wind: [8, 0], temperature: 20, haze: 1,
+    drizzle: 0, storms: 1, power: 1, lightning: 1, layers: {},
+};
+// cloud genus layers (scenario `clouds`): kind heap | sheet | cellular
+const LAYER_DEFAULTS = {
+    name: 'layer', kind: 'sheet', base: 2000, top: 2600, mapScale: 25000, shapeScale: 9000, stretch: 2, erosion: 0.2,
+    density: 0.02, ambient: 1, precip: 0,
+};
+const LAYER_KINDS = { heap: 0, sheet: 1, cellular: 2 };
+const TIME_SCALES = [1, 5, 10, 20, 40, 80, 160];
+
+// -------------------------------------------------------------------------------------------------- math
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const sat01 = x => clamp(x, 0, 1);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smoothstep = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+
+const v3 = {
+    add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+    sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]],
+    mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s],
+    dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+    cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+    len: a => Math.hypot(a[0], a[1], a[2]),
+    norm: a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; },
+};
+
+// column-major 4x4
+const m4 = {
+    mul(a, b) {
+        const o = new Float32Array(16);
+        for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+            let s = 0;
+            for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+            o[c * 4 + r] = s;
+        }
+        return o;
+    },
+    // rows: right, up, back
+    view(eye, r, u, f) {
+        const b = [-f[0], -f[1], -f[2]];
+        return new Float32Array([r[0], u[0], b[0], 0, r[1], u[1], b[1], 0, r[2], u[2], b[2], 0,
+            -v3.dot(r, eye), -v3.dot(u, eye), -v3.dot(b, eye), 1]);
+    },
+    // reversed-Z, infinite far plane: depth = near / view distance
+    reversedInfinite(fovy, aspect, near) {
+        const f = 1 / Math.tan(fovy / 2);
+        return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, near, 0]);
+    },
+    project(m, p) {
+        return [0, 1, 2, 3].map(r => m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r]);
+    },
+};
+
+function mulberry32(seed) {
+    let a = seed >>> 0;
+    return () => {
+        a = (a + 0x6D2B79F5) >>> 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+// half floats for rgba16float uploads / readback
+const toHalf = (() => {
+    const f = new Float32Array(1), u = new Uint32Array(f.buffer);
+    return v => {
+        f[0] = v;
+        const x = u[0], s = (x >>> 16) & 0x8000, e = ((x >>> 23) & 0xff) - 112, m = x & 0x7fffff;
+        if (e <= 0) return s;
+        if (e >= 31) return s | 0x7c00;
+        return s | (e << 10) | (m >>> 13);
+    };
+})();
+const fromHalf = h => {
+    const s = h & 0x8000 ? -1 : 1, e = (h >> 10) & 31, m = h & 1023;
+    if (e === 0) return s * m * 2 ** -24;
+    if (e === 31) return m ? NaN : s * Infinity;
+    return s * (1 + m / 1024) * 2 ** (e - 15);
+};
+
+// -------------------------------------------------------------------------------------------------- noise
+function hash2(ix, iy, seed) {
+    let h = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(seed, 1442695041)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1274126177);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+}
+
+function vnoise(x, y, seed) {
+    const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const a = hash2(ix, iy, seed), b = hash2(ix + 1, iy, seed), c = hash2(ix, iy + 1, seed), d = hash2(ix + 1, iy + 1, seed);
+    return lerp(lerp(a, b, ux), lerp(c, d, ux), uy) * 2 - 1;
+}
+
+// fractal noise in about [-1, 1]; ridged gives sharp crests in [0, 1]
+function fbm(x, y, { octaves = 5, seed = 1, ridged = false, gain = 0.5 } = {}) {
+    let sum = 0, amp = 1, norm = 0, f = 1;
+    for (let o = 0; o < octaves; o++) {
+        const n = vnoise(x * f + o * 17.3, y * f - o * 9.1, seed + o * 31);
+        sum += (ridged ? 1 - Math.abs(n) : n) * amp;
+        norm += amp;
+        amp *= gain;
+        f *= 2.03;
+    }
+    return sum / norm;
+}
+
+// nearest point on a polyline: { dist, s (arc length at that point) }
+function polylineNearest(pts, lens, x, z) {
+    let best = Infinity, bs = 0;
+    for (let k = 0; k < pts.length - 1; k++) {
+        const [ax, az] = pts[k], [bx, bz] = pts[k + 1], dx = bx - ax, dz = bz - az;
+        const l2 = dx * dx + dz * dz || 1;
+        const t = clamp(((x - ax) * dx + (z - az) * dz) / l2, 0, 1);
+        const px = ax + dx * t - x, pz = az + dz * t - z, d = px * px + pz * pz;
+        if (d < best) { best = d; bs = lens[k] + t * Math.sqrt(l2); }
+    }
+    return { dist: Math.sqrt(best), s: bs };
+}
+
+function polylineLengths(pts) {
+    const lens = [0];
+    for (let k = 1; k < pts.length; k++) lens.push(lens[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
+    return lens;
+}
+
+function polylineBox(pts, pad) {
+    const xs = pts.map(p => p[0]), zs = pts.map(p => p[1]);
+    return [Math.min(...xs) - pad, Math.min(...zs) - pad, Math.max(...xs) + pad, Math.max(...zs) + pad];
+}
+
+// ----------------------------------------------------------------------------------------- heightfield
+// CPU copy of the terrain plus a land-use map (r town, g forest, b water), authored by entities and uploaded once.
+// Cell (i, j) centre sits at (origin + (i + 0.5) * cell, origin + (j + 0.5) * cell); i runs along x, j along z.
+class Heightfield {
+    constructor(size, n, base) {
+        this.size = size;
+        this.n = n;
+        this.cell = size / n;
+        this.origin = -size / 2;
+        this.base = base;
+        this.h = new Float32Array(n * n).fill(base);
+        this.land = new Float32Array(n * n * 3);
+        this.min = base;
+        this.max = base;
+    }
+
+    cx(i) { return this.origin + (i + 0.5) * this.cell; }
+    ci(x) { return (x - this.origin) / this.cell - 0.5; }
+
+    // calls fn(idx, x, z, i, j) for every cell centre inside the world-space box
+    each(x0, z0, x1, z1, fn) {
+        const n = this.n;
+        const i0 = clamp(Math.floor(this.ci(x0)), 0, n - 1), i1 = clamp(Math.ceil(this.ci(x1)), 0, n - 1);
+        const j0 = clamp(Math.floor(this.ci(z0)), 0, n - 1), j1 = clamp(Math.ceil(this.ci(z1)), 0, n - 1);
+        for (let j = j0; j <= j1; j++) {
+            const z = this.cx(j);
+            for (let i = i0; i <= i1; i++) fn(j * n + i, this.cx(i), z, i, j);
+        }
+    }
+
+    eachAll(fn) { this.each(-Infinity, -Infinity, Infinity, Infinity, fn); }
+
+    sample(x, z) {
+        const n = this.n, fx = clamp(this.ci(x), 0, n - 1), fz = clamp(this.ci(z), 0, n - 1);
+        const i = Math.min(Math.floor(fx), n - 2), j = Math.min(Math.floor(fz), n - 2), tx = fx - i, tz = fz - j, h = this.h;
+        const v = lerp(lerp(h[j * n + i], h[j * n + i + 1], tx), lerp(h[(j + 1) * n + i], h[(j + 1) * n + i + 1], tx), tz);
+        // matches the terrain shader: beyond the map the edge height eases back to the base level
+        const out = Math.max(Math.abs(x), Math.abs(z)) - this.size / 2;
+        return out > 0 ? lerp(this.base, v, Math.exp(-out / 4000)) : v;
+    }
+
+    paint(idx, channel, value) { const k = idx * 3 + channel; this.land[k] = Math.max(this.land[k], value); }
+
+    updateRange() {
+        let lo = Infinity, hi = -Infinity;
+        for (const v of this.h) { if (v < lo) lo = v; if (v > hi) hi = v; }
+        this.min = lo;
+        this.max = hi;
+    }
+
+    // rgba16float texels: height, normal xyz
+    packHeight() {
+        const n = this.n, h = this.h, out = new Uint16Array(n * n * 4), c2 = this.cell * 2;
+        for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+            const l = h[j * n + Math.max(i - 1, 0)], r = h[j * n + Math.min(i + 1, n - 1)];
+            const u = h[Math.max(j - 1, 0) * n + i], d = h[Math.min(j + 1, n - 1) * n + i];
+            const nv = v3.norm([(l - r) / c2, 1, (u - d) / c2]), k = (j * n + i) * 4;
+            out[k] = toHalf(h[j * n + i]); out[k + 1] = toHalf(nv[0]); out[k + 2] = toHalf(nv[1]); out[k + 3] = toHalf(nv[2]);
+        }
+        return out;
+    }
+
+    packLand() {
+        const n = this.n, out = new Uint8Array(n * n * 4);
+        for (let k = 0; k < n * n; k++) {
+            out[k * 4] = clamp(this.land[k * 3], 0, 1) * 255;
+            out[k * 4 + 1] = clamp(this.land[k * 3 + 1], 0, 1) * 255;
+            out[k * 4 + 2] = clamp(this.land[k * 3 + 2], 0, 1) * 255;
+            out[k * 4 + 3] = 255;
+        }
+        return out;
+    }
+
+    // first hit of a ray with the heightfield, or null
+    raycast(o, d, maxDist = 150000) {
+        const above = t => { const p = v3.add(o, v3.mul(d, t)); return p[1] - this.sample(p[0], p[2]); };
+        if (above(0) < 0) return null;
+        let t = 0, prev = 0;
+        while (t < maxDist) {
+            prev = t;
+            t += Math.max(this.cell * 0.5, t * 0.004);
+            const p = v3.add(o, v3.mul(d, t));
+            if (above(t) < 0) {
+                let a = prev, b = t;
+                for (let k = 0; k < 20; k++) { const m = (a + b) / 2; if (above(m) < 0) b = m; else a = m; }
+                return v3.add(o, v3.mul(d, b));
+            }
+            if (p[1] > this.max + 100 && d[1] >= 0) return null;
+        }
+        return null;
+    }
+}
+
+// =====================================================================================================
+// GPU layout shared by JS and WGSL
+// =====================================================================================================
+// Per-frame uniform block. The WGSL struct is generated from this list, so offsets can never drift apart.
+const FRAME_LAYOUT = [
+    ['viewProj', 'mat4x4f'],
+    ['prevViewProj', 'mat4x4f'],
+    ['cam', 'vec4f'],       // xyz, real time (s)
+    ['fwd', 'vec4f'],       // xyz, near
+    ['right', 'vec4f'],     // right * tan(fovx / 2), frame index
+    ['up', 'vec4f'],        // up * tan(fovy / 2), weather time (s)
+    ['sunDir', 'vec4f'],    // xyz, -
+    ['sunCol', 'vec4f'],    // rgb irradiance, exposure
+    ['zenith', 'vec4f'],    // rgb sky radiance, haze extinction at the ground (1/m)
+    ['horizon', 'vec4f'],   // rgb sky radiance, haze scale height (m)
+    ['ambient', 'vec4f'],   // rgb sky ambient, -
+    ['screen', 'vec4f'],    // full w, h, volumetric w, h
+    ['cloud', 'vec4f'],     // base, layer top, extinction (1/m), coverage
+    ['noise', 'vec4f'],     // shape scale, detail scale, detail strength, slab top
+    ['wind', 'vec4f'],      // wind x, z (m/s), noise offset x, z (m)
+    ['precip', 'vec4f'],    // freezing level, slant (s/m), rain extinction, snow extinction
+    ['wdomain', 'vec4f'],   // weather map origin x, z, size, resolution
+    ['tdomain', 'vec4f'],   // terrain origin x, z, size, resolution
+    ['ground', 'vec4f'],    // field size, pivot chance, ground state resolution, render mode
+    ['cirrus', 'vec4f'],    // altitude, coverage, scale, drizzle
+    ['flash', `array<vec4f, ${MAX_FLASHES}>`], // xyz, intensity
+    ['march', 'vec4f'],     // steps, light steps, max distance, radar on
+    ['near', 'vec4f'],      // near rain, near snow, history reset, storm cell count
+    ['misc', 'vec4f'],      // sea-level temperature, streak scroll (m), ground reference height, weather dt (s)
+    ['layers', `array<vec4f, ${MAX_LAYERS * 3}>`], // per genus: [base, top, coverage, extinction] [map scale, shape scale, stretch, erosion] [kind, ambient, precip, seed]
+    ['layerInfo', 'vec4f'], // lowest genus base, highest genus top, lowest cloud of any kind, -
+    ['ms', `array<vec4f, ${MAX_MOTHERSHIPS * 3}>`],  // [x, z, radius, spin] [stack bottom, top, plates, twist] [wall drop, wall radius, strength, seed]
+    ['shelves', `array<vec4f, ${MAX_SHELVES * 4}>`], // [end a, end b] [bow control, motion dir] [lip height, depth, tiers, strength] [bbox]
+    ['features', 'vec4f'],  // motherships, shelf lines, highest cloud top (m), -
+    ['lod', 'vec4f'],       // checkerboard march on, shadow map slices, slice this frame, detail distance (m)
+];
+
+class FrameBlock {
+    constructor() {
+        const size = t => t === 'mat4x4f' ? 16 : t === 'vec4f' ? 4 : 4 * parseInt(t.match(/(\d+)>$/)[1]);
+        this.offsets = {};
+        let o = 0;
+        for (const [name, type] of FRAME_LAYOUT) { this.offsets[name] = o; o += size(type); }
+        this.data = new Float32Array(o);
+    }
+    set(name, values, at = 0) { this.data.set(values, this.offsets[name] + at); }
+    static wgsl() { return `struct Frame {\n${FRAME_LAYOUT.map(([n, t]) => `    ${n}: ${t},`).join('\n')}\n};\n`; }
+}
+
+// Shared resources. A shader asks for the subset it uses by name; binding numbers are the table index, so a module's
+// declarations and its bind group layout come from the same list.
+const WORLD_BINDINGS = [
+    ['F', 'uniform', 'var<uniform> F: Frame'],
+    ['shapeTex', 'tex3d', 'var shapeTex: texture_3d<f32>'],
+    ['detailTex', 'tex3d', 'var detailTex: texture_3d<f32>'],
+    ['weatherTex', 'tex', 'var weatherTex: texture_2d<f32>'],
+    ['shadowTex', 'tex', 'var shadowTex: texture_2d<f32>'],
+    ['heightTex', 'tex', 'var heightTex: texture_2d<f32>'],
+    ['landTex', 'tex', 'var landTex: texture_2d<f32>'],
+    ['repSamp', 'sampler', 'var repSamp: sampler'],
+    ['clampSamp', 'sampler', 'var clampSamp: sampler'],
+    ['cells', 'read', 'var<storage, read> cells: array<Cell>'],
+    ['ground', 'read', 'var<storage, read> ground: array<vec2f>'],
+    ['bolts', 'read', 'var<storage, read> bolts: array<vec4f>'],
+    ['anvilTex', 'tex', 'var anvilTex: texture_2d<f32>'],     // anvil coverage, anvil top, shelf coverage, shelf wedge
+    ['layerTex', 'tex', 'var layerTex: texture_2d<f32>'],     // coverage of each cloud genus layer
+    ['styleTex', 'tex', 'var styleTex: texture_2d<f32>'],     // laminar plates, green tint, wall cloud lowering (m), -
+];
+
+function layoutEntry(binding, visibility, kind) {
+    const [k, arg] = kind.split(':'), e = { binding, visibility };
+    if (k === 'uniform') e.buffer = { type: 'uniform' };
+    else if (k === 'read') e.buffer = { type: 'read-only-storage' };
+    else if (k === 'storage') e.buffer = { type: 'storage' };
+    else if (k === 'tex') e.texture = { sampleType: arg || 'float', viewDimension: '2d' };
+    else if (k === 'tex3d') e.texture = { sampleType: 'float', viewDimension: '3d' };
+    else if (k === 'depth') e.texture = { sampleType: 'depth', viewDimension: '2d' };
+    else if (k === 'sampler') e.sampler = { type: 'filtering' };
+    else if (k === 'write') e.storageTexture = { access: 'write-only', format: arg, viewDimension: '2d' };
+    else if (k === 'write3d') e.storageTexture = { access: 'write-only', format: arg, viewDimension: '3d' };
+    else throw new Error(`layout kind ${kind}`);
+    return e;
+}
+
+const asResource = r => r instanceof GPUBuffer ? { buffer: r } : r;
+
+class BindingSet {
+    constructor(device, names, group = 0) {
+        this.device = device;
+        this.slots = names.map(n => {
+            const b = WORLD_BINDINGS.findIndex(x => x[0] === n);
+            if (b < 0) throw new Error(`unknown binding ${n}`);
+            return { name: n, binding: b, kind: WORLD_BINDINGS[b][1], decl: WORLD_BINDINGS[b][2] };
+        });
+        const vis = GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+        this.layout = device.createBindGroupLayout({ entries: this.slots.map(s => layoutEntry(s.binding, vis, s.kind)) });
+        this.wgsl = this.slots.map(s => `@group(${group}) @binding(${s.binding}) ${s.decl};`).join('\n') + '\n';
+    }
+    group(res, label) {
+        return this.device.createBindGroup({ label, layout: this.layout, entries: this.slots.map(s => ({ binding: s.binding, resource: asResource(res[s.name]) })) });
+    }
+}
+
+// private bindings of one pass (outputs, screen textures): kinds in binding order
+function makeLayout(device, visibility, kinds) {
+    return device.createBindGroupLayout({ entries: kinds.map((k, b) => layoutEntry(b, visibility, k)) });
+}
+function makeGroup(device, layout, resources, label) {
+    return device.createBindGroup({ label, layout, entries: resources.map((r, binding) => ({ binding, resource: asResource(r) })) });
+}
+function makeBuffer(device, size, usage, data) {
+    const b = device.createBuffer({ size: Math.max(16, Math.ceil(size / 4) * 4), usage, mappedAtCreation: !!data });
+    if (data) { new data.constructor(b.getMappedRange()).set(data); b.unmap(); }
+    return b;
+}
+function gridIndices(w) {
+    const idx = new Uint32Array((w - 1) * (w - 1) * 6);
+    let o = 0;
+    for (let j = 0; j < w - 1; j++) for (let i = 0; i < w - 1; i++) {
+        const a = j * w + i, b = a + 1, c = a + w, d = c + 1;
+        idx[o++] = a; idx[o++] = c; idx[o++] = b;
+        idx[o++] = b; idx[o++] = c; idx[o++] = d;
+    }
+    return idx;
+}
+
+// =====================================================================================================
+// WGSL
+// =====================================================================================================
+
+// ---------------------------------------------------------------------------------------- WGSL helpers
+// no bindings
+const WGSL_MATH = /* wgsl */`
+const PI = 3.14159265;
+struct Cell { a: vec4f, b: vec4f, c: vec4f, d: vec4f };
+// a: x, z, radius, top   b: coverage, precip, seed, virga   c: core, core offset x, z, -   d: shelf, laminar, green, wall cloud (m)
+
+fn sat(x: f32) -> f32 { return clamp(x, 0.0, 1.0); }
+fn remap(x: f32, a: f32, b: f32, c: f32, d: f32) -> f32 { return c + (x - a) / (b - a) * (d - c); }
+fn hg(mu: f32, g: f32) -> f32 {
+    let g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
+}
+fn hash12(p: vec2f) -> f32 {
+    var p3 = fract(vec3f(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+fn pcg(v: u32) -> u32 {
+    let s = v * 747796405u + 2891336453u;
+    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+fn rnd(v: u32) -> f32 { return f32(pcg(v)) / 4294967295.0; }
+fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715)))); }
+fn vnoise2(p: vec2f) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash12(i), hash12(i + vec2f(1.0, 0.0)), u.x), mix(hash12(i + vec2f(0.0, 1.0)), hash12(i + vec2f(1.0, 1.0)), u.x), u.y);
+}
+fn fbm2(p: vec2f, oct: i32) -> f32 {
+    var s = 0.0; var a = 0.5; var n = 0.0; var q = p;
+    for (var i = 0; i < oct; i++) { s += a * vnoise2(q); n += a; a *= 0.5; q = q * 2.03 + vec2f(17.1, -9.3); }
+    return s / n;
+}
+fn aces(x: vec3f) -> vec3f {
+    let a = x * (2.51 * x + 0.03);
+    let b = x * (2.43 * x + 0.59) + 0.14;
+    return clamp(a / b, vec3f(0.0), vec3f(1.0));
+}
+`;
+
+// needs F
+const WGSL_SKY = /* wgsl */`
+fn rayDir(ndc: vec2f) -> vec3f { return normalize(F.fwd.xyz + F.right.xyz * ndc.x + F.up.xyz * ndc.y); }
+fn tonemap(c: vec3f) -> vec3f { return pow(aces(c * F.sunCol.w), vec3f(1.0 / 2.2)); }
+
+fn skyColor(dir: vec3f) -> vec3f {
+    let mu = dot(dir, F.sunDir.xyz);
+    let t = pow(sat(dir.y + 0.02), 0.5);
+    var c = mix(F.horizon.rgb, F.zenith.rgb, t);
+    c = mix(c, F.horizon.rgb * 0.7, sat(-dir.y * 8.0));
+    return c + F.sunCol.rgb * (hg(mu, 0.78) * 0.025 + hg(mu, 0.3) * 0.02 * (1.0 - t));
+}
+
+// light of the active lightning flashes at p
+fn flashLight(p: vec3f) -> vec3f {
+    var l = 0.0;
+    for (var k = 0; k < ${MAX_FLASHES}; k++) {
+        let f = F.flash[k];
+        if (f.w > 0.0) { let d = distance(p, f.xyz); l += f.w / (1.0 + d * d * 4e-7); }
+    }
+    return vec3f(0.75, 0.82, 1.0) * l;
+}
+`;
+
+// needs F, weatherTex, clampSamp
+const WGSL_WEATHER_SAMPLE = /* wgsl */`
+// x coverage, y cloud top (m), z precipitation (0..1), w virga (0 reaches the ground .. 1 evaporates at the cloud base)
+fn weatherAt(xz: vec2f) -> vec4f {
+    let uv = (xz - F.wdomain.xy) / F.wdomain.z;
+    let w = textureSampleLevel(weatherTex, clampSamp, uv, 0.0);
+    let e = sat(min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) * 12.0);
+    return mix(vec4f(F.cloud.w * 0.6, F.cloud.y, 0.0, 0.0), w, e);
+}
+// precipitation at p left the cloud base upwind: falling takes time and the wind carries it, so shafts slant
+fn precipWeatherAt(p: vec3f) -> vec4f {
+    let drop = max(F.cloud.x - p.y, 0.0);
+    return weatherAt(p.xz - F.wind.xy * drop * F.precip.y);
+}
+`;
+
+// needs F, shapeTex, detailTex, anvilTex, layerTex, styleTex, repSamp, clampSamp (+ weather sample)
+const WGSL_DENSITY = /* wgsl */`
+fn mapUV(xz: vec2f) -> vec2f { return (xz - F.wdomain.xy) / F.wdomain.z; }
+fn mapFade(uv: vec2f) -> f32 { return sat(min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) * 12.0); }
+fn windDir() -> vec2f { let wl = length(F.wind.xy); return select(vec2f(1.0, 0.0), F.wind.xy / wl, wl > 0.1); }
+
+// x anvil coverage, y anvil top (m), z shelf cloud coverage, w shelf wedge (1 on the storm side, 0 at the leading edge)
+fn anvilAt(xz: vec2f) -> vec4f {
+    let uv = mapUV(xz);
+    let f = mapFade(uv);
+    return textureSampleLevel(anvilTex, clampSamp, uv, 0.0) * vec4f(f, 1.0, f, 1.0);
+}
+// coverage of each genus layer; beyond the map, a plain share of the state's coverage
+fn layerCovAt(xz: vec2f) -> vec4f {
+    let uv = mapUV(xz);
+    let edge = vec4f(F.layers[0].z, F.layers[3].z, F.layers[6].z, F.layers[9].z) * 0.7;
+    return mix(edge, textureSampleLevel(layerTex, clampSamp, uv, 0.0), mapFade(uv));
+}
+fn styleAt(xz: vec2f) -> vec4f { let uv = mapUV(xz); return textureSampleLevel(styleTex, clampSamp, uv, 0.0) * mapFade(uv); }
+
+// cumulus layer and storm towers from the weather map, anvils, mothership plates and wall clouds (st = style sample)
+fn convectiveDensity(p: vec3f, w: vec4f, an: vec4f, st: vec4f, detail: bool) -> f32 {
+    let base0 = F.cloud.x;
+    let base = base0 - st.z;                                                  // wall cloud: lowered base under the updraft
+    if (p.y <= base) { return 0.0; }
+    let top = max(w.y, base0 + 400.0);
+    var cov = 0.0;
+    var prof = 0.0;
+    var h = 0.0;
+    if (p.y < top && w.x >= 0.01) {
+        h = (p.y - base) / (top - base);
+        let tall = sat((top - base - 2500.0) / 6000.0);                       // cumulonimbus towers
+        prof = sat(h / 0.025 + 0.15) * sat((1.0 - h) / mix(0.45, 0.14, tall)); // flat bases, rounded tops
+        cov = sat(w.x * mix(1.0, 0.72, h)) * 0.94;                           // towers narrow upwards
+    }
+    if (p.y > base0 + 2500.0) {
+        let band = 2800.0;
+        if (an.x > 0.01 && p.y > an.y - band && p.y < an.y) {
+            let ha = (p.y - (an.y - band)) / band;
+            let pa = sat(ha / 0.35) * sat((1.0 - ha) / 0.2);
+            if (an.x * pa > cov * prof) { cov = an.x; prof = pa; h = max(h, 0.85); }
+        }
+    }
+    if (cov <= 0.0 || prof <= 0.0) { return 0.0; }
+    let wd = windDir();
+    let q = vec3f(p.x - F.wind.z - wd.x * (p.y - base) * 0.25, p.y, p.z - F.wind.w - wd.y * (p.y - base) * 0.25);
+    let s = textureSampleLevel(shapeTex, repSamp, q / F.noise.x, 0.0);
+    let wf = s.y * 0.625 + s.z * 0.25 + s.w * 0.125;
+    var d = sat(remap(s.x, wf - 1.0, 1.0, 0.0, 1.0)) * prof;
+    // mothership: smooth stacked plates around the rotating updraft
+    if (st.x > 0.01) {
+        let plate = abs(fract(p.y / 950.0 + 0.3 * sin(p.x / 4200.0) + 0.3 * cos(p.z / 5100.0)) * 2.0 - 1.0);
+        d = mix(d, d * (0.72 + 0.28 * smoothstep(0.05, 0.4, plate)) + 0.12 * prof, st.x);
+    }
+    d = sat(remap(d, 1.0 - cov, 1.0, 0.0, 1.0)) * cov;
+    if (d <= 0.0) { return 0.0; }
+    if (detail) {
+        let n = textureSampleLevel(detailTex, repSamp, q / F.noise.y + vec3f(0.0, F.up.w * 0.0004, 0.0), 0.0);
+        let dw = n.x * 0.625 + n.y * 0.25 + n.z * 0.125;
+        let e = mix(dw, 1.0 - dw, sat(h * 5.0));                     // wispy bases, billowy tops
+        d = sat(remap(d, e * F.noise.z * (1.0 - 0.75 * st.x), 1.0, 0.0, 1.0));
+    }
+    return d * F.cloud.z;
+}
+
+// shelf cloud: a tiered wedge along a storm's gust front, low and dark underneath
+fn shelfDensity(p: vec3f, an: vec4f) -> f32 {
+    if (an.z < 0.01) { return 0.0; }
+    let base = F.cloud.x;
+    // lowest at the lip near the leading edge; the top slopes up into the storm's base behind it
+    let lip = smoothstep(0.0, 0.3, an.w) * (1.0 - 0.55 * an.w);
+    let bottom = base - 1100.0 * lip;
+    let top = bottom + 250.0 + 1100.0 * an.w;
+    if (p.y <= bottom || p.y >= top) { return 0.0; }
+    let h = (p.y - bottom) / (top - bottom);
+    let tiers = 0.5 + 0.5 * smoothstep(0.15, 0.6, abs(fract(h * 3.0 + 0.15 * sin(p.x / 1800.0 + p.z / 2300.0)) * 2.0 - 1.0));
+    let s = textureSampleLevel(shapeTex, repSamp, vec3f(p.x - F.wind.z, p.y * 2.0, p.z - F.wind.w) / (F.noise.x * 0.6), 0.0);
+    let prof = sat(h / 0.08) * sat((1.0 - h) / 0.35);
+    var d = sat(remap((0.4 + 0.6 * s.x) * prof * tiers, 1.0 - an.z, 1.0, 0.0, 1.0)) * an.z;
+    let dn = textureSampleLevel(detailTex, repSamp, vec3f(p.x - F.wind.z, p.y, p.z - F.wind.w) / 1100.0, 0.0);
+    d = sat(remap(d, (dn.x * 0.625 + dn.y * 0.25 + dn.z * 0.125) * 0.55, 1.0, 0.0, 1.0));   // ragged scud underneath
+    return d * F.cloud.z;
+}
+
+// genus layer i (stratus, nimbostratus, altostratus, altocumulus, ...) with coverage cov from the layer map
+fn layerDensity(p: vec3f, i: i32, cov: f32, detail: bool) -> f32 {
+    let A = F.layers[i * 3];
+    let B = F.layers[i * 3 + 1];
+    let C = F.layers[i * 3 + 2];
+    if (cov < 0.01 || p.y <= A.x || p.y >= A.y) { return 0.0; }
+    let h = (p.y - A.x) / (A.y - A.x);
+    let wd = windDir();
+    let rel = p.xz - F.wind.zw;
+    let lp = vec3f(dot(rel, wd) / B.z, p.y, dot(rel, vec2f(-wd.y, wd.x)));   // stretched along the wind (B.z > 1) or across it
+    let s = textureSampleLevel(shapeTex, repSamp, lp / B.y + C.w, 0.0);
+    let kind = i32(C.x);
+    var n = 0.0;
+    var prof = 0.0;
+    if (kind == 2) {            // cellular: separate puffs in rows (altocumulus)
+        n = s.z * 0.75 + s.w * 0.25;
+        prof = sat(h / 0.25) * sat((1.0 - h) / 0.35);
+    } else if (kind == 1) {     // sheet: flat and featureless (stratus, altostratus, nimbostratus)
+        n = 0.55 + 0.45 * s.x;
+        prof = sat(h / 0.12) * sat((1.0 - h) / 0.18);
+    } else {                    // heaped
+        n = sat(remap(s.x, s.y * 0.625 + s.z * 0.25 + s.w * 0.125 - 1.0, 1.0, 0.0, 1.0));
+        prof = sat(h / 0.05) * sat((1.0 - h) / 0.4);
+    }
+    var d = sat(remap(n * prof, 1.0 - cov, 1.0, 0.0, 1.0)) * cov;
+    if (d <= 0.0) { return 0.0; }
+    if (detail && B.w > 0.0) {
+        let dn = textureSampleLevel(detailTex, repSamp, lp / (B.y * 0.2) + C.w, 0.0);
+        d = sat(remap(d, (dn.x * 0.625 + dn.y * 0.25 + dn.z * 0.125) * B.w, 1.0, 0.0, 1.0));
+    }
+    return d * A.w;
+}
+
+fn bez(a: vec2f, c: vec2f, b: vec2f, t: f32) -> vec2f { let u = 1.0 - t; return u * u * a + 2.0 * u * t * c + t * t * b; }
+
+fn rot2(v: vec2f, a: f32) -> vec2f { let c = cos(a); let s = sin(a); return vec2f(c * v.x - s * v.y, s * v.x + c * v.y); }
+
+// mothership: a stack of striated plates turning around a supercell's updraft, with a wall cloud and scud under it.
+// x extinction (1/m), y mask where the ordinary convective cloud gives way to it, z sky light (plate tops lit, lips dark)
+// lod 0: eroded rims, grooves, scud   1: grooves, scud   2 (lighting, shadows): shape only
+fn mothershipDensity(p: vec3f, i: i32, lod: i32) -> vec3f {
+    let A = F.ms[i * 3];        // centre x, z, radius, spin (rad)
+    let B = F.ms[i * 3 + 1];    // stack bottom, stack top, plates, twist (plates climbed per turn)
+    let C = F.ms[i * 3 + 2];    // wall cloud drop, wall cloud radius (fraction), strength, seed
+    let rel = p.xz - A.xy;
+    let r = length(rel);
+    if (r > A.z * 1.3 || p.y < B.x - C.x - 450.0 || p.y > B.y + 2500.0) { return vec3f(0.0); }
+    // the ordinary cloud gives way inside the stack and comes back towards its top, so the tower grows out of it
+    let mask = (1.0 - smoothstep(A.z * 0.95, A.z * 1.3, r)) * (1.0 - smoothstep(B.y - 500.0, B.y + 2500.0, p.y)) * C.z;
+    if (p.y > B.y + 500.0) { return vec3f(0.0, mask, 1.0); }
+    let rl = rot2(rel, -A.w);                                  // co-rotating frame: features turn with the updraft
+    let a = atan2(rl.y, rl.x);
+    // low-frequency warp: plates bend, thicken and thin; the outline bulges unevenly
+    let wv = textureSampleLevel(shapeTex, repSamp, vec3f(rl.x, p.y * 1.6, rl.y) / 7000.0 + C.w, 0.0);
+    let rw = r + (wv.z - 0.5) * 800.0 + (wv.w - 0.5) * 300.0;
+    var d = 0.0;
+    var sky = 0.2;
+    if (p.y >= B.x) {
+        let h = (p.y - B.x) / (B.y - B.x);
+        let hw = h + (wv.y - 0.5) * 0.05;                           // plates undulate a little, stay readable
+        // envelope: wide flat base, bulging low down, tapering into the tower above
+        let env = A.z * (0.76 + 0.24 * sin(PI * sat(hw / 0.7))) * mix(1.0, 0.6, smoothstep(0.5, 1.0, hw));   // bell, not pagoda
+        // plates: tiers with a rounded lip on their lower edge, in a slow helix
+        let f = fract(hw * B.z + B.w * a / (2.0 * PI));
+        let lip = smoothstep(0.0, 0.16, f) * pow(1.0 - f, 1.3);
+        let R = env * (0.86 + 0.14 * lip);
+        // soft rim, uneven inside
+        d = pow(sat((R - rw) / 700.0), 0.7) * (0.6 + 0.4 * wv.x);
+        d *= sat((p.y - B.x) / 150.0) * (1.0 - smoothstep(B.y - 1200.0, B.y + 500.0, p.y));
+        sky = (0.22 + 0.55 * smoothstep(0.05, 0.9, f)) * (0.55 + 0.45 * h) * (0.8 + 0.4 * wv.x);
+        if (lod <= 1 && d > 0.0) {
+            d *= 0.88 + 0.12 * smoothstep(0.1, 0.9, abs(fract(hw * B.z * 2.0 + B.w * a / PI + wv.y * 0.5) * 2.0 - 1.0));
+        }
+        if (lod == 0 && d > 0.0) {
+            // billowy, eroded rim; the core stays smooth
+            let rim = 1.0 - sat((R - rw) / 1800.0);
+            let n1 = textureSampleLevel(detailTex, repSamp, vec3f(rl.x, p.y, rl.y) / 1500.0 + C.w, 0.0);
+            let n2 = textureSampleLevel(detailTex, repSamp, vec3f(rl.x, p.y, rl.y) / 700.0, 0.0).x;
+            let e = (n1.x * 0.625 + n1.y * 0.25 + n1.z * 0.125) * 0.75 + n2 * 0.25;
+            d = sat(remap(d, e * (0.08 + 0.4 * rim), 1.0, 0.0, 1.0));
+        }
+    } else {
+        // wall cloud: a lowered drum under the updraft, narrowing downwards to a ragged bottom
+        let k = (B.x - p.y) / C.x;
+        let wr = A.z * C.y * (1.0 - 0.45 * k * k) * (1.0 + (wv.z - 0.5) * 0.5);
+        let cut = 0.75 + 0.6 * (wv.y - 0.5);
+        d = (1.0 - smoothstep(wr - 300.0, wr + 60.0, r)) * (1.0 - smoothstep(cut - 0.25, cut + 0.1, k));
+        sky = 0.15;
+        // scud: torn shreds hanging under the plates
+        if (lod <= 1 && p.y > B.x - 450.0 && r < A.z * 0.95) {
+            let n = textureSampleLevel(detailTex, repSamp, vec3f(rl.x, p.y * 2.0, rl.y) / 900.0 + C.w, 0.0);
+            let sc = smoothstep(0.52, 0.8, n.x * 0.7 + n.y * 0.3 + (wv.x - 0.5) * 0.4) * (1.0 - (B.x - p.y) / 450.0) * 0.6;
+            d = max(d, sc);
+        }
+    }
+    return vec3f(d * C.z * F.cloud.z, mask, sky);
+}
+
+// shelf cloud along a squall line's gust front: stacked laminar wedges, lowest at the leading lip, their tops sloping
+// up into the storm base behind; the lip wanders along the line, scud hangs under it.
+// lod 0: eroded edges, striations, scud   1: striations, scud   2 (lighting, shadows): shape only
+fn shelfLineDensity(p: vec3f, i: i32, lod: i32) -> vec2f {
+    let A = F.shelves[i * 4];        // ends a (xy), b (zw)
+    let B = F.shelves[i * 4 + 1];    // bow control point (xy), motion direction (zw)
+    let C = F.shelves[i * 4 + 2];    // lip height above ground, depth, tiers, strength
+    let D = F.shelves[i * 4 + 3];    // bounding box
+    let lipY = F.misc.z + C.x;
+    if (p.y < lipY - 600.0 || p.y > F.cloud.x + 300.0) { return vec2f(0.0); }
+    if (p.x < D.x || p.z < D.y || p.x > D.z || p.z > D.w) { return vec2f(0.0); }
+    let a = A.xy;
+    let b = A.zw;
+    let c = B.xy;
+    let ab = b - a;
+    let depth = C.y;
+    // cheap reject against the chord before solving for the curve
+    var bt = sat(dot(p.xz - a, ab) / max(dot(ab, ab), 1.0));
+    if (distance(p.xz, a + ab * bt) > distance(c, (a + b) * 0.5) * 0.5 + depth + 2500.0) { return vec2f(0.0); }
+    // nearest point on the bowed front: Newton steps on the quadratic Bezier
+    for (var k = 0; k < 3; k++) {
+        let q = bez(a, c, b, bt);
+        let dq = 2.0 * (1.0 - bt) * (c - a) + 2.0 * bt * (b - c);
+        let ddq = 2.0 * (a - 2.0 * c + b);
+        bt = sat(bt - dot(q - p.xz, dq) / max(dot(dq, dq) + dot(q - p.xz, ddq), 1.0));
+    }
+    let bq = bez(a, c, b, bt);
+    if (distance(p.xz, bq) > depth + 1500.0) { return vec2f(0.0); }
+    let ends = smoothstep(0.0, 0.07, bt) * (1.0 - smoothstep(0.93, 1.0, bt));
+    // warps: along the line the lip wanders and the tiers rise and dip; in 3D the surfaces bulge
+    let lw = textureSampleLevel(shapeTex, repSamp, vec3f(bt * length(ab) / 14000.0, 0.31, f32(i) * 0.37 + 0.5), 0.0);
+    let wv = textureSampleLevel(shapeTex, repSamp, vec3f(p.x - F.wind.z, p.y * 3.0, p.z - F.wind.w) / 9000.0, 0.0);
+    let wob = wv.x - 0.5;
+    let u = -dot(p.xz - bq, B.zw) + (lw.x - 0.5) * 1800.0 + (lw.z - 0.5) * 600.0 + wob * 700.0;   // distance behind the lip
+    let lift = (lw.y - 0.5) * 350.0;
+    let topSlope = (F.cloud.x + 250.0 - lipY) / depth;
+    var d = 0.0;
+    var sky = 0.2;
+    for (var j = 0; j < i32(C.z); j++) {
+        let fj = f32(j);
+        let uj = u - fj * depth * 0.12;
+        let yj = lipY + lift + fj * (380.0 + (lw.w - 0.5) * 160.0);
+        let thick = 230.0 + fj * 60.0;
+        var inside = 0.0;
+        var v = 0.0;                // height within the tier: 0 underside, 1 top
+        if (uj < 0.0) {             // the rounded nose of the tier
+            inside = 1.0 - smoothstep(thick * 0.5 - 90.0, thick * 0.5 + 40.0, length(vec2f(uj, p.y - (yj + thick * 0.5))));
+            v = sat((p.y - yj) / thick);
+        } else {
+            let yb = yj + uj * 0.025;                        // nearly flat underside
+            let yt = yj + thick + uj * topSlope;             // top slopes up into the storm base
+            inside = smoothstep(yb - 50.0, yb + 90.0, p.y) * (1.0 - smoothstep(yt - 120.0, yt + 40.0, p.y)) * (1.0 - smoothstep(depth * 0.8, depth, uj));
+            v = sat((p.y - yb) / max(yt - yb, 1.0));
+        }
+        if (inside > d) { d = inside; sky = (0.1 + 0.8 * v * v) * (0.8 + 0.4 * wv.y); }
+    }
+    d *= 0.72 + 0.28 * wv.y;                                  // uneven inside
+    if (lod <= 1 && d > 0.0) {
+        // laminar striations parallel to the front
+        d *= 0.6 + 0.4 * smoothstep(0.1, 0.6, abs(fract((p.y - lipY - max(u, 0.0) * topSlope * 0.5) / 140.0 + wob) * 2.0 - 1.0));
+    }
+    if (lod == 0 && d > 0.0) {
+        let n = textureSampleLevel(detailTex, repSamp, vec3f(p.x - F.wind.z, p.y * 1.5, p.z - F.wind.w) / 800.0, 0.0);
+        d = sat(remap(d, (n.x * 0.625 + n.y * 0.25 + n.z * 0.125) * 0.4, 1.0, 0.0, 1.0));
+    }
+    // scud: torn fragments under the shelf, behind the lip
+    let yb0 = lipY + lift + max(u, 0.0) * 0.025;
+    if (lod <= 1 && p.y < yb0 && p.y > yb0 - 380.0 && u > 200.0 && u < depth * 0.75) {
+        let n = textureSampleLevel(detailTex, repSamp, vec3f(p.x - F.wind.z, p.y * 2.5, p.z - F.wind.w) / 750.0, 0.0);
+        let sc = smoothstep(0.55, 0.82, n.x * 0.7 + n.y * 0.3 + wob * 0.3) * (1.0 - (yb0 - p.y) / 380.0) * 0.55;
+        if (sc > d) { d = sc; sky = 0.12; }
+    }
+    return vec2f(d * ends * C.w * F.cloud.z, sky);
+}
+
+// every kind of cloud at p: x extinction (1/m), y ambient light scale, z green tint.
+// lod: 0 full detail, 1 no detail erosion, 2 shape only (light march, shadow map). feat: bits of the analytic
+// structures this ray can meet (0-3 motherships, 4-5 shelf lines)
+fn cloudSample(p: vec3f, w: vec4f, lod: i32, feat: u32) -> vec3f {
+    var d = 0.0;
+    var amb = 0.0;
+    var green = 0.0;
+    let base = F.cloud.x;
+    // analytic storm structures; motherships replace the noise cloud where they stand
+    var mask = 0.0;
+    for (var i = 0; i < i32(F.features.x); i++) {
+        if ((feat & (1u << u32(i))) == 0u) { continue; }
+        let m = mothershipDensity(p, i, lod);
+        d += m.x;
+        amb += m.x * m.z;
+        mask = max(mask, m.y);
+    }
+    for (var i = 0; i < i32(F.features.y); i++) {
+        if ((feat & (16u << u32(i))) == 0u) { continue; }
+        let sl = shelfLineDensity(p, i, lod);
+        d += sl.x;
+        amb += sl.x * sl.y;
+    }
+    if (p.y > base - 1300.0 && mask < 0.999) {
+        // fetch the anvil / shelf map only where those can be (anvils high, cell shelves low) and the style map only
+        // near storm cells (they lift the weather map's cloud top)
+        var an = vec4f(0.0);
+        if (p.y > base + 2500.0 || p.y < base + 450.0) { an = anvilAt(p.xz); }
+        var st = vec4f(0.0);
+        if (w.y > F.cloud.y + 30.0) { st = styleAt(p.xz); }
+        let dc = convectiveDensity(p, w, an, st, lod == 0) * (1.0 - mask);
+        var ds = 0.0;
+        if (an.z > 0.01) { ds = shelfDensity(p, an); }
+        d += dc + ds;
+        amb += dc + ds * 0.5;
+        green = st.y * sat((base + 3500.0 - p.y) / 3000.0);
+    }
+    if (p.y > F.layerInfo.x && p.y < F.layerInfo.y) {
+        let lc = layerCovAt(p.xz);
+        for (var i = 0; i < ${MAX_LAYERS}; i++) {
+            let dl = layerDensity(p, i, lc[i], lod == 0);
+            d += dl;
+            amb += dl * F.layers[i * 3 + 2].y;
+        }
+    }
+    return vec3f(d, amb / max(d, 1e-9), green);
+}
+
+// shape-only extinction, for light marches and the shadow map
+fn cloudDensity(p: vec3f, w: vec4f) -> f32 { return cloudSample(p, w, 2, 0xffffffffu).x; }
+
+// rain (x) and snow (y) extinction (1/m) at p; w is the slanted weather sample (precipWeatherAt)
+fn precipDensity(p: vec3f, w: vec4f) -> vec2f {
+    if (w.z < 0.003) { return vec2f(0.0); }
+    let base = F.cloud.x;
+    let bottom = mix(F.misc.z - 300.0, base, w.w);                    // virga: evaporated below here
+    let low = smoothstep(bottom, bottom + max(250.0, (base - bottom) * 0.7 * w.w + 250.0), p.y);
+    let high = sat((base + 700.0 - p.y) / 900.0);                     // shafts start inside the cloud
+    if (low * high <= 0.0) { return vec2f(0.0); }
+    let q = vec3f(p.x - F.wind.z * 0.3, p.y + F.misc.y, p.z - F.wind.w * 0.3);
+    let streak = textureSampleLevel(detailTex, repSamp, vec3f(q.x / 420.0, q.y / 4200.0, q.z / 420.0), 0.0);
+    let clump = textureSampleLevel(shapeTex, repSamp, vec3f(q.x / 6000.0, q.y / 24000.0, q.z / 6000.0), 0.0).x;
+    let curtain = smoothstep(0.38, 0.9, (streak.x * 0.7 + streak.y * 0.3) * 0.6 + clump * 0.6);
+    let d = w.z * low * high * (0.12 + 0.88 * curtain);
+    let snow = smoothstep(F.precip.x - 250.0, F.precip.x + 250.0, p.y);
+    return d * vec2f((1.0 - snow) * F.precip.z, snow * F.precip.w);
+}
+`;
+
+// needs F, shadowTex, clampSamp
+const WGSL_SHADOW_SAMPLE = /* wgsl */`
+// x: sun transmittance through the cloud slab, y: sky light left under the cloud column above p
+fn shadowAt(p: vec3f) -> vec2f {
+    let s = F.sunDir.xyz;
+    let base = F.layerInfo.z;
+    let lift = max(base - p.y, 0.0);
+    let xz = p.xz + s.xz * lift / max(s.y, 0.08);
+    let ua = (xz - F.wdomain.xy) / F.wdomain.z;
+    let ub = (p.xz - F.wdomain.xy) / F.wdomain.z;
+    let a = textureSampleLevel(shadowTex, clampSamp, ua, 0.0).x;
+    let b = textureSampleLevel(shadowTex, clampSamp, ub, 0.0).y;
+    // beyond the map: no cloud shadows instead of its edge texels smeared outwards
+    let ea = sat(min(min(ua.x, 1.0 - ua.x), min(ua.y, 1.0 - ua.y)) * 12.0);
+    let eb = sat(min(min(ub.x, 1.0 - ub.x), min(ub.y, 1.0 - ub.y)) * 12.0);
+    let above = sat((p.y - base) / max(F.noise.w - base, 1.0));
+    return vec2f(mix(mix(1.0, a, ea), 1.0, above), mix(mix(1.0, b, eb), 1.0, above));
+}
+`;
+
+// ---------------------------------------------------------------------------------- WGSL noise volumes
+// Tileable 3D noise, baked once: shape (Perlin-Worley + 3 Worley fbm octaves) and detail (3 Worley fbm octaves).
+const WGSL_NOISE = /* wgsl */`
+@group(0) @binding(0) var shapeOut: texture_storage_3d<rgba8unorm, write>;
+@group(0) @binding(1) var detailOut: texture_storage_3d<rgba8unorm, write>;
+
+fn pcg3(v0: vec3u) -> vec3u {
+    var v = v0 * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> vec3u(16u);
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+fn h33(c: vec3i, seed: u32) -> vec3f { return vec3f(pcg3(vec3u(c) + vec3u(seed, seed * 7u, seed * 13u))) / 4294967295.0; }
+fn wrapc(c: vec3i, period: i32) -> vec3i { return ((c % vec3i(period)) + vec3i(period)) % vec3i(period); }
+
+fn worley(p: vec3f, period: i32, seed: u32) -> f32 {
+    let id = vec3i(floor(p));
+    let f = fract(p);
+    var md = 1e9;
+    for (var z = -1; z <= 1; z++) {
+        for (var y = -1; y <= 1; y++) {
+            for (var x = -1; x <= 1; x++) {
+                let o = vec3i(x, y, z);
+                let d = vec3f(o) + h33(wrapc(id + o, period), seed) - f;
+                md = min(md, dot(d, d));
+            }
+        }
+    }
+    return clamp(1.0 - sqrt(md), 0.0, 1.0);
+}
+
+fn gradAt(c: vec3i, period: i32, seed: u32) -> vec3f { return normalize(h33(wrapc(c, period), seed) * 2.0 - 1.0 + 1e-4); }
+
+fn perlin(p: vec3f, period: i32, seed: u32) -> f32 {
+    let i = vec3i(floor(p));
+    let f = fract(p);
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    var v: array<f32, 8>;
+    for (var k = 0; k < 8; k++) {
+        let o = vec3i(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+        v[k] = dot(gradAt(i + o, period, seed), f - vec3f(o));
+    }
+    let x0 = mix(v[0], v[1], u.x); let x1 = mix(v[2], v[3], u.x);
+    let x2 = mix(v[4], v[5], u.x); let x3 = mix(v[6], v[7], u.x);
+    return mix(mix(x0, x1, u.y), mix(x2, x3, u.y), u.z);
+}
+
+fn worleyFbm(p: vec3f, freq: i32, seed: u32) -> f32 {
+    return worley(p * f32(freq), freq, seed) * 0.625 + worley(p * f32(freq * 2), freq * 2, seed + 1u) * 0.25 + worley(p * f32(freq * 4), freq * 4, seed + 2u) * 0.125;
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn genShape(@builtin(global_invocation_id) gid: vec3u) {
+    if (any(gid >= vec3u(${NOISE_SHAPE}u))) { return; }
+    let p = (vec3f(gid) + 0.5) / ${NOISE_SHAPE}.0;
+    var pf = 0.0; var amp = 1.0; var norm = 0.0; var freq = 4;
+    for (var o = 0u; o < 5u; o++) { pf += perlin(p * f32(freq), freq, 11u + o) * amp; norm += amp; amp *= 0.5; freq *= 2; }
+    pf = clamp(pf / norm * 1.3 + 0.5, 0.0, 1.0);
+    let w = worleyFbm(p, 4, 30u);
+    let pw = clamp(w + pf * (1.0 - w) - (1.0 - pf) * 0.35, 0.0, 1.0);     // Perlin-Worley
+    textureStore(shapeOut, gid, vec4f(pw, worleyFbm(p, 4, 40u), worleyFbm(p, 8, 50u), worleyFbm(p, 16, 60u)));
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn genDetail(@builtin(global_invocation_id) gid: vec3u) {
+    if (any(gid >= vec3u(${NOISE_DETAIL}u))) { return; }
+    let p = (vec3f(gid) + 0.5) / ${NOISE_DETAIL}.0;
+    textureStore(detailOut, gid, vec4f(worleyFbm(p, 2, 70u), worleyFbm(p, 4, 80u), worleyFbm(p, 8, 90u), 1.0));
+}
+`;
+
+// ------------------------------------------------------------------------------------- WGSL weather maps
+// weather map: layer coverage from large-scale noise advected by the wind, plus every storm cell
+const WGSL_WEATHER = /* wgsl */`
+@group(1) @binding(0) var weatherOut: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(1) var anvilOut: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(2) var layerOut: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(3) var styleOut: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn weather(@builtin(global_invocation_id) gid: vec3u) {
+    let n = u32(F.wdomain.w);
+    if (gid.x >= n || gid.y >= n) { return; }
+    let xz = F.wdomain.xy + (vec2f(gid.xy) + 0.5) / f32(n) * F.wdomain.z;
+    let lf = fbm2((xz - F.wind.zw) / 16000.0, 5);
+    let covParam = F.cloud.w;
+    var cov = sat(covParam * (0.5 + 2.0 * (lf - 0.5)) + covParam * covParam * 0.35);
+    var top = F.cloud.y;
+    var pr = F.cirrus.w * smoothstep(0.5, 0.9, cov) * (0.4 + lf);      // drizzle / snow from the layer itself
+    var vw = 0.0;
+    var vs = 1e-4;
+    var anvCov = 0.0;
+    var anvTop = 0.0;
+    var shelfCov = 0.0;
+    var shelfW = 0.0;
+    var style = vec4f(0.0);
+    // genus layers: a coverage map each, drifting with the wind; some drizzle (stratus, nimbostratus)
+    var lcov = vec4f(0.0);
+    for (var k = 0; k < ${MAX_LAYERS}; k++) {
+        let A = F.layers[k * 3];
+        let B = F.layers[k * 3 + 1];
+        let C = F.layers[k * 3 + 2];
+        if (A.z <= 0.0) { continue; }
+        let ln = fbm2((xz - F.wind.zw * 0.8) / B.x + C.w * 17.0, 4);
+        let lc = sat(A.z * (0.45 + 2.2 * (ln - 0.5)) + A.z * A.z * 0.6);
+        lcov[k] = lc;
+        pr = 1.0 - (1.0 - pr) * (1.0 - C.z * smoothstep(0.35, 0.85, lc));
+    }
+    let wl = length(F.wind.xy);
+    let wd = select(vec2f(1.0, 0.0), F.wind.xy / wl, wl > 0.1);
+    for (var i = 0u; i < u32(F.near.w); i++) {
+        let c = cells[i];
+        let dist = length(xz - c.a.xy);
+        if (dist > c.a.z * 3.4) { continue; }                          // beyond every footprint of this cell (anvil reach)
+        // anvil: tall cells spread a sheet downwind under the tropopause
+        let tall = sat((c.a.w - F.cloud.y - 2500.0) / 4000.0) * sat(c.b.x * 2.0);
+        if (tall > 0.0) {
+            let ad = xz - c.a.xy - wd * c.a.z * 0.8;
+            let along = dot(ad, wd);
+            let ra = length(vec2f(along * 0.6, dot(ad, vec2f(-wd.y, wd.x)))) / (c.a.z * 1.6) * (0.8 + 0.4 * fbm2(xz / 5000.0 + c.b.z * 7.0, 3));
+            let ga = sat(1.0 - ra);
+            let a = ga * ga * (3.0 - 2.0 * ga) * tall * 0.85;
+            if (a > 0.005) { anvCov = max(anvCov, a); anvTop = max(anvTop, c.a.w); }
+        }
+        if (dist > c.a.z * 1.45) { continue; }                         // the rest (body, shelf, rain core) is closer in
+        let d = xz - c.a.xy;
+        let outline = fbm2((xz - F.wind.zw * 0.5) / (c.a.z * 0.7) + c.b.z * 31.0, 3);
+        let r = length(d) / c.a.z * (0.75 + 0.5 * outline);
+        let g = sat(1.0 - r);
+        let gs = g * g * (3.0 - 2.0 * g);
+        // shelf cloud: a wedge band on the leading (downwind) edge, along the gust front
+        if (c.d.x > 0.0) {
+            let len = max(length(d), 1.0);
+            let front = smoothstep(0.35, 0.85, dot(d, wd) / len);
+            let rs = len / c.a.z * (0.9 + 0.2 * outline);
+            let wedge = sat((1.25 - rs) / 0.45);
+            let sc = c.d.x * front * smoothstep(0.75, 0.85, rs) * smoothstep(0.0, 0.15, wedge) * sat(c.b.x * 2.0);
+            if (sc > shelfCov) { shelfCov = sc; shelfW = wedge; }
+        }
+        // supercell style: laminar plates, green tint, wall cloud under the updraft (opposite the rain core)
+        style.x = max(style.x, gs * c.d.y);
+        style.y = max(style.y, gs * c.d.z * sat(c.b.y * 2.0));
+        let wr = sat(1.0 - length(d + c.c.yz * 0.6) / (c.a.z * 0.3));
+        style.z = max(style.z, c.d.w * wr * wr * (3.0 - 2.0 * wr) * sat(c.b.x * 2.0));
+        cov = max(cov, gs * c.b.x * 0.9);
+        top = max(top, mix(F.cloud.y, c.a.w, pow(gs, 0.55) * sat(c.b.x * 3.0)));      // domed towers
+        // precipitation core: c.c.x of the radius, offset towards the forward flank
+        let rp = length(d - c.c.yz) / c.a.z * (0.75 + 0.5 * outline);
+        if (c.b.y <= 0.0 || rp > c.c.x * 1.5) { continue; }           // no precipitation core here
+        let streaks = fbm2(xz / 900.0 + c.b.z * 17.0, 3);
+        let pc = sat(1.0 - rp / max(c.c.x, 0.05) + (streaks - 0.5) * 0.5);
+        let pv = c.b.y * pc * pc * (3.0 - 2.0 * pc);
+        vw += c.b.w * pv;
+        vs += pv;
+        pr = 1.0 - (1.0 - pr) * (1.0 - pv);
+    }
+    textureStore(weatherOut, gid.xy, vec4f(cov, top, pr, vw / vs));
+    textureStore(anvilOut, gid.xy, vec4f(anvCov, anvTop, shelfCov, shelfW));
+    textureStore(layerOut, gid.xy, lcov);
+    textureStore(styleOut, gid.xy, style);
+}
+`;
+
+// cloud shadow map: sun transmittance from the cloud base plane up through the slab, and sky occlusion of the column
+const WGSL_SHADOW = /* wgsl */`
+@group(1) @binding(0) var shadowOut: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn shadow(@builtin(global_invocation_id) gid: vec3u) {
+    // time slicing: this frame refreshes every S-th row, starting at the slice index
+    let dim = textureDimensions(shadowOut);
+    let S = u32(max(F.lod.y, 1.0));
+    let tex = vec2u(gid.x, gid.y * S + u32(F.lod.z));
+    if (tex.x >= dim.x || tex.y >= dim.y) { return; }
+    let xz = F.wdomain.xy + (vec2f(tex) + 0.5) / vec2f(dim) * F.wdomain.z;
+    let s = normalize(vec3f(F.sunDir.x, max(F.sunDir.y, 0.08), F.sunDir.z));
+    let base = F.layerInfo.z;
+    let top = F.noise.w;
+    let N = 24;
+    let ds = (top - base) / s.y / f32(N);
+    var od = 0.0;
+    for (var i = 0; i < N; i++) {
+        let p = vec3f(xz.x, base, xz.y) + s * (f32(i) + 0.5) * ds;
+        od += cloudDensity(p, weatherAt(p.xz)) * ds;
+        if (od > 12.0) { break; }
+    }
+    let w = weatherAt(xz);
+    var ov = 0.0;
+    let M = 10;
+    let dv = (max(max(max(w.y, anvilAt(xz).y), F.layerInfo.y), base + 400.0) - base) / f32(M);
+    for (var i = 0; i < M; i++) {
+        ov += cloudDensity(vec3f(xz.x, base + (f32(i) + 0.5) * dv, xz.y), w) * dv;
+    }
+    textureStore(shadowOut, tex, vec4f(exp(-od), 0.12 + 0.88 * exp(-ov * 0.03), 0.0, 1.0));
+}
+`;
+
+// ground state: snow cover (x) and wetness (y) on the terrain grid
+const WGSL_GROUND = /* wgsl */`
+@group(1) @binding(0) var<storage, read_write> groundRW: array<vec2f>;
+
+@compute @workgroup_size(8, 8)
+fn groundUpdate(@builtin(global_invocation_id) gid: vec3u) {
+    let n = u32(F.ground.z);
+    if (gid.x >= n || gid.y >= n) { return; }
+    let uv = (vec2f(gid.xy) + 0.5) / f32(n);
+    let xz = F.tdomain.xy + uv * F.tdomain.z;
+    let h = textureSampleLevel(heightTex, clampSamp, uv, 0.0).x;
+    let w = weatherAt(xz);
+    let reach = sat(1.0 - w.w * 1.25);                                // virga never lands
+    let pr = w.z * reach;
+    let temp = F.misc.x - 0.0065 * h;
+    let dt = F.misc.w;
+    let idx = gid.y * n + gid.x;
+    var g = groundRW[idx];
+    if (temp < 1.0) { g.x += pr * dt / 1500.0; } else { g.y += pr * dt / 400.0; }
+    g.x -= max(temp, 0.0) * dt / 9000.0;
+    g.y -= dt / 2400.0 * (0.4 + 0.1 * max(temp, 0.0)) * (1.0 - pr);
+    groundRW[idx] = clamp(g, vec2f(0.0), vec2f(1.0, 1.0));
+}
+`;
+
+// ------------------------------------------------------------------------------------- WGSL volumetrics
+const WGSL_MARCH = /* wgsl */`
+@group(1) @binding(0) var depthTex: texture_depth_2d;
+@group(1) @binding(1) var outColor: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(2) var outDepth: texture_storage_2d<r32float, write>;
+
+fn hazeDensity(y: f32) -> f32 { return F.zenith.w * exp(-max(y - F.misc.z, 0.0) / F.horizon.w); }
+
+// optical depth of the haze along a straight segment
+fn hazeOD(y0: f32, y1: f32, len: f32) -> f32 {
+    let H = F.horizon.w;
+    let a = exp(-max(y0 - F.misc.z, 0.0) / H);
+    let b = exp(-max(y1 - F.misc.z, 0.0) / H);
+    let dy = y1 - y0;
+    if (abs(dy) < 1.0) { return F.zenith.w * a * len; }
+    return F.zenith.w * H * len * (a - b) / dy;
+}
+
+// tends to the horizon sky colour far away; sunlit haze adds forward scattering, so cloud shadows cut crepuscular rays
+fn hazeLight(mu: f32, sh: vec2f) -> vec3f {
+    let glow = hg(mu, 0.78) * 0.025 + hg(mu, 0.3) * 0.02;
+    return F.horizon.rgb * (0.45 + 0.55 * sh.y) + F.sunCol.rgb * sh.x * (glow + hg(mu, 0.6) * 0.015);
+}
+
+// radiance scattered towards the eye by cloud at p
+// lightSteps / stepScale: fewer, longer steps far from the camera (light LOD)
+fn cloudLight(p: vec3f, mu: f32, w: vec4f, lightSteps: i32, stepScale: f32, ambScale: f32) -> vec3f {
+    let s = F.sunDir.xyz;
+    var od = 0.0;
+    var ls = 90.0 * stepScale;
+    var t = 0.0;
+    for (var j = 0; j < lightSteps; j++) {
+        let q = p + s * (t + ls * 0.5);
+        od += cloudDensity(q, weatherAt(q.xz)) * ls;
+        t += ls;
+        ls *= 1.9;
+    }
+    // multiple scattering octaves (Wrenninge): each octave less extinction, less anisotropy
+    var sun = 0.0; var a = 1.0; var b = 1.0; var c = 1.0;
+    for (var k = 0; k < 3; k++) {
+        sun += a * exp(-od * b) * mix(hg(mu, 0.8 * c), hg(mu, -0.25 * c), 0.3);
+        a *= 0.55; b *= 0.35; c *= 0.6;
+    }
+    let base = F.cloud.x;
+    let top = max(w.y, base + 400.0);
+    let h = sat((p.y - base) / (top - base));
+    let tall = sat((top - base - 2500.0) / 6000.0);
+    let amb = F.ambient.rgb * (0.3 + 0.7 * pow(h, 0.6)) * mix(1.0, 0.3, tall * (1.0 - h)) * ambScale;
+    let bounce = F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.03 * (1.0 - h);
+    return F.sunCol.rgb * sun + amb + bounce + flashLight(p) * 0.05;
+}
+
+fn rayBox(ro: vec3f, rd: vec3f, lo: vec3f, hi: vec3f, t0: f32, t1: f32) -> bool {
+    let inv = 1.0 / select(rd, vec3f(1e-6), abs(rd) < vec3f(1e-6));
+    let a = (lo - ro) * inv;
+    let b = (hi - ro) * inv;
+    let tn = max(max(min(a.x, b.x), min(a.y, b.y)), min(a.z, b.z));
+    let tf = min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z));
+    return max(tn, t0) <= min(tf, t1);
+}
+
+// which analytic structures this ray passes near (their bounding boxes): bits 0-3 motherships, 4-5 shelf lines
+fn featureMask(ro: vec3f, rd: vec3f, t0: f32, t1: f32) -> u32 {
+    var m = 0u;
+    for (var i = 0; i < i32(F.features.x); i++) {
+        let A = F.ms[i * 3];
+        let B = F.ms[i * 3 + 1];
+        let C = F.ms[i * 3 + 2];
+        let r = A.z * 1.3;
+        if (rayBox(ro, rd, vec3f(A.x - r, B.x - C.x - 450.0, A.y - r), vec3f(A.x + r, B.y + 2500.0, A.y + r), t0, t1)) { m |= 1u << u32(i); }
+    }
+    for (var i = 0; i < i32(F.features.y); i++) {
+        let D = F.shelves[i * 4 + 3];
+        let lipY = F.misc.z + F.shelves[i * 4 + 2].x;
+        if (rayBox(ro, rd, vec3f(D.x, lipY - 600.0, D.y), vec3f(D.z, F.cloud.x + 300.0, D.w), t0, t1)) { m |= 16u << u32(i); }
+    }
+    return m;
+}
+
+@compute @workgroup_size(8, 8)
+fn march(@builtin(global_invocation_id) gid: vec3u) {
+    let size = vec2u(F.screen.zw);
+    let frame = F.right.w;
+    // checkerboard: this frame marches the pixels with (x + y + frame) even; the resolve fills the others
+    var px = gid.xy;
+    if (F.lod.x > 0.5) { px.x = gid.x * 2u + ((gid.y + u32(frame)) & 1u); }
+    if (px.x >= size.x || px.y >= size.y) { return; }
+    let jit = fract(vec2f(frame * 0.7548776662, frame * 0.5698402910));
+    let uv = (vec2f(px) + jit) / vec2f(size);
+    let dir = rayDir(vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0));
+    let full = F.screen.xy;
+    let dz = textureLoad(depthTex, vec2i(min(uv * full, full - 1.0)), 0);
+    let sceneT = select(1e9, F.fwd.w / dz / max(dot(dir, F.fwd.xyz), 1e-3), dz > 0.0);
+
+    let ro = F.cam.xyz;
+    let mode = i32(F.ground.w);
+    let doClouds = mode != 3;
+    let doPrecip = mode != 2;
+    let doHaze = mode == 0;
+    let mu = dot(dir, F.sunDir.xyz);
+    let base = F.cloud.x;
+
+    var t0 = 0.0;
+    var t1 = min(sceneT, F.march.z);
+    if (abs(dir.y) > 1e-5) {
+        let ta = (F.noise.w - ro.y) / dir.y;
+        let tb = (F.misc.z - 1500.0 - ro.y) / dir.y;
+        t0 = max(t0, min(ta, tb));
+        t1 = min(t1, max(ta, tb));
+    } else if (ro.y > F.noise.w) { t1 = -1.0; }
+
+    var col = vec3f(0.0);
+    var T = 1.0;
+    var depthAcc = 0.0;
+    var wsum = 0.0;
+    if (t1 > t0) {
+        let span = t1 - t0;
+        // step-count LOD: short segments (looking down at nearby ground) need fewer steps than long horizontal ones
+        let N = max(24, i32(ceil(F.march.x * sqrt(min(span / 30000.0, 1.0)))));
+        // per-pixel, per-frame step offset (hashed: interleaved gradient noise lines up into streaks at half resolution)
+        let jitter = rnd(px.x * 1973u + px.y * 9277u + u32(frame) * 26699u);
+        let feat = featureMask(ro, dir, t0, t1);
+        let detailDist = F.lod.w;
+        var emptyRun = 0;           // consecutive cloud-free samples: in empty air clouds are evaluated every other step
+        let rainPhase = mix(hg(mu, 0.75), hg(mu, 0.0), 0.45);
+        let snowPhase = mix(hg(mu, 0.45), hg(mu, 0.0), 0.6);
+        for (var i = 0; i < N; i++) {
+            let fa = f32(i) / f32(N);
+            let fb = f32(i + 1) / f32(N);
+            let fs = (f32(i) + jitter) / f32(N);
+            let ds = span * (fb * fb - fa * fa);
+            let t = t0 + span * fs * fs;
+            let p = ro + dir * t;
+            var sigma = 0.0;
+            var S = vec3f(0.0);
+            let cloudy = doClouds && p.y > F.layerInfo.z && p.y < F.features.z;
+            if (cloudy && emptyRun >= 2 && (emptyRun & 1) == 0) { emptyRun++; }
+            else if (cloudy) {
+                let w = weatherAt(p.xz);
+                // LOD by distance: detail erosion near, fine structure mid, shape only far
+                let lod = select(select(2, 1, t < detailDist * 2.5), 0, t < detailDist);
+                let cs = cloudSample(p, w, lod, feat);
+                let dc = cs.x;
+                if (dc > 0.0) {
+                    let nl = i32(F.march.y);
+                    let ls = select(select(nl, max(nl - 1, 2), t > detailDist), 2, t > detailDist * 2.5);
+                    let tint = mix(vec3f(1.0), vec3f(0.62, 1.0, 0.72), cs.z);   // green storm light
+                    S += dc * cloudLight(p, mu, w, ls, clamp(t / detailDist, 1.0, 3.0), cs.y) * tint;
+                    sigma += dc;
+                    emptyRun = 0;
+                } else { emptyRun++; }
+            }
+            if (p.y < base + 700.0) {
+                let sh = shadowAt(p);
+                if (doPrecip) {
+                    let pd = precipDensity(p, precipWeatherAt(p));
+                    if (pd.x + pd.y > 0.0) {
+                        let amb = F.ambient.rgb * (0.25 + 0.75 * sh.y) + F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.02;
+                        S += pd.x * (F.sunCol.rgb * sh.x * rainPhase + amb * 0.85) * 0.9;
+                        S += pd.y * (F.sunCol.rgb * sh.x * snowPhase * 0.6 + amb * 1.25) * 0.95;
+                        S += (pd.x + pd.y) * flashLight(p) * 0.02;
+                        sigma += pd.x + pd.y;
+                    }
+                }
+                if (doHaze) {
+                    let hd = hazeDensity(p.y);
+                    S += hd * hazeLight(mu, sh);
+                    sigma += hd;
+                }
+            } else if (doHaze) {
+                let hd = hazeDensity(p.y);
+                S += hd * hazeLight(mu, vec2f(1.0));
+                sigma += hd;
+            }
+            if (sigma > 1e-8) {
+                let tr = exp(-sigma * ds);
+                col += T * S / sigma * (1.0 - tr);
+                let dT = T * (1.0 - tr);
+                depthAcc += t * dT;
+                wsum += dT;
+                T *= tr;
+                if (T < 0.004) { break; }
+            }
+        }
+    }
+
+    // haze beyond the march, up to the terrain
+    if (doHaze && sceneT < 1e8 && sceneT > max(t1, 0.0)) {
+        let a = max(t1, 0.0);
+        let od = hazeOD(ro.y + dir.y * a, ro.y + dir.y * sceneT, sceneT - a);
+        let tr = exp(-od);
+        col += T * hazeLight(mu, vec2f(1.0)) * (1.0 - tr);
+        T *= tr;
+    }
+
+    // cirrus sheet above everything
+    if (doClouds && sceneT > 1e8 && dir.y > 0.0 && ro.y < F.cirrus.x && F.cirrus.y > 0.0) {
+        let tc = (F.cirrus.x - ro.y) / dir.y;
+        let c = ro + dir * tc;
+        let wl = length(F.wind.xy);
+        let wd = select(vec2f(1.0, 0.0), F.wind.xy / wl, wl > 0.1);
+        let along = vec2f(dot(c.xz, wd), dot(c.xz, vec2f(-wd.y, wd.x)));
+        let q = (along - vec2f(dot(F.wind.zw, wd) * 1.5, 0.0)) / F.cirrus.z;
+        let n = textureSampleLevel(shapeTex, repSamp, vec3f(q.x * 0.35, q.y * 2.2, 0.37), 0.0);
+        let streak = n.x * 0.6 + n.z * 0.4;
+        let a = sat(remap(streak, 1.0 - F.cirrus.y * 0.8, 1.0, 0.0, 1.0)) * 0.55 * sat(1.0 - tc / 160000.0);
+        let lc = F.sunCol.rgb * (hg(mu, 0.6) * 0.5 + 0.06) + F.ambient.rgb * 0.8;
+        col += T * lc * a;
+        T *= 1.0 - a;
+    }
+
+    textureStore(outColor, px, vec4f(col, T));
+    textureStore(outDepth, px, vec4f(select(min(sceneT, F.march.z), depthAcc / wsum, wsum > 1e-3), 0.0, 0.0, 0.0));
+}
+`;
+
+// temporal reprojection of the volumetrics, with neighbourhood clamping
+const WGSL_RESOLVE = /* wgsl */`
+@group(1) @binding(0) var curTex: texture_2d<f32>;
+@group(1) @binding(1) var curDepth: texture_2d<f32>;
+@group(1) @binding(2) var histTex: texture_2d<f32>;
+@group(1) @binding(3) var histOut: texture_storage_2d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8)
+fn resolve(@builtin(global_invocation_id) gid: vec3u) {
+    let size = vec2i(textureDimensions(curTex));
+    let q = vec2i(gid.xy);
+    if (q.x >= size.x || q.y >= size.y) { return; }
+    let checker = F.lod.x > 0.5;
+    let fresh = !checker || ((q.x + q.y + i32(F.right.w)) & 1) == 0;   // marched this frame
+    // neighbourhood statistics over pixels marched this frame: the 3x3, or on a checkerboard the centre and diagonals
+    // (fresh pixel) / the four direct neighbours (stale pixel)
+    var m1 = vec4f(0.0);
+    var m2 = vec4f(0.0);
+    var n = 0.0;
+    var dsum = 0.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let same = ((x + y) & 1) == 0;
+            if (checker && same != fresh) { continue; }
+            let o = clamp(q + vec2i(x, y), vec2i(0), size - 1);
+            let c = textureLoad(curTex, o, 0);
+            m1 += c;
+            m2 += c * c;
+            n += 1.0;
+            dsum += textureLoad(curDepth, o, 0).x;
+        }
+    }
+    let mean = m1 / n;
+    let sigma = sqrt(max(m2 / n - mean * mean, vec4f(0.0)));
+    let box = select(1.6, 1.25, fresh);
+    let mn = mean - sigma * box;
+    let mx = mean + sigma * box;
+    let cur = select(mean, textureLoad(curTex, q, 0), fresh);
+    let depth = select(dsum / n, textureLoad(curDepth, q, 0).x, fresh);
+    let uv = (vec2f(q) + 0.5) / vec2f(size);
+    let dir = rayDir(vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0));
+    let pc = F.prevViewProj * vec4f(F.cam.xyz + dir * depth, 1.0);
+    var o = cur;
+    if (pc.w > 0.0 && F.near.z < 0.5) {
+        let puv = vec2f(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
+        if (all(puv > vec2f(0.0)) && all(puv < vec2f(1.0))) {
+            let hist = clamp(textureSampleLevel(histTex, clampSamp, puv, 0.0), mn, mx);
+            o = mix(hist, cur, select(0.06, select(0.1, 0.18, checker), fresh));
+        }
+    }
+    textureStore(histOut, q, o);
+}
+`;
+
+// ------------------------------------------------------------------------------------------ WGSL scene
+const WGSL_SCENE = /* wgsl */`
+struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
+
+@vertex fn vsSky(@builtin(vertex_index) vi: u32) -> SkyOut {
+    let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u)) * 2.0 - 1.0;
+    var o: SkyOut;
+    o.pos = vec4f(p, 0.0, 1.0);
+    o.ndc = p;
+    return o;
+}
+
+@fragment fn fsSky(i: SkyOut) -> @location(0) vec4f {
+    let d = rayDir(i.ndc);
+    var c = skyColor(d);
+    c += F.sunCol.rgb * 30.0 * smoothstep(0.99990, 0.99996, dot(d, F.sunDir.xyz));
+    return vec4f(c, 1.0);
+}
+
+// geometric grid: linear over the heightfield, then rings growing out to the horizon
+fn gridWarp(u: f32) -> f32 {
+    let a = abs(u);
+    let r0 = F.tdomain.z * 0.5;
+    let inner = 0.72;
+    let r = select(r0 * exp((a - inner) / (1.0 - inner) * log(260000.0 / r0)), a / inner * r0, a < inner);
+    return sign(u) * r;
+}
+
+fn terrainHeight(xz: vec2f) -> vec4f {
+    let uv = (xz - F.tdomain.xy) / F.tdomain.z;
+    let s = textureSampleLevel(heightTex, clampSamp, uv, 0.0);
+    let out = max(max(abs(uv.x - 0.5), abs(uv.y - 0.5)) - 0.5, 0.0) * F.tdomain.z;
+    let k = exp(-out / 4000.0);
+    return vec4f(mix(F.misc.z, s.x, k), normalize(mix(vec3f(0.0, 1.0, 0.0), s.yzw, k * k * k)));
+}
+
+struct TerrOut { @builtin(position) pos: vec4f, @location(0) world: vec3f };
+
+@vertex fn vsTerrain(@builtin(vertex_index) vi: u32) -> TerrOut {
+    let N = ${GRID_N}u;
+    let i = vi % N;
+    let j = vi / N;
+    let u = f32(i) / f32(N - 1u) * 2.0 - 1.0;
+    let v = f32(j) / f32(N - 1u) * 2.0 - 1.0;
+    let xz = F.tdomain.xy + F.tdomain.z * 0.5 + vec2f(gridWarp(u), gridWarp(v));
+    let h = terrainHeight(xz).x;
+    var o: TerrOut;
+    o.world = vec3f(xz.x, h, xz.y);
+    o.pos = F.viewProj * vec4f(o.world, 1.0);
+    return o;
+}
+
+fn groundAt(xz: vec2f) -> vec2f {
+    let uv = (xz - F.tdomain.xy) / F.tdomain.z;
+    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0))) { return vec2f(0.0); }
+    let n = i32(F.ground.z);
+    let g = clamp((xz - F.tdomain.xy) / F.tdomain.z * f32(n) - 0.5, vec2f(0.0), vec2f(f32(n) - 1.001));
+    let i = vec2i(floor(g));
+    let f = fract(g);
+    let a = ground[i.y * n + i.x];
+    let b = ground[i.y * n + min(i.x + 1, n - 1)];
+    let c = ground[min(i.y + 1, n - 1) * n + i.x];
+    let d = ground[min(i.y + 1, n - 1) * n + min(i.x + 1, n - 1)];
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// farm sections on a mile grid: crops, fallow, centre pivots, section-line roads
+fn fieldColor(xz: vec2f, px: f32) -> vec3f {
+    let fs = F.ground.x;
+    let g = xz / fs;
+    let cell = floor(g);
+    let f = fract(g);
+    let h2 = hash12(cell + 71.3);
+    var k = hash12(cell);
+    if (h2 < 0.5) { k = hash12(cell * 2.0 + floor(f * 2.0) + 13.7); }
+    else if (h2 < 0.7) { k = hash12(cell * 2.0 + vec2f(floor(f.x * 2.0), 0.0) + 5.2); }
+    var pal = array<vec3f, 7>(
+        vec3f(0.34, 0.26, 0.18), vec3f(0.25, 0.19, 0.13), vec3f(0.19, 0.25, 0.11), vec3f(0.46, 0.38, 0.24),
+        vec3f(0.17, 0.14, 0.11), vec3f(0.40, 0.33, 0.24), vec3f(0.27, 0.27, 0.15));
+    var c = pal[min(u32(k * 7.0), 6u)];
+    if (hash12(cell + 5.1) < F.ground.y) {
+        let r = length(f - 0.5) * fs;
+        let ring = 1.0 - smoothstep(fs * 0.48 - px, fs * 0.48 + px, r);
+        c = mix(c, select(vec3f(0.15, 0.24, 0.09), vec3f(0.36, 0.31, 0.21), h2 > 0.75), ring * (1.0 - smoothstep(0.05, 0.3, px / fs)));
+    }
+    c = mix(c, vec3f(0.30, 0.25, 0.17), smoothstep(0.08, 0.45, px / fs));     // far away: the average crop colour
+    let detail = sat(40.0 / max(px, 1.0));
+    c *= 0.88 + 0.24 * mix(0.5, vnoise2(xz / 70.0), detail) + 0.12 * (vnoise2(xz / 2400.0) - 0.5);
+    let e = min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y)) * fs;
+    let road = (1.0 - smoothstep(4.0, 4.0 + px, e)) * sat(8.0 / max(px, 0.5));
+    return mix(c, vec3f(0.44, 0.42, 0.39), road * 0.85);
+}
+
+fn townColor(xz: vec2f, px: f32) -> vec3f {
+    let b = 120.0;
+    let g = xz / b;
+    let id = floor(g);
+    let f = fract(g);
+    var c = mix(vec3f(0.30, 0.29, 0.28), vec3f(0.46, 0.42, 0.38), hash12(id));
+    c = mix(c, vec3f(0.17, 0.22, 0.12), step(0.78, hash12(id + 3.3)));
+    c *= mix(1.0, 0.75 + 0.5 * hash12(floor(xz / 16.0)), sat(20.0 / max(px, 1.0)));
+    let street = min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y)) * b;
+    let s = (1.0 - smoothstep(6.0, 6.0 + px, street)) * sat(12.0 / max(px, 0.5));
+    return mix(c, vec3f(0.36, 0.36, 0.35), s);
+}
+
+@fragment fn fsTerrain(i: TerrOut) -> @location(0) vec4f {
+    let p = i.world;
+    let px = max(length(fwidth(p.xz)), 0.05);
+    let uv = (p.xz - F.tdomain.xy) / F.tdomain.z;
+    let inside = all(uv > vec2f(0.0)) && all(uv < vec2f(1.0));
+    let th = terrainHeight(p.xz);
+    let n = th.yzw;
+    var land = textureSampleLevel(landTex, clampSamp, uv, 0.0).xyz;
+    if (!inside) { land = vec3f(0.0); }
+    var alb = fieldColor(p.xz, px);
+    alb = mix(alb, townColor(p.xz, px), sat(land.x * (0.6 + 0.8 * vnoise2(p.xz / 700.0)) * 1.4 - 0.2));
+    let forest = sat(land.y * (0.4 + vnoise2(p.xz / 300.0)) * 1.3);
+    alb = mix(alb, vec3f(0.07, 0.11, 0.06) * (0.8 + 0.4 * vnoise2(p.xz / 40.0)), forest);
+    // mountains: conifers, then rock above the tree line and on steep slopes
+    let wild = smoothstep(150.0, 700.0, p.y - F.misc.z);
+    let rock = sat(smoothstep(3300.0, 3700.0, p.y + 200.0 * vnoise2(p.xz / 500.0)) + smoothstep(0.82, 0.62, n.y));
+    let mtn = mix(vec3f(0.09, 0.12, 0.07), vec3f(0.33, 0.31, 0.29), rock);
+    alb = mix(alb, mtn, wild);
+    // weather on the ground
+    let gs = groundAt(p.xz);
+    let snow = sat(gs.x * 3.0) * smoothstep(0.45, 0.75, n.y);
+    let wet = gs.y * (1.0 - snow);
+    alb = mix(alb * (1.0 - 0.45 * wet), vec3f(0.85, 0.88, 0.92), snow);
+    let water = land.z;
+
+    let sh = shadowAt(p);
+    let s = F.sunDir.xyz;
+    let v = normalize(F.cam.xyz - p);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x + F.ambient.rgb * sh.y * (0.55 + 0.45 * n.y) + flashLight(p) * 0.03);
+    // wet ground and open water reflect the sky
+    let r = reflect(-v, vec3f(0.0, 1.0, 0.0));
+    let fres = 0.02 + 0.98 * pow(1.0 - max(v.y, 0.0), 5.0);
+    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 400.0) * 4.0;
+    col = mix(col, vec3f(0.01, 0.02, 0.025) * F.ambient.rgb + spec * fres, water);
+    col += spec * fres * wet * 0.35 * (1.0 - water);
+    return vec4f(col, 1.0);
+}
+`;
+
+// ------------------------------------------------------------------------------------------ WGSL final
+const WGSL_FINAL = /* wgsl */`
+@group(1) @binding(0) var cloudTex: texture_2d<f32>;
+@group(1) @binding(1) var hdrTex: texture_2d<f32>;
+
+struct FsIn { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vsFull(@builtin(vertex_index) vi: u32) -> FsIn {
+    let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    var o: FsIn;
+    o.pos = vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = vec2f(p.x, 1.0 - p.y);
+    return o;
+}
+
+// weather-radar style precipitation colours; snow in blues
+fn radarColor(pr: f32, snow: bool) -> vec3f {
+    if (snow) { return mix(vec3f(0.25, 0.45, 0.95), vec3f(0.92, 0.95, 1.0), sat(pr * 1.4)); }
+    let a = vec3f(0.1, 0.75, 0.2);
+    let b = vec3f(0.95, 0.9, 0.15);
+    let c = vec3f(0.95, 0.45, 0.1);
+    let d = vec3f(0.9, 0.1, 0.15);
+    if (pr < 0.35) { return mix(a, b, pr / 0.35); }
+    if (pr < 0.65) { return mix(b, c, (pr - 0.35) / 0.3); }
+    return mix(c, d, sat((pr - 0.65) / 0.3));
+}
+
+fn radar(px: vec2f, col: vec3f) -> vec3f {
+    let size = min(240.0, F.screen.y * 0.3);
+    let origin = vec2f(F.screen.x - size - 16.0, 16.0);
+    let q = (px - origin) / size;
+    if (any(q < vec2f(0.0)) || any(q > vec2f(1.0))) { return col; }
+    let range = 120000.0;
+    let xz = F.cam.xz + (q - 0.5) * range;
+    let w = weatherAt(xz);
+    let reach = sat(1.0 - w.w * 1.25);
+    var c = mix(vec3f(0.02, 0.04, 0.05), vec3f(0.22, 0.25, 0.27), sat(w.x));
+    let snow = F.precip.x < F.misc.z + 150.0;
+    if (w.z * reach > 0.04) { c = radarColor(w.z * reach, snow); }
+    else if (w.z > 0.04) { c = mix(c, vec3f(0.35, 0.4, 0.55), 0.5); }   // virga aloft: not reaching the ground
+    let d = length((q - 0.5) * range);
+    let ring = abs(fract(d / 20000.0 + 0.5) - 0.5) * 20000.0;
+    c = mix(c, vec3f(0.43, 0.86, 1.0), (1.0 - smoothstep(0.0, range / size * 1.2, ring)) * 0.35);
+    let f = normalize(F.fwd.xz + vec2f(1e-5, 0.0));
+    let rel = (q - 0.5) * range;
+    let along = dot(rel, f);
+    let across = abs(dot(rel, vec2f(-f.y, f.x)));
+    if (along > 0.0 && along < 6000.0 && across < (6000.0 - along) * 0.4) { c = vec3f(1.0, 0.79, 0.29); }
+    let edge = min(min(q.x, 1.0 - q.x), min(q.y, 1.0 - q.y)) * size;
+    c = mix(vec3f(0.43, 0.86, 1.0), c, smoothstep(0.5, 1.5, edge));
+    return mix(col, c, 0.88);
+}
+
+@fragment fn fsComposite(i: FsIn) -> @location(0) vec4f {
+    let hdr = textureLoad(hdrTex, vec2i(i.pos.xy), 0).rgb;
+    let c = textureSampleLevel(cloudTex, clampSamp, i.uv, 0.0);
+    var col = hdr * c.a + c.rgb;
+    if (i32(F.ground.w) == 1) { col = hdr; }
+    var o = tonemap(col);
+    if (F.march.w > 0.5) { o = radar(i.pos.xy, o); }
+    return vec4f(o, 1.0);
+}
+
+struct LineOut { @builtin(position) pos: vec4f, @location(0) col: vec4f, @location(1) uv: vec2f };
+
+// screen-space quad from a to b (clip space), widthPx wide; corner = vertex 0..5
+fn lineQuad(a: vec4f, b: vec4f, widthPx: f32, corner: u32, o: ptr<function, LineOut>) {
+    let res = F.screen.xy;
+    let sa = a.xy / a.w * res * 0.5;
+    let sb = b.xy / b.w * res * 0.5;
+    let ax = sb - sa;
+    let len = length(ax);
+    let d = select(vec2f(0.0, 1.0), ax / len, len > 1e-3);
+    let n = vec2f(-d.y, d.x);
+    var ends = array<f32, 6>(0.0, 1.0, 0.0, 0.0, 1.0, 1.0);
+    var sides = array<f32, 6>(-1.0, -1.0, 1.0, 1.0, -1.0, 1.0);
+    let e = ends[corner];
+    let sd = sides[corner];
+    let w = mix(a.w, b.w, e);
+    let z = mix(a.z, b.z, e);
+    let sp = mix(sa, sb, e) + n * sd * widthPx * 0.5 + d * (e * 2.0 - 1.0) * widthPx * 0.5;
+    (*o).pos = vec4f(sp / (res * 0.5) * w, z, w);
+    (*o).uv = vec2f(e, sd);
+}
+
+// near-field precipitation: drops and flakes in a box that wraps around the camera
+@vertex fn vsPrecip(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> LineOut {
+    var o: LineOut;
+    o.pos = vec4f(0.0, 0.0, -2.0, 1.0);
+    o.col = vec4f(0.0);
+    let total = F.near.x + F.near.y;
+    let isSnow = rnd(ii * 5u + 3u) < F.near.y / max(total, 1e-4);
+    if (rnd(ii * 5u + 4u) > sat(total * 1.3)) { return o; }
+    let seed = vec3f(rnd(ii * 5u), rnd(ii * 5u + 1u), rnd(ii * 5u + 2u));
+    let box = select(vec3f(70.0, 50.0, 70.0), vec3f(36.0, 24.0, 36.0), isSnow);
+    let t = F.cam.w;
+    let fall = select(8.0 + 3.0 * seed.x, 1.0 + 0.7 * seed.y, isSnow);
+    let vel = vec3f(F.wind.x * 0.8, -fall, F.wind.y * 0.8);
+    var p = seed * box + vel * t;
+    if (isSnow) { p += vec3f(sin(t * 1.3 + seed.x * 40.0), 0.0, cos(t * 1.1 + seed.z * 40.0)) * 0.8; }
+    let rel = (fract((p - F.cam.xyz) / box + 0.5) - 0.5) * box;
+    let wp = F.cam.xyz + rel;
+    let dist = length(rel);
+    let a = F.viewProj * vec4f(wp, 1.0);
+    if (a.w < 0.5) { return o; }
+    let lightc = F.ambient.rgb * 0.9 + F.sunCol.rgb * 0.05;
+    let fade = sat(dist / 2.0) * sat(1.0 - dist / (box.x * 0.5));
+    if (isSnow) {
+        // flakes: a soft dot, smeared a little along the fall (motion blur)
+        let focal = F.screen.y * 0.5 / length(F.up.xyz);
+        let sz = clamp((0.02 + 0.025 * seed.z) * focal / a.w, 1.8, 14.0);
+        let b = F.viewProj * vec4f(wp - vel * 0.006, 1.0);
+        if (b.w < 0.5) { return o; }
+        lineQuad(a, b, sz, vi, &o);
+        o.col = vec4f(lightc * 1.5, 0.9 * fade);
+    } else {
+        let b = F.viewProj * vec4f(wp - vel * 0.035, 1.0);
+        if (b.w < 0.5) { return o; }
+        lineQuad(a, b, 1.2, vi, &o);
+        o.col = vec4f(lightc * 1.2, (0.12 + 0.12 * seed.z) * fade * sat(total * 2.0));
+    }
+    o.uv.x = select(0.0, 1.0, isSnow);    // shape flag for the fragment: streak or flake
+    return o;
+}
+
+@fragment fn fsPrecip(i: LineOut) -> @location(0) vec4f {
+    let across = 1.0 - abs(i.uv.y);
+    let a = select(i.col.w * across, i.col.w * smoothstep(0.0, 0.6, across), i.uv.x > 0.5);
+    return vec4f(tonemap(i.col.rgb), a);
+}
+
+// lightning bolts: segment k = (bolts[2k] start + brightness, bolts[2k + 1] end + width in m)
+@vertex fn vsBolt(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> LineOut {
+    var o: LineOut;
+    o.pos = vec4f(0.0, 0.0, -2.0, 1.0);
+    o.col = vec4f(0.0);
+    let s0 = bolts[ii * 2u];
+    let s1 = bolts[ii * 2u + 1u];
+    if (s0.w <= 0.0) { return o; }
+    let a = F.viewProj * vec4f(s0.xyz, 1.0);
+    let b = F.viewProj * vec4f(s1.xyz, 1.0);
+    if (a.w < 1.0 || b.w < 1.0) { return o; }
+    let focal = F.screen.y * 0.5 / length(F.up.xyz);
+    lineQuad(a, b, max(1.5, s1.w * focal / a.w), vi, &o);
+    let haze = exp(-distance(s0.xyz, F.cam.xyz) * F.zenith.w * 0.6);
+    o.col = vec4f(vec3f(0.8, 0.86, 1.0) * s0.w * haze, 1.0);
+    return o;
+}
+
+@fragment fn fsBolt(i: LineOut) -> @location(0) vec4f {
+    let core = pow(1.0 - abs(i.uv.y), 1.5);
+    return vec4f(tonemap(i.col.rgb * core), core);
+}
+`;
+
+// =====================================================================================================
+// Entities
+// =====================================================================================================
+// Built from scenario definitions ({ type, id, label, ... }) in order. Hooks, all optional:
+//   stamp(field)          shape the terrain and paint land use (build time)
+//   spawn()               register with the world (spawners pre-populate the sky)
+//   update(dt, wdt, t)    per frame; dt real seconds, wdt weather seconds
+//   cell()                per frame: a storm cell for the GPU ({ x, z, radius, top, coverage, precip, seed, virga, core }) or null
+// Entities may set `dead` to be removed after the frame.
+class Entity {
+    constructor(def, world) {
+        this.def = def;
+        this.world = world;
+        this.id = def.id || null;
+        this.label = def.label || '';
+        this.dead = false;
+    }
+
+    // label anchor in world space
+    get anchor() {
+        const p = this.def.labelPos || this.def.pos;
+        if (!p) return null;
+        return [p[0], this.world.field.sample(p[0], p[1]) + (this.def.labelHeight ?? 300), p[1]];
+    }
+
+    stamp(field) {}
+    spawn() {}
+    features(out) {}
+    update(dt, wdt, t) {}
+    cell() { return null; }
+}
+
+// --- terrain features
+
+// global slope along `dir` (downhill): the far side is `drop` metres lower than the near side
+class Tilt extends Entity {
+    stamp(f) {
+        const [dx, dz] = this.def.dir || [0, 1], l = Math.hypot(dx, dz) || 1, drop = this.def.drop || 0;
+        f.eachAll((idx, x, z) => { f.h[idx] -= drop * (x * dx + z * dz) / l / f.size; });
+    }
+}
+
+class Hills extends Entity {
+    stamp(f) {
+        const d = this.def, s = d.scale || 400, amp = d.amplitude || 20, opt = { octaves: d.octaves || 5, seed: d.seed || 1, ridged: !!d.ridged };
+        f.eachAll((idx, x, z) => { f.h[idx] += amp * fbm(x / s, z / s, opt); });
+    }
+}
+
+class Mountain extends Entity {
+    get anchor() { const p = this.def.pos; return [p[0], this.world.field.sample(p[0], p[1]) + 400, p[1]]; }
+    stamp(f) {
+        const d = this.def, [cx, cz] = d.pos, r = d.radius, hgt = d.height, rough = d.roughness ?? 0.4, seed = d.seed || 3;
+        f.each(cx - r, cz - r, cx + r, cz + r, (idx, x, z) => {
+            const t = Math.hypot(x - cx, z - cz) / r;
+            if (t >= 1) return;
+            const shape = Math.pow(1 - smoothstep(0, 1, t), 1.6);
+            const ridge = fbm(x / (r * 0.35), z / (r * 0.35), { octaves: 5, seed, ridged: true });
+            f.h[idx] += hgt * shape * (1 - rough + rough * 1.6 * ridge);
+        });
+    }
+}
+
+// mountain range along a polyline: a ridged massif `width` wide, `height` above the plain
+class Range extends Entity {
+    stamp(f) {
+        const d = this.def, pts = d.path, lens = polylineLengths(pts), w = d.width || 6000, hgt = d.height || 1500;
+        const rough = d.roughness ?? 0.5, seed = d.seed || 4, [x0, z0, x1, z1] = polylineBox(pts, w);
+        f.each(x0, z0, x1, z1, (idx, x, z) => {
+            const { dist } = polylineNearest(pts, lens, x + 1500 * fbm(x / 9000, z / 9000, { seed }), z);
+            const t = dist / w;
+            if (t >= 1) return;
+            const shape = Math.pow(1 - smoothstep(0, 1, t), 1.4);
+            const ridge = fbm(x / 3500, z / 3500, { octaves: 6, seed: seed + 3, ridged: true });
+            f.h[idx] += hgt * shape * (1 - rough + rough * 1.5 * ridge);
+        });
+    }
+}
+
+// carves a river bed along a polyline and paints it as water
+class River extends Entity {
+    get anchor() { const p = this.def.path[Math.floor(this.def.path.length / 2)]; return [p[0], this.world.field.sample(p[0], p[1]) + 200, p[1]]; }
+    stamp(f) {
+        const d = this.def, pts = d.path, lens = polylineLengths(pts), halfW = (d.width || 60) / 2, bank = d.bank || 600, depth = d.depth || 5;
+        const [x0, z0, x1, z1] = polylineBox(pts, halfW + bank + 400);
+        f.each(x0, z0, x1, z1, (idx, x, z) => {
+            const wig = 350 * fbm(x / 2500, z / 2500, { octaves: 3, seed: 17 });
+            const { dist } = polylineNearest(pts, lens, x, z + wig);
+            if (dist >= halfW + bank + f.cell) return;
+            const k = smoothstep(halfW, halfW + bank, dist);
+            f.h[idx] -= depth * (1 - k);
+            f.paint(idx, 2, 1 - smoothstep(halfW - f.cell * 0.5, halfW + f.cell * 0.5, dist));
+            f.paint(idx, 1, 0.5 * (1 - smoothstep(halfW, halfW + bank * 0.6, dist)));        // cottonwoods along the banks
+        });
+    }
+}
+
+class Lake extends Entity {
+    stamp(f) {
+        const d = this.def, [cx, cz] = d.pos, r = d.radius || 1000, reach = r * 1.6;
+        f.each(cx - reach, cz - reach, cx + reach, cz + reach, (idx, x, z) => {
+            const t = Math.hypot(x - cx, z - cz) / r + 0.25 * fbm(x / (r * 0.6), z / (r * 0.6), { octaves: 3, seed: 5 });
+            if (t < 1) { f.h[idx] = Math.min(f.h[idx], d.level - 6 * (1 - t)); f.paint(idx, 2, 1); }
+            else if (t < 1.6) f.h[idx] = Math.max(Math.min(f.h[idx], lerp(d.level + 2, f.h[idx], (t - 1) / 0.6)), d.level + 0.5);
+        });
+    }
+}
+
+class Town extends Entity {
+    stamp(f) {
+        const d = this.def, [cx, cz] = d.pos, r = d.radius || 2000, dens = d.density ?? 1;
+        f.each(cx - r, cz - r, cx + r, cz + r, (idx, x, z) => {
+            const t = Math.hypot(x - cx, z - cz) / r + 0.3 * fbm(x / 1500, z / 1500, { octaves: 3, seed: 8 });
+            if (t < 1) f.paint(idx, 0, dens * (1 - smoothstep(0.5, 1, t)));
+        });
+    }
+}
+
+class Forest extends Entity {
+    stamp(f) {
+        const d = this.def, [cx, cz] = d.pos, r = d.radius || 2000, dens = d.density ?? 1, seed = d.seed || 2;
+        f.each(cx - r, cz - r, cx + r, cz + r, (idx, x, z) => {
+            const t = Math.hypot(x - cx, z - cz) / r;
+            if (t < 1) f.paint(idx, 1, dens * (1 - smoothstep(0.6, 1, t)) * smoothstep(-0.1, 0.3, fbm(x / 2500, z / 2500, { seed })));
+        });
+    }
+}
+
+// --- weather
+
+// A storm cell (cumulus congestus -> cumulonimbus): grows, matures (rain or snow, lightning), decays (anvil lingers,
+// precipitation turns to virga). It drifts with the layer wind; `pinned` cells hold their place and stay mature, `hold`
+// cells only stay mature. Optional: `shelf` (shelf cloud on the gust front), `laminar` (mothership plates), `green`
+// (green storm light), `wallCloud` (m the base lowers under the updraft).
+class StormCell extends Entity {
+    constructor(def, world) {
+        super(def, world);
+        this.pos = [...def.pos];
+        this.life = def.life || [600, 1800, 900];
+        this.age = def.age ?? (def.pinned ? this.life[0] : 0);
+        this.seed = def.seed ?? Math.random();
+        this.flashClock = 0;
+        this.state = {};
+        this.evolve();
+    }
+
+    get anchor() { return [this.pos[0], this.world.weather.cur.base - 250, this.pos[1]]; }
+    get mature() { return this.age >= this.life[0] && this.age < this.life[0] + this.life[1]; }
+
+    evolve() {
+        const d = this.def, [g, m, k] = this.life, wx = this.world.weather.cur;
+        const grow = smoothstep(0, 1, clamp(this.age / g, 0, 1));
+        const decay = clamp((this.age - g - m) / k, 0, 1);
+        const base = wx.base;
+        const s = this.state;
+        s.coverage = grow * (1 - smoothstep(0.35, 1, decay));
+        s.top = Math.max(base + 600, lerp(base + 500, d.top || 9000, grow));
+        s.precip = Math.min(1, (d.precip ?? 0.7) * wx.power) * smoothstep(0.55, 1, clamp(this.age / g, 0, 1)) * (1 - smoothstep(0.45, 1, decay));
+        s.virga = lerp(d.virga ?? 0.1, 0.92, smoothstep(0.2, 0.85, decay));
+        s.radius = (d.radius || 4000) * (0.55 + 0.45 * grow) * (1 + 0.3 * decay);
+        s.decay = decay;
+    }
+
+    update(dt, wdt) {
+        const d = this.def, w = this.world.weather.cur;
+        if (d.pinned || d.hold) this.age = Math.min(this.age + wdt, this.life[0] + this.life[1] * 0.5);
+        else this.age += wdt;
+        if (!d.pinned) {
+            const drift = d.drift ?? 1, vel = d.velocity || [0, 0];
+            this.pos[0] += (w.wind[0] * drift + vel[0]) * wdt;
+            this.pos[1] += (w.wind[1] * drift + vel[1]) * wdt;
+        }
+        this.evolve();
+        if (this.age > this.life[0] + this.life[1] + this.life[2]) this.dead = true;
+        // lightning, in real time while mature
+        const rate = (d.lightning || 0) * w.lightning / 60;
+        if (rate > 0 && this.mature && this.state.precip > 0.15) {
+            this.flashClock -= dt;
+            if (this.flashClock <= 0) {
+                this.world.lightning.strike(this);
+                this.flashClock = -Math.log(1 - Math.random() * 0.999) / rate;
+            }
+        }
+    }
+
+    cell() {
+        const s = this.state;
+        if (s.coverage <= 0.005 && s.precip <= 0.005) return null;
+        // the precipitation core sits on the downwind flank unless the definition places it
+        const w = this.world.weather.cur.wind, wl = Math.hypot(w[0], w[1]) || 1;
+        const off = this.def.coreOffset || [w[0] / wl * s.radius * 0.2, w[1] / wl * s.radius * 0.2];
+        const d = this.def, rain = sat01(s.precip * 3);
+        return { x: this.pos[0], z: this.pos[1], radius: s.radius, top: s.top, coverage: s.coverage, precip: s.precip,
+            seed: this.seed, virga: s.virga, core: d.core ?? 0.45, offset: off,
+            shelf: (d.shelf || 0) * rain, laminar: (d.laminar || 0) * s.coverage, green: d.green || 0, wall: (d.wallCloud || 0) * rain };
+    }
+
+    // cloud genus for labels
+    get kind() {
+        if (this.def.shelf) return 'cumulonimbus + shelf cloud';
+        return this.state.top - this.world.weather.cur.base > 4500 ? 'cumulonimbus' : 'cumulus congestus';
+    }
+
+    describe() {
+        const s = this.state, wx = this.world.weather;
+        const kind = s.precip < 0.03 ? 'building' : s.virga > 0.7 ? 'virga' : wx.typeAt(this.world.field.base);
+        const level = s.precip < 0.03 ? '' : s.precip < 0.25 ? 'light ' : s.precip < 0.55 ? 'moderate ' : s.precip < 0.85 ? 'heavy ' : 'torrential ';
+        return `${this.kind} · ${kind === 'building' || kind === 'virga' ? '' : level}${kind}${this.mature && this.def.lightning && wx.cur.lightning > 0 ? ' ⚡' : ''}`;
+    }
+}
+
+// "mothership": a rotating supercell. Wide, with smooth stacked plates, a wall cloud under the updraft and a shelf
+// cloud on its gust front; `green` tints the light under it.
+// The plate stack is analytic (mothershipDensity): `stackRadius` (x radius), `stackDrop` / `stackHeight` (m around the
+// cloud base), `plates`, `twist`, `spin` (rad/s), `wallCloud` (m), `wallRadius` (x stack radius).
+class Supercell extends StormCell {
+    constructor(def, world) {
+        super({ radius: 7000, top: 12000, precip: 1, core: 0.4, lightning: 6, ...def }, world);
+        this.spin = 0;
+    }
+    get kind() { return 'supercell (mothership)'; }
+    get focus() { const o = this.updraft; return [o[0], this.world.field.base, o[1]]; }
+
+    // the updraft sits opposite the rain core
+    get updraft() {
+        const off = this.def.coreOffset || [0, 0];
+        return [this.pos[0] - off[0] * 0.25, this.pos[1] - off[1] * 0.25];
+    }
+
+    update(dt, wdt) {
+        super.update(dt, wdt);
+        this.spin += dt * (this.def.spin ?? 0.03);
+    }
+
+    features(out) {
+        const d = this.def, s = this.state, base = this.world.weather.cur.base, [x, z] = this.updraft;
+        if (s.coverage < 0.05) return;
+        out.ms.push([x, z, s.radius * (d.stackRadius ?? 0.8), this.spin,
+            base - (d.stackDrop ?? 300), base + (d.stackHeight ?? 4500), d.plates ?? 6, d.twist ?? 0.5,
+            d.wallCloud ?? 800, d.wallRadius ?? 0.3, smoothstep(0.1, 0.6, s.coverage), this.seed * 10]);
+    }
+}
+
+// a line of storms carried by the wind, each with a shelf cloud along its gust front; starts over after `travel` m
+class SquallLine extends Entity {
+    spawn() {
+        const d = this.def, n = d.count || 5, rng = mulberry32(d.seed || 3);
+        this.cells = [];
+        for (let k = 0; k < n; k++) {
+            const t = n > 1 ? k / (n - 1) : 0.5;
+            this.cells.push(this.world.add({
+                type: 'storm', label: k === Math.floor(n / 2) ? this.label : '', seed: rng(),
+                pos: [lerp(d.from[0], d.to[0], t) + (rng() - 0.5) * 2500, lerp(d.from[1], d.to[1], t) + (rng() - 0.5) * 2500],
+                radius: (d.radius || 4500) * (0.8 + 0.4 * rng()), top: (d.top || 10000) * (0.85 + 0.15 * rng()),
+                precip: d.precip ?? 0.9, core: 0.55, coreOffset: [0, 0], life: [400, 1e9, 900], age: 400, hold: true, drift: 0,
+                lightning: d.lightning ?? 3, virga: 0.05, green: d.green || 0,
+            }));
+        }
+        this.starts = this.cells.map(c => [...c.pos]);
+        this.offset = [0, 0];
+        this.label = '';            // the middle cell carries it
+    }
+
+    get motion() {
+        const w = this.world.weather.cur.wind, v = this.def.velocity || [0, 0], k = this.def.drift ?? 1;
+        return [w[0] * k + v[0], w[1] * k + v[1]];
+    }
+
+    update(dt, wdt) {
+        const [vx, vz] = this.motion;
+        this.offset[0] += vx * wdt;
+        this.offset[1] += vz * wdt;
+        if (Math.hypot(...this.offset) > (this.def.travel || 60000)) this.offset = [0, 0];
+        this.cells.forEach((c, i) => { c.pos = [this.starts[i][0] + this.offset[0], this.starts[i][1] + this.offset[1]]; });
+    }
+
+    // the gust front: the line moved ahead of the cells, bowed out in the middle
+    get front() {
+        const d = this.def, [vx, vz] = this.motion, ml = Math.hypot(vx, vz) || 1, m = [vx / ml, vz / ml];
+        const gap = (d.radius || 4500) * (d.gap ?? 0.9);
+        const a = [d.from[0] + this.offset[0] + m[0] * gap, d.from[1] + this.offset[1] + m[1] * gap];
+        const b = [d.to[0] + this.offset[0] + m[0] * gap, d.to[1] + this.offset[1] + m[1] * gap];
+        const bow = d.bow ?? 4000;
+        const c = [(a[0] + b[0]) / 2 + m[0] * bow * 2, (a[1] + b[1]) / 2 + m[1] * bow * 2];   // control point: the curve reaches half of it
+        return { a, b, c, m };
+    }
+
+    get focus() { const { a, b, c } = this.front; return [(a[0] + b[0]) / 4 + c[0] / 2, this.world.field.base, (a[1] + b[1]) / 4 + c[1] / 2]; }
+
+    features(out) {
+        const d = this.def, { a, b, c, m } = this.front, depth = d.shelfDepth ?? 7000, pad = depth + 2000;
+        const strength = (d.shelf ?? 1) * this.cells.reduce((sum, e) => sum + e.state.coverage, 0) / this.cells.length;
+        if (strength < 0.02) return;
+        out.shelves.push([...a, ...b, ...c, ...m, d.lip ?? 650, depth, d.tiers ?? 3, strength,
+            Math.min(a[0], b[0], c[0]) - pad, Math.min(a[1], b[1], c[1]) - pad, Math.max(a[0], b[0], c[0]) + pad, Math.max(a[1], b[1], c[1]) + pad]);
+    }
+}
+
+// keeps the sky populated: spawns storm cells inside `area` at `rate` cells per weather-hour (times the state's `storms`)
+class Spawner extends Entity {
+    spawn() {
+        this.rng = mulberry32(this.def.seed || 1);
+        this.clock = 0;
+        this.made = 0;
+        for (let k = 0; k < (this.def.initial || 0); k++) {
+            const def = this.make(this.rand(this.def.area[0], this.def.area[2]), this.rand(this.def.area[1], this.def.area[3]));
+            def.age = this.rng() * (def.life[0] + def.life[1] + def.life[2]) * 0.8;
+            this.world.add(def);
+        }
+    }
+
+    rand(a, b) { return lerp(a, b, this.rng()); }
+    pick(key, fallback) { const r = (this.def.template || {})[key]; return r ? this.rand(r[0], r[1]) : fallback; }
+
+    make(x, z) {
+        this.made++;
+        return {
+            type: 'storm', label: `Cell ${this.made}`, pos: [x, z], spawned: true, seed: this.rng(),
+            radius: this.pick('radius', 3500), top: this.pick('top', 8000), precip: this.pick('precip', 0.6), core: this.pick('core', 0.45),
+            life: [this.pick('grow', 700), this.pick('mature', 1500), this.pick('decay', 900)],
+            lightning: this.pick('lightning', 1), virga: this.pick('virga', 0.2), drift: this.pick('drift', 1),
+        };
+    }
+
+    count() { return this.world.entities.filter(e => e instanceof StormCell && e.def.spawned && !e.dead).length; }
+
+    update(dt, wdt) {
+        const w = this.world.weather.cur, rate = (this.def.rate || 6) * w.storms / 3600;
+        if (rate <= 0) return;
+        this.clock -= wdt;
+        if (this.clock > 0) return;
+        this.clock = -Math.log(1 - this.rng() * 0.999) / rate;
+        if (this.count() >= (this.def.max || 16)) return;
+        // new cells form upwind, so they drift across the area while they live
+        const [x0, z0, x1, z1] = this.def.area, wl = Math.hypot(w.wind[0], w.wind[1]) || 1;
+        let x = this.rand(x0, x1), z = this.rand(z0, z1);
+        x -= w.wind[0] / wl * (x1 - x0) * 0.25;
+        z -= w.wind[1] / wl * (z1 - z0) * 0.25;
+        this.world.add(this.make(x, z));
+    }
+
+    // a cell where the user asked for one
+    spawnAt(x, z) { const def = this.make(x, z); def.label = `Cell ${this.made} (yours)`; return this.world.add(def); }
+}
+
+const ENTITY_TYPES = {
+    tilt: Tilt,
+    hills: Hills,
+    mountain: Mountain,
+    range: Range,
+    river: River,
+    lake: Lake,
+    town: Town,
+    forest: Forest,
+    storm: StormCell,
+    supercell: Supercell,
+    squall: SquallLine,
+    spawner: Spawner,
+};
+
+// =====================================================================================================
+// Weather, sky, lightning
+// =====================================================================================================
+// Named weather states; the current state blends towards the target over `transition` seconds.
+class WeatherSystem {
+    constructor(def) {
+        this.def = def || {};
+        this.states = Object.fromEntries(Object.entries(this.def.states || { default: {} }).map(([k, v]) => [k, { ...WEATHER_DEFAULTS, ...v }]));
+        this.names = Object.keys(this.states);
+        const start = this.states[this.def.start] ? this.def.start : this.names[0];
+        this.cur = structuredClone(this.states[start]);
+        this.from = structuredClone(this.cur);
+        this.target = start;
+        this.blend = 1;
+        this.transition = this.def.transition ?? 10;
+        this.cycle = { enabled: false, hold: 40, ...(this.def.cycle || {}) };
+        this.cycleClock = this.cycle.hold;
+        this.offset = [0, 0];
+    }
+
+    set(name) {
+        if (!this.states[name]) return;
+        this.from = structuredClone(this.cur);
+        this.target = name;
+        this.blend = 0;
+        this.cycleClock = this.cycle.hold;
+    }
+
+    next() { this.set(this.names[(this.names.indexOf(this.target) + 1) % this.names.length]); }
+
+    get freezingLevel() { return this.cur.temperature / 6.5 * 1000; }
+
+    // precipitation type reaching height y
+    typeAt(y) {
+        const fl = this.freezingLevel;
+        return y > fl + 150 ? 'snow' : y > fl - 250 ? 'sleet' : 'rain';
+    }
+
+    update(dt, wdt) {
+        if (this.blend < 1) {
+            this.blend = Math.min(1, this.blend + dt / Math.max(this.transition, 1e-3));
+            const k = smoothstep(0, 1, this.blend), to = this.states[this.target];
+            for (const key of Object.keys(to)) {
+                const a = this.from[key], b = to[key];
+                if (Array.isArray(b)) this.cur[key] = b.map((v, i) => lerp(a[i], v, k));
+                else if (typeof b === 'object') {
+                    const names = new Set([...Object.keys(a || {}), ...Object.keys(b)]);
+                    this.cur[key] = Object.fromEntries([...names].map(n => [n, lerp(a?.[n] ?? 0, b[n] ?? 0, k)]));
+                } else this.cur[key] = lerp(a, b, k);
+            }
+        }
+        if (this.cycle.enabled && (this.cycleClock -= dt) <= 0) this.next();
+        this.offset[0] += this.cur.wind[0] * wdt;
+        this.offset[1] += this.cur.wind[1] * wdt;
+    }
+}
+
+// Cloud genus layers besides the convective one (stratus, nimbostratus, altostratus, altocumulus, ...): shape data from
+// the scenario's `clouds`, coverage per weather state (`layers: { genus: coverage }`). Up to MAX_LAYERS.
+class CloudLayers {
+    constructor(defs) {
+        this.defs = (defs || []).slice(0, MAX_LAYERS).map((d, i) => ({ ...LAYER_DEFAULTS, seed: i * 0.37 + 0.11, ...d }));
+    }
+
+    coverage(weather, d) { return d ? (weather.layers?.[d.name] ?? 0) : 0; }
+
+    write(frame, weather, convectiveBase) {
+        let lo = Infinity, hi = -Infinity;
+        for (let k = 0; k < MAX_LAYERS; k++) {
+            const d = this.defs[k], cov = this.coverage(weather, d);
+            frame.set('layers', d ? [d.base, d.top, cov, d.density, d.mapScale, d.shapeScale, d.stretch, d.erosion,
+                LAYER_KINDS[d.kind] ?? 1, d.ambient, d.precip, d.seed] : new Array(12).fill(0), k * 12);
+            if (cov > 0.005) { lo = Math.min(lo, d.base); hi = Math.max(hi, d.top); }
+        }
+        frame.set('layerInfo', [isFinite(lo) ? lo : 1e6, isFinite(hi) ? hi : -1e6, Math.min(convectiveBase - 1300, lo), 0]);
+    }
+
+    // [name, coverage] of every genus present, for the HUD
+    active(weather) {
+        const list = [['cumulus', weather.coverage]];
+        for (const d of this.defs) list.push([d.name, this.coverage(weather, d)]);
+        list.push(['cirrus', weather.cirrus]);
+        return list.filter(([, c]) => c > 0.02);
+    }
+}
+
+// sun and sky colours from the sun elevation (Kasten-Young air mass through Rayleigh + Mie) and the weather
+class Sky {
+    static compute(az, el, intensity, weather) {
+        const dir = [Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az)];
+        const elDeg = el / DEG;
+        const am = 1 / (Math.sin(Math.max(el, 0)) + 0.50572 * Math.pow(Math.max(elDeg, 0) + 6.07995, -1.6364));
+        const tauR = [0.04, 0.095, 0.22], tauM = 0.02 + 0.035 * weather.haze;
+        const trans = tauR.map(t => Math.exp(-(t + tauM) * am));
+        const day = smoothstep(-3, 10, elDeg);
+        const sun = trans.map(t => t * intensity * (0.2 + 0.8 * day));
+        const blue = [0.16, 0.32, 0.72].map((c, i) => c * (0.25 + 0.75 * day) * (0.6 + 0.4 * trans[i]));
+        const low = (1 - smoothstep(2, 18, elDeg)) * 0.6;
+        const warm = trans.map(t => t / Math.max(...trans));
+        const horizon = [0.6, 0.68, 0.78].map((c, i) => lerp(c, c * (0.55 + 0.6 * warm[i]), low) * (0.3 + 0.7 * day));
+        // overcast: greyer, darker sky
+        const g = Math.pow(clamp(weather.coverage, 0, 1), 1.5) * 0.85;
+        const grey = 0.45 * (0.3 + 0.7 * day);
+        const zenith = blue.map(c => lerp(c, grey, g)).map(c => c * (1 - 0.35 * g));
+        const hor = horizon.map(c => lerp(c, grey * 1.1, g * 0.8));
+        const ambient = zenith.map((c, i) => (c * 0.6 + hor[i] * 0.4) * 1.1);
+        return { dir, sun, zenith, horizon: hor, ambient };
+    }
+}
+
+// lightning flashes (light inside the cloud) and, for some, cloud-to-ground bolts
+class Lightning {
+    constructor() {
+        this.flashes = [];
+        this.segs = new Float32Array(MAX_BOLT_SEGS * 8);
+        this.count = 0;
+    }
+
+    strike(cell, forceBolt = false) {
+        if (this.flashes.length >= MAX_FLASHES) this.flashes.shift();
+        const s = cell.state, w = cell.world.weather.cur, ang = Math.random() * Math.PI * 2, r = s.radius * 0.35 * Math.sqrt(Math.random());
+        const x = cell.pos[0] + Math.cos(ang) * r, z = cell.pos[1] + Math.sin(ang) * r;
+        const y = lerp(w.base + 800, s.top * 0.75, Math.random());
+        const f = { pos: [x, y, z], age: 0, dur: 0.35 + Math.random() * 0.5, peak: 25 + Math.random() * 35, seed: Math.random() * 100, bolt: null };
+        if (forceBolt || Math.random() < 0.35) f.bolt = this.makeBolt([x, w.base + 150, z], cell.world.field);
+        this.flashes.push(f);
+        cell.world.flashCount++;
+    }
+
+    // jagged path from the cloud base to the ground, with a few branches
+    makeBolt(start, field) {
+        const end = [start[0] + (Math.random() - 0.5) * 2500, 0, start[2] + (Math.random() - 0.5) * 2500];
+        end[1] = field.sample(end[0], end[2]);
+        const segs = [];
+        const walk = (a, b, depth, width, out) => {
+            let pts = [a, b];
+            for (let level = 0; level < depth; level++) {
+                const next = [pts[0]];
+                for (let k = 0; k < pts.length - 1; k++) {
+                    const p = pts[k], q = pts[k + 1], len = v3.len(v3.sub(q, p));
+                    const m = v3.add(v3.mul(v3.add(p, q), 0.5), [(Math.random() - 0.5) * len * 0.45, (Math.random() - 0.5) * len * 0.15, (Math.random() - 0.5) * len * 0.45]);
+                    next.push(m, q);
+                }
+                pts = next;
+            }
+            for (let k = 0; k < pts.length - 1; k++) out.push([pts[k], pts[k + 1], width]);
+            return pts;
+        };
+        const main = walk(start, end, 6, 6, segs);
+        for (let b = 0; b < 3; b++) {
+            const from = main[Math.floor(Math.random() * main.length * 0.6)];
+            const to = v3.add(from, [(Math.random() - 0.5) * 1800, -300 - Math.random() * 900, (Math.random() - 0.5) * 1800]);
+            walk(from, to, 4, 2.5, segs);
+        }
+        return segs;
+    }
+
+    update(dt) {
+        for (const f of this.flashes) f.age += dt;
+        this.flashes = this.flashes.filter(f => f.age < f.dur);
+    }
+
+    // intensity with a few return strokes
+    level(f) {
+        const t = f.age / f.dur, strokes = Math.max(0, Math.sin(f.age * 38 + f.seed)) * 0.6 + 0.4;
+        return f.peak * Math.exp(-t * 4) * strokes;
+    }
+
+    write(frame) {
+        for (let k = 0; k < MAX_FLASHES; k++) {
+            const f = this.flashes[k];
+            frame.set('flash', f ? [...f.pos, this.level(f)] : [0, 0, 0, 0], k * 4);
+        }
+        this.segs.fill(0);
+        let n = 0;
+        for (const f of this.flashes) {
+            if (!f.bolt) continue;
+            const b = this.level(f) * 40;
+            for (const [a, c, w] of f.bolt) {
+                if (n >= MAX_BOLT_SEGS) break;
+                this.segs.set([...a, b, ...c, w], n * 8);
+                n++;
+            }
+        }
+        this.count = n;
+    }
+
+    get brightness() { return this.flashes.reduce((s, f) => s + this.level(f), 0); }
+}
+
+// ------------------------------------------------------------------------------------------------- world
+class World {
+    constructor(scenario) {
+        this.scenario = scenario;
+        const t = { size: 64000, resolution: 512, base: 1500, fieldSize: 800, pivots: 0.2, ...(scenario.terrain || {}) };
+        this.terrain = t;
+        this.field = new Heightfield(t.size, t.resolution, t.base);
+        this.weather = new WeatherSystem(scenario.weather);
+        this.clouds = new CloudLayers(scenario.clouds);
+        this.lightning = new Lightning();
+        this.entities = [];
+        this.byId = new Map();
+        this.flashCount = 0;
+        for (const def of scenario.entities || []) this.add(def, false);
+        for (const e of this.entities) { e.stamp(this.field); this.field.updateRange(); }
+        for (const e of [...this.entities]) e.spawn();
+    }
+
+    add(def, spawn = true) {
+        const Type = ENTITY_TYPES[def.type];
+        if (!Type) throw new Error(`unknown entity type "${def.type}"`);
+        const e = new Type(def, this);
+        this.entities.push(e);
+        if (e.id) this.byId.set(e.id, e);
+        if (spawn) e.spawn();
+        return e;
+    }
+
+    get(id) { return this.byId.get(id); }
+    get storms() { return this.entities.filter(e => e instanceof StormCell); }
+    get spawner() { return this.entities.find(e => e instanceof Spawner); }
+
+    // analytic storm structures for the GPU: motherships (12 floats each) and shelf lines (16 floats each)
+    features() {
+        const out = { ms: [], shelves: [] };
+        for (const e of this.entities) e.features(out);
+        return { ms: out.ms.slice(0, MAX_MOTHERSHIPS), shelves: out.shelves.slice(0, MAX_SHELVES) };
+    }
+
+    update(dt, wdt, t) {
+        this.weather.update(dt, wdt);
+        for (const e of [...this.entities]) e.update(dt, wdt, t);
+        if (this.entities.some(e => e.dead)) {
+            this.entities = this.entities.filter(e => !e.dead);
+            for (const [k, e] of this.byId) if (e.dead) this.byId.delete(k);
+        }
+        this.lightning.update(dt);
+    }
+
+    // storm cells for the GPU, nearest to `around` first when there are too many
+    gpuCells(around) {
+        const list = this.entities.map(e => e.cell()).filter(Boolean);
+        if (list.length > MAX_CELLS) list.sort((a, b) => Math.hypot(a.x - around[0], a.z - around[2]) - Math.hypot(b.x - around[0], b.z - around[2]));
+        return list.slice(0, MAX_CELLS);
+    }
+}
+
+// =====================================================================================================
+// GPU passes
+// =====================================================================================================
+// 3D noise volumes, baked once
+class NoiseVolumes {
+    constructor(device) {
+        const U = GPUTextureUsage;
+        const make = n => device.createTexture({ size: [n, n, n], dimension: '3d', format: 'rgba8unorm', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.shape = make(NOISE_SHAPE);
+        this.detail = make(NOISE_DETAIL);
+        const layout = makeLayout(device, GPUShaderStage.COMPUTE, ['write3d:rgba8unorm', 'write3d:rgba8unorm']);
+        const module = device.createShaderModule({ label: 'noise', code: WGSL_NOISE });
+        const pl = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+        const group = makeGroup(device, layout, [this.shape.createView({ dimension: '3d' }), this.detail.createView({ dimension: '3d' })], 'noise');
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass();
+        pass.setBindGroup(0, group);
+        pass.setPipeline(device.createComputePipeline({ layout: pl, compute: { module, entryPoint: 'genShape' } }));
+        pass.dispatchWorkgroups(NOISE_SHAPE / 4, NOISE_SHAPE / 4, NOISE_SHAPE / 4);
+        pass.setPipeline(device.createComputePipeline({ layout: pl, compute: { module, entryPoint: 'genDetail' } }));
+        pass.dispatchWorkgroups(NOISE_DETAIL / 4, NOISE_DETAIL / 4, NOISE_DETAIL / 4);
+        pass.end();
+        device.queue.submit([enc.finish()]);
+        this.shapeView = this.shape.createView({ dimension: '3d' });
+        this.detailView = this.detail.createView({ dimension: '3d' });
+    }
+}
+
+// shader source for a pass: frame struct, helpers, bindings
+const shaderSource = (set, ...parts) => FrameBlock.wgsl() + WGSL_MATH + set.wgsl + parts.join('\n');
+
+function computePipeline(device, label, layouts, code, entryPoint) {
+    return device.createComputePipeline({
+        label, layout: device.createPipelineLayout({ bindGroupLayouts: layouts }),
+        compute: { module: device.createShaderModule({ label, code }), entryPoint },
+    });
+}
+
+// weather map, cloud shadow map and the camera probe read back for the HUD and near-field precipitation
+class WeatherPass {
+    constructor(r) {
+        const d = r.device, U = GPUTextureUsage, C = GPUShaderStage.COMPUTE;
+        this.device = d;
+        this.weather = d.createTexture({ size: [WEATHER_RES, WEATHER_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING | U.COPY_SRC });
+        this.shadow = d.createTexture({ size: [SHADOW_RES, SHADOW_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.anvil = d.createTexture({ size: [WEATHER_RES, WEATHER_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.weatherView = this.weather.createView();
+        this.anvilView = this.anvil.createView();
+        this.layerMap = d.createTexture({ size: [WEATHER_RES, WEATHER_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.styleMap = d.createTexture({ size: [WEATHER_RES, WEATHER_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.layerView = this.layerMap.createView();
+        this.styleView = this.styleMap.createView();
+        this.shadowView = this.shadow.createView();
+
+        const wSet = new BindingSet(d, ['F', 'cells']);
+        const wOut = makeLayout(d, C, ['write:rgba16float', 'write:rgba16float', 'write:rgba16float', 'write:rgba16float']);
+        this.pWeather = computePipeline(d, 'weather', [wSet.layout, wOut], shaderSource(wSet, WGSL_WEATHER), 'weather');
+        this.wGroup = wSet.group({ F: r.frameBuf, cells: r.cellBuf }, 'weather-in');
+        this.wOutGroup = makeGroup(d, wOut, [this.weatherView, this.anvilView, this.layerView, this.styleView], 'weather-out');
+
+        const sSet = new BindingSet(d, ['F', 'shapeTex', 'detailTex', 'weatherTex', 'anvilTex', 'layerTex', 'styleTex', 'repSamp', 'clampSamp']);
+        const sOut = makeLayout(d, C, ['write:rgba16float']);
+        this.pShadow = computePipeline(d, 'shadow', [sSet.layout, sOut], shaderSource(sSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW), 'shadow');
+        this.sGroup = sSet.group({ F: r.frameBuf, shapeTex: r.noise.shapeView, detailTex: r.noise.detailView, weatherTex: this.weatherView, anvilTex: this.anvilView, layerTex: this.layerView, styleTex: this.styleView, repSamp: r.repSamp, clampSamp: r.clampSamp }, 'shadow-in');
+        this.sOutGroup = makeGroup(d, sOut, [this.shadowView], 'shadow-out');
+
+        this.probes = [0, 1, 2].map(() => ({ buf: d.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }), busy: false }));
+        this.probe = { coverage: 0, top: 0, precip: 0, virga: 0 };
+    }
+
+    encode(enc, probeTexel, prof, shadowSlices = 1) {
+        const pass = enc.beginComputePass({ label: 'weather', timestampWrites: prof.writes('weather') });
+        pass.setPipeline(this.pWeather);
+        pass.setBindGroup(0, this.wGroup);
+        pass.setBindGroup(1, this.wOutGroup);
+        pass.dispatchWorkgroups(WEATHER_RES / 8, WEATHER_RES / 8);
+        pass.setPipeline(this.pShadow);
+        pass.setBindGroup(0, this.sGroup);
+        pass.setBindGroup(1, this.sOutGroup);
+        pass.dispatchWorkgroups(Math.ceil(SHADOW_RES / 8), Math.ceil(SHADOW_RES / shadowSlices / 8));
+        pass.end();
+        this.pending = null;
+        const slot = this.probes.find(p => !p.busy);
+        if (slot && probeTexel) {
+            enc.copyTextureToBuffer({ texture: this.weather, origin: [probeTexel[0], probeTexel[1], 0] }, { buffer: slot.buf, bytesPerRow: 256 }, [1, 1, 1]);
+            this.pending = slot;
+        }
+    }
+
+    afterSubmit() {
+        const slot = this.pending;
+        if (!slot) return;
+        slot.busy = true;
+        slot.buf.mapAsync(GPUMapMode.READ).then(() => {
+            const h = new Uint16Array(slot.buf.getMappedRange(0, 8));
+            this.probe = { coverage: fromHalf(h[0]), top: fromHalf(h[1]), precip: fromHalf(h[2]), virga: fromHalf(h[3]) };
+            slot.buf.unmap();
+            slot.busy = false;
+        }).catch(() => { slot.busy = false; });
+    }
+}
+
+// snow cover and wetness on the terrain
+class GroundPass {
+    constructor(r, world) {
+        const d = r.device;
+        this.n = GROUND_RES;
+        const init = new Float32Array(this.n * this.n * 2), f = world.field, w = world.weather.cur;
+        // start with snow wherever it is below freezing (mountain caps)
+        for (let j = 0; j < this.n; j++) for (let i = 0; i < this.n; i++) {
+            const x = f.origin + (i + 0.5) / this.n * f.size, z = f.origin + (j + 0.5) / this.n * f.size;
+            const temp = w.temperature - 0.0065 * f.sample(x, z);
+            init[(j * this.n + i) * 2] = smoothstep(2, -3, temp);
+        }
+        this.buffer = makeBuffer(d, init.byteLength, GPUBufferUsage.STORAGE, init);
+        const set = new BindingSet(d, ['F', 'weatherTex', 'heightTex', 'clampSamp']);
+        const out = makeLayout(d, GPUShaderStage.COMPUTE, ['storage']);
+        this.pipeline = computePipeline(d, 'ground', [set.layout, out], shaderSource(set, WGSL_WEATHER_SAMPLE, WGSL_GROUND), 'groundUpdate');
+        this.group = set.group({ F: r.frameBuf, weatherTex: r.weatherPass.weatherView, heightTex: r.heightView, clampSamp: r.clampSamp }, 'ground-in');
+        this.outGroup = makeGroup(d, out, [this.buffer], 'ground-out');
+    }
+
+    encode(enc, prof) {
+        const pass = enc.beginComputePass({ label: 'ground', timestampWrites: prof.writes('ground') });
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.group);
+        pass.setBindGroup(1, this.outGroup);
+        pass.dispatchWorkgroups(this.n / 8, this.n / 8);
+        pass.end();
+    }
+
+    destroy() { this.buffer.destroy(); }
+}
+
+// volumetric march at reduced resolution + temporal resolve into a ping-pong history
+class CloudPass {
+    constructor(r) {
+        const d = r.device, C = GPUShaderStage.COMPUTE;
+        this.r = r;
+        this.marchOut = makeLayout(d, C, ['depth', 'write:rgba16float', 'write:r32float']);
+        this.resolveIO = makeLayout(d, C, ['tex', 'tex:unfilterable-float', 'tex', 'write:rgba16float']);
+        const rSet = new BindingSet(d, ['F', 'clampSamp']);
+        this.pMarch = computePipeline(d, 'march', [r.worldSet.layout, this.marchOut],
+            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_MARCH), 'march');
+        this.pResolve = computePipeline(d, 'resolve', [rSet.layout, this.resolveIO], shaderSource(rSet, WGSL_SKY, WGSL_RESOLVE), 'resolve');
+        this.rGroup = rSet.group({ F: r.frameBuf, clampSamp: r.clampSamp }, 'resolve-in');
+        this.cur = 0;
+    }
+
+    resize(w, h, depthView) {
+        const d = this.r.device, U = GPUTextureUsage;
+        for (const t of [this.color, this.depth, ...(this.hist || [])]) t?.destroy();
+        this.w = w;
+        this.h = h;
+        this.color = d.createTexture({ size: [w, h], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.depth = d.createTexture({ size: [w, h], format: 'r32float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.hist = [0, 1].map(() => d.createTexture({ size: [w, h], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING }));
+        const hv = this.hist.map(t => t.createView());
+        this.marchGroup = makeGroup(d, this.marchOut, [depthView, this.color.createView(), this.depth.createView()], 'march-out');
+        // resolveGroups[k] reads history k and writes history 1 - k
+        this.resolveGroups = [0, 1].map(k => makeGroup(d, this.resolveIO, [this.color.createView(), this.depth.createView(), hv[k], hv[1 - k]], `resolve-${k}`));
+        this.histViews = hv;
+    }
+
+    // checker: march every other pixel (alternating each frame); the resolve fills the rest from history
+    encode(enc, prof, checker) {
+        const a = enc.beginComputePass({ label: 'march', timestampWrites: prof.writes('march') });
+        a.setPipeline(this.pMarch);
+        a.setBindGroup(0, this.r.worldGroup);
+        a.setBindGroup(1, this.marchGroup);
+        a.dispatchWorkgroups(Math.ceil((checker ? Math.ceil(this.w / 2) : this.w) / 8), Math.ceil(this.h / 8));
+        a.end();
+        const b = enc.beginComputePass({ label: 'resolve', timestampWrites: prof.writes('resolve') });
+        b.setPipeline(this.pResolve);
+        b.setBindGroup(0, this.rGroup);
+        b.setBindGroup(1, this.resolveGroups[this.cur]);
+        b.dispatchWorkgroups(Math.ceil(this.w / 8), Math.ceil(this.h / 8));
+        b.end();
+        this.cur = 1 - this.cur;
+        return this.cur;          // history index that now holds this frame
+    }
+}
+
+// GPU time per pass from timestamp queries (when the adapter offers them), smoothed for the HUD
+class GpuProfiler {
+    constructor(device, names) {
+        this.names = names;
+        this.ms = Object.fromEntries(names.map(n => [n, 0]));
+        this.enabled = device.features.has('timestamp-query');
+        if (!this.enabled) return;
+        const n = names.length * 2, B = GPUBufferUsage;
+        this.set = device.createQuerySet({ type: 'timestamp', count: n });
+        this.resolveBuf = device.createBuffer({ size: n * 8, usage: B.QUERY_RESOLVE | B.COPY_SRC });
+        this.reads = [0, 1, 2].map(() => ({ buf: device.createBuffer({ size: n * 8, usage: B.COPY_DST | B.MAP_READ }), busy: false }));
+    }
+
+    // timestampWrites for a pass descriptor
+    writes(name) {
+        if (!this.enabled) return undefined;
+        const i = this.names.indexOf(name);
+        return { querySet: this.set, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 };
+    }
+
+    resolve(enc) {
+        this.slot = this.enabled ? this.reads.find(r => !r.busy) : null;
+        if (!this.slot) return;
+        enc.resolveQuerySet(this.set, 0, this.names.length * 2, this.resolveBuf, 0);
+        enc.copyBufferToBuffer(this.resolveBuf, 0, this.slot.buf, 0, this.names.length * 16);
+    }
+
+    afterSubmit() {
+        const slot = this.slot;
+        this.slot = null;
+        if (!slot) return;
+        slot.busy = true;
+        slot.buf.mapAsync(GPUMapMode.READ).then(() => {
+            const t = new BigInt64Array(slot.buf.getMappedRange());
+            this.names.forEach((n, i) => {
+                const v = Number(t[i * 2 + 1] - t[i * 2]) / 1e6;
+                if (v >= 0 && v < 500) this.ms[n] = this.ms[n] * 0.9 + v * 0.1;
+            });
+            slot.buf.unmap();
+            slot.busy = false;
+        }).catch(() => { slot.busy = false; });
+    }
+
+    get total() { return Object.values(this.ms).reduce((a, b) => a + b, 0); }
+}
+
+// =====================================================================================================
+// Renderer
+// =====================================================================================================
+class Renderer {
+    async init(canvas) {
+        if (!navigator.gpu) throw new Error('navigator.gpu is undefined');
+        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        if (!adapter) throw new Error('No WebGPU adapter available');
+        this.device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('timestamp-query') ? ['timestamp-query'] : [] });
+        this.profiler = new GpuProfiler(this.device, ['weather', 'ground', 'scene', 'march', 'resolve', 'final']);
+        this.device.lost.then(info => { if (info.reason !== 'destroyed') this.onError?.(new Error(`GPU device lost: ${info.message}`)); });
+        this.device.addEventListener('uncapturederror', e => { console.error(e.error.message); this.lastError = e.error.message; });
+        this.canvas = canvas;
+        this.context = canvas.getContext('webgpu');
+        this.format = navigator.gpu.getPreferredCanvasFormat();
+        this.context.configure({ device: this.device, format: this.format, alphaMode: 'opaque' });
+        const d = this.device, B = GPUBufferUsage;
+        this.frame = new FrameBlock();
+        this.frameBuf = makeBuffer(d, this.frame.data.byteLength, B.UNIFORM | B.COPY_DST);
+        this.cellData = new Float32Array(MAX_CELLS * CELL_FLOATS);
+        this.cellBuf = makeBuffer(d, this.cellData.byteLength, B.STORAGE | B.COPY_DST);
+        this.boltBuf = makeBuffer(d, MAX_BOLT_SEGS * 32, B.STORAGE | B.COPY_DST);
+        this.repSamp = d.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat' });
+        this.clampSamp = d.createSampler({ magFilter: 'linear', minFilter: 'linear', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
+        this.noise = new NoiseVolumes(d);
+        this.weatherPass = new WeatherPass(this);
+        this.worldSet = new BindingSet(d, WORLD_BINDINGS.map(b => b[0]));
+        this.cloudPass = new CloudPass(this);
+        this.createPipelines();
+        const gi = gridIndices(GRID_N);
+        this.terrainIndex = makeBuffer(d, gi.byteLength, B.INDEX, gi);
+        this.terrainCount = gi.length;
+        this.width = this.height = 0;
+        this.scale = 0.5;
+    }
+
+    createPipelines() {
+        const d = this.device;
+        this.screenLayout = makeLayout(d, GPUShaderStage.FRAGMENT, ['tex', 'tex']);
+        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_SHADOW_SAMPLE, WGSL_SCENE) });
+        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_FINAL) });
+        const layoutA = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout] });
+        const layoutB = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout, this.screenLayout] });
+        const blendAlpha = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
+        const blendAdd = { color: { srcFactor: 'src-alpha', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
+        const pipe = (layout, module, vs, fs, format, depth, blend) => d.createRenderPipeline({
+            label: vs, layout,
+            vertex: { module, entryPoint: vs },
+            fragment: { module, entryPoint: fs, targets: [{ format, blend }] },
+            primitive: { topology: 'triangle-list', cullMode: 'none' },
+            depthStencil: { format: 'depth32float', depthWriteEnabled: depth.write, depthCompare: depth.compare },
+        });
+        this.pSky = pipe(layoutA, scene, 'vsSky', 'fsSky', 'rgba16float', { write: false, compare: 'always' });
+        this.pTerrain = pipe(layoutA, scene, 'vsTerrain', 'fsTerrain', 'rgba16float', { write: true, compare: 'greater' });
+        this.pComposite = pipe(layoutB, final, 'vsFull', 'fsComposite', this.format, { write: false, compare: 'always' });
+        this.pPrecip = pipe(layoutB, final, 'vsPrecip', 'fsPrecip', this.format, { write: false, compare: 'greater' }, blendAlpha);
+        this.pBolt = pipe(layoutB, final, 'vsBolt', 'fsBolt', this.format, { write: false, compare: 'greater' }, blendAdd);
+    }
+
+    setWorld(world) {
+        const d = this.device, f = world.field, U = GPUTextureUsage;
+        this.heightMap?.destroy();
+        this.landMap?.destroy();
+        this.groundPass?.destroy();
+        this.heightMap = d.createTexture({ size: [f.n, f.n], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.COPY_DST });
+        d.queue.writeTexture({ texture: this.heightMap }, f.packHeight(), { bytesPerRow: f.n * 8 }, [f.n, f.n]);
+        this.landMap = d.createTexture({ size: [f.n, f.n], format: 'rgba8unorm', usage: U.TEXTURE_BINDING | U.COPY_DST });
+        d.queue.writeTexture({ texture: this.landMap }, f.packLand(), { bytesPerRow: f.n * 4 }, [f.n, f.n]);
+        this.heightView = this.heightMap.createView();
+        this.groundPass = new GroundPass(this, world);
+        this.worldGroup = this.worldSet.group({
+            F: this.frameBuf, shapeTex: this.noise.shapeView, detailTex: this.noise.detailView, weatherTex: this.weatherPass.weatherView,
+            shadowTex: this.weatherPass.shadowView, heightTex: this.heightView, landTex: this.landMap.createView(), repSamp: this.repSamp,
+            clampSamp: this.clampSamp, cells: this.cellBuf, ground: this.groundPass.buffer, bolts: this.boltBuf, anvilTex: this.weatherPass.anvilView,
+            layerTex: this.weatherPass.layerView, styleTex: this.weatherPass.styleView,
+        }, 'world');
+    }
+
+    resize(scale) {
+        const c = this.canvas, dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const w = Math.max(1, Math.floor(c.clientWidth * dpr)), h = Math.max(1, Math.floor(c.clientHeight * dpr));
+        if (w === this.width && h === this.height && scale === this.scale) return false;
+        this.width = c.width = w;
+        this.height = c.height = h;
+        this.scale = scale;
+        const U = GPUTextureUsage;
+        this.hdr?.destroy();
+        this.depth?.destroy();
+        this.hdr = this.device.createTexture({ size: [w, h], format: 'rgba16float', usage: U.RENDER_ATTACHMENT | U.TEXTURE_BINDING });
+        this.depth = this.device.createTexture({ size: [w, h], format: 'depth32float', usage: U.RENDER_ATTACHMENT | U.TEXTURE_BINDING });
+        this.hdrView = this.hdr.createView();
+        this.depthView = this.depth.createView();
+        this.cloudPass.resize(Math.max(1, Math.ceil(w * scale)), Math.max(1, Math.ceil(h * scale)), this.depthView);
+        this.screenGroups = this.cloudPass.histViews.map((hv, k) => makeGroup(this.device, this.screenLayout, [hv, this.hdrView], `screen-${k}`));
+        return true;
+    }
+
+    render(enc, probeTexel, particles, bolts, checker, shadowSlices) {
+        const q = this.device.queue, prof = this.profiler;
+        q.writeBuffer(this.frameBuf, 0, this.frame.data);
+        q.writeBuffer(this.cellBuf, 0, this.cellData);
+        this.weatherPass.encode(enc, probeTexel, prof, shadowSlices);
+        this.groundPass.encode(enc, prof);
+
+        const a = enc.beginRenderPass({
+            label: 'scene', timestampWrites: prof.writes('scene'),
+            colorAttachments: [{ view: this.hdrView, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+            depthStencilAttachment: { view: this.depthView, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 0 },
+        });
+        a.setBindGroup(0, this.worldGroup);
+        a.setPipeline(this.pSky);
+        a.draw(3);
+        a.setPipeline(this.pTerrain);
+        a.setIndexBuffer(this.terrainIndex, 'uint32');
+        a.drawIndexed(this.terrainCount);
+        a.end();
+
+        const hist = this.cloudPass.encode(enc, prof, checker);
+
+        const b = enc.beginRenderPass({
+            label: 'final', timestampWrites: prof.writes('final'),
+            colorAttachments: [{ view: this.context.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+            depthStencilAttachment: { view: this.depthView, depthReadOnly: true },
+        });
+        b.setBindGroup(0, this.worldGroup);
+        b.setBindGroup(1, this.screenGroups[hist]);
+        b.setPipeline(this.pComposite);
+        b.draw(3);
+        if (particles) { b.setPipeline(this.pPrecip); b.draw(6, particles); }
+        if (bolts) { b.setPipeline(this.pBolt); b.draw(6, bolts); }
+        b.end();
+        prof.resolve(enc);
+    }
+}
+
+// =====================================================================================================
+// App
+// =====================================================================================================
+class Input {
+    constructor(el) {
+        this.el = el;
+        this.keys = new Set();
+        this.pressed = [];
+        this.dx = this.dy = this.wheel = 0;
+        this.mouse = [0, 0];
+        this.looking = false;
+        this.clicks = [];
+        el.addEventListener('contextmenu', e => e.preventDefault());
+        el.addEventListener('pointerdown', e => {
+            el.setPointerCapture(e.pointerId);
+            if (e.button === 2 || (e.button === 0 && e.ctrlKey)) this.clicks.push([e.clientX, e.clientY]);
+            else if (e.button === 0) { this.looking = true; el.classList.add('drag'); }
+        });
+        el.addEventListener('pointermove', e => {
+            this.mouse = [e.clientX, e.clientY];
+            if (this.looking) { this.dx += e.movementX; this.dy += e.movementY; }
+        });
+        const up = () => { this.looking = false; el.classList.remove('drag'); };
+        el.addEventListener('pointerup', up);
+        el.addEventListener('pointercancel', up);
+        el.addEventListener('wheel', e => { e.preventDefault(); this.wheel += Math.sign(e.deltaY); }, { passive: false });
+        window.addEventListener('keydown', e => {
+            if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+            if (!e.repeat) this.pressed.push(e.code);
+            this.keys.add(e.code);
+        });
+        window.addEventListener('keyup', e => this.keys.delete(e.code));
+        window.addEventListener('blur', () => { this.keys.clear(); up(); });
+    }
+
+    consume() {
+        const r = { dx: this.dx, dy: this.dy, wheel: this.wheel, pressed: this.pressed, clicks: this.clicks };
+        this.dx = this.dy = this.wheel = 0;
+        this.pressed = [];
+        this.clicks = [];
+        return r;
+    }
+}
+
+class FlyCamera {
+    constructor() {
+        this.pos = [0, 3000, 0];
+        this.yaw = 0;
+        this.pitch = 0;
+        this.fov = 60 * DEG;
+        this.speed = 400;
+    }
+
+    basis() {
+        const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw), cp = Math.cos(this.pitch), sp = Math.sin(this.pitch);
+        const fwd = [-sy * cp, sp, -cy * cp], right = [cy, 0, -sy];
+        return { fwd, right, up: v3.cross(right, fwd) };
+    }
+
+    lookAt(target) {
+        const d = v3.norm(v3.sub(target, this.pos));
+        this.yaw = Math.atan2(-d[0], -d[2]);
+        this.pitch = Math.asin(clamp(d[1], -1, 1));
+    }
+
+    update(dt, io, input, field) {
+        this.yaw -= io.dx * 0.0025;
+        this.pitch = clamp(this.pitch - io.dy * 0.0025, -1.55, 1.55);
+        if (io.wheel) this.speed = clamp(this.speed * Math.pow(1.25, -io.wheel), 5, 20000);
+        const k = input.keys, { fwd, right } = this.basis();
+        let m = [0, 0, 0];
+        if (k.has('KeyW')) m = v3.add(m, fwd);
+        if (k.has('KeyS')) m = v3.sub(m, fwd);
+        if (k.has('KeyD')) m = v3.add(m, right);
+        if (k.has('KeyA')) m = v3.sub(m, right);
+        if (k.has('Space')) m[1] += 1;
+        if (k.has('KeyC')) m[1] -= 1;
+        const mul = (k.has('ShiftLeft') || k.has('ShiftRight') ? 5 : 1) * (k.has('AltLeft') ? 0.2 : 1);
+        this.pos = v3.add(this.pos, v3.mul(m, this.speed * mul * dt));
+        this.pos[1] = clamp(this.pos[1], field.sample(this.pos[0], this.pos[2]) + 2, 25000);
+    }
+
+    ray(mx, my, w, h) {
+        const { fwd, right, up } = this.basis(), t = Math.tan(this.fov / 2), a = w / h;
+        const x = (mx / w * 2 - 1) * t * a, y = (1 - my / h * 2) * t;
+        return v3.norm(v3.add(fwd, v3.add(v3.mul(right, x), v3.mul(up, y))));
+    }
+}
+
+// -------------------------------------------------------------------------------------------------- hud
+const fmtKm = d => d < 1000 ? `${d.toFixed(0)} m` : `${(d / 1000).toFixed(d < 10000 ? 1 : 0)} km`;
+
+class Hud {
+    constructor() {
+        this.el = document.getElementById('hud');
+        this.help = document.getElementById('help');
+        this.statesEl = document.getElementById('states');
+        this.toastEl = document.getElementById('toast');
+        this.labels = document.getElementById('labels');
+        this.lctx = this.labels.getContext('2d');
+        this.showLabels = true;
+        this.last = 0;
+        this.help.innerHTML = [
+            '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
+            '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
+            '<b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
+            '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
+            'drop a scenario .json on the page',
+        ].join('\n');
+    }
+
+    setStates(weather) {
+        this.statesEl.innerHTML = weather.names.map((n, i) => `<b>${i + 1}</b> <span class="${n === weather.target ? 'sel' : ''}">${n}</span>`).join('\n')
+            + `\n<b>0</b> auto cycle ${weather.cycle.enabled ? '<span class="sel">on</span>' : 'off'}`;
+    }
+
+    toast(msg, ms = 2200) {
+        this.toastEl.textContent = msg;
+        this.toastEl.style.display = 'block';
+        clearTimeout(this.tid);
+        this.tid = setTimeout(() => { this.toastEl.style.display = 'none'; }, ms);
+    }
+
+    update(app, now) {
+        if (now - this.last < 150) return;
+        this.last = now;
+        const w = app.world, wx = w.weather, c = wx.cur, p = app.near;
+        const storms = w.storms, raining = storms.filter(s => s.state.precip > 0.05 && s.state.virga < 0.7).length;
+        const wind = Math.hypot(...c.wind), dirDeg = (Math.atan2(c.wind[0], -c.wind[1]) / DEG + 360) % 360;
+        const from = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(((dirDeg + 180) % 360) / 45) % 8];
+        const here = p.rain + p.snow < 0.01 ? (app.camera.pos[1] > c.base && app.probe.coverage > 0.5 ? '<span class="m">in cloud</span>' : '<span class="m">dry</span>')
+            : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">rain ${(p.rain * 100).toFixed(0)}%</span>`;
+        const q = QUALITY[app.quality], cw = app.renderer.cloudPass;
+        const lines = [
+            `<span class="t">ENTITY CLOUD // ${w.scenario.name || 'scenario'}</span>`,
+            `weather   ${wx.blend < 1 ? `<span class="w">${wx.target} ${(wx.blend * 100).toFixed(0)}%</span>` : wx.target}${wx.cycle.enabled ? ' <span class="m">(auto)</span>' : ''} · ×${app.timeScale} time${app.paused ? ' <span class="w">paused</span>' : ''}`,
+            `layer     base ${(c.base / 1000).toFixed(1)} km · top ${(c.top / 1000).toFixed(1)} km · cover ${(c.coverage * 100).toFixed(0)}% · cirrus ${(c.cirrus * 100).toFixed(0)}%`,
+            `air       ${c.temperature.toFixed(0)} °C at sea level · freezing level ${(wx.freezingLevel / 1000).toFixed(1)} km · wind ${wind.toFixed(0)} m/s from ${from}`,
+            `clouds    ${w.clouds.active(c).map(([n, v]) => `${n} ${(v * 100).toFixed(0)}%`).join(' · ') || 'none'}`,
+            `storms    ${storms.length} cells · ${raining} raining · ${w.flashCount} flashes`,
+            `here      ${here} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
+            `render    ${RENDER_MODES[app.mode]} · ${q.name} ${cw.w}×${cw.h}${q.checker ? ' checker' : ''} ${q.steps} steps · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
+            app.renderer.profiler.enabled
+                ? `gpu       ${app.renderer.profiler.total.toFixed(1)} ms · ${Object.entries(app.renderer.profiler.ms).map(([n, v]) => `${n} ${v.toFixed(1)}`).join(' · ')}`
+                : `gpu       <span class="m">no timestamp queries on this adapter</span>`,
+        ];
+        if (app.renderer.lastError) lines.push(`<span class="off">${app.renderer.lastError.slice(0, 90)}</span>`);
+        this.el.innerHTML = lines.join('\n');
+    }
+
+    drawLabels(app) {
+        const c = this.labels, dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const W = Math.floor(c.clientWidth * dpr), H = Math.floor(c.clientHeight * dpr);
+        if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+        const g = this.lctx;
+        g.clearRect(0, 0, W, H);
+        if (!this.showLabels) return;
+        g.font = `${11 * dpr}px 'Share Tech Mono', monospace`;
+        g.textBaseline = 'middle';
+        for (const e of app.world.entities) {
+            if (!e.label) continue;
+            const storm = e instanceof StormCell;
+            if (storm && e.state.coverage < 0.1) continue;
+            const p = e.anchor;
+            if (!p) continue;
+            const clip = m4.project(app.viewProj, p);
+            if (clip[3] <= 0) continue;
+            const x = (clip[0] / clip[3] * 0.5 + 0.5) * W, y = (0.5 - clip[1] / clip[3] * 0.5) * H;
+            if (x < -50 || x > W + 50 || y < -20 || y > H + 20) continue;
+            const d = v3.len(v3.sub(p, app.camera.pos));
+            if (storm && d > 70000) continue;
+            g.strokeStyle = g.fillStyle = storm ? 'rgba(110,220,255,0.9)' : 'rgba(255,201,74,0.9)';
+            g.lineWidth = dpr;
+            g.beginPath();
+            g.moveTo(x, y - 4 * dpr); g.lineTo(x + 4 * dpr, y); g.lineTo(x, y + 4 * dpr); g.lineTo(x - 4 * dpr, y); g.closePath();
+            g.stroke();
+            g.fillText(`${e.label}${storm ? ` · ${e.describe()}` : ''}  ${fmtKm(d)}`, x + 8 * dpr, y);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------- app
+class App {
+    constructor(canvas) {
+        this.canvas = canvas;
+        this.renderer = new Renderer();
+        this.input = new Input(canvas);
+        this.hud = new Hud();
+        this.camera = new FlyCamera();
+        this.time = 0;
+        this.weatherTime = 0;
+        this.paused = false;
+        this.fps = 60;
+        this.mode = 0;
+        this.radar = true;
+        this.viewProj = new Float32Array(16);
+        this.prevViewProj = null;
+        this.frameNo = 0;
+        this.near = { rain: 0, snow: 0 };
+        this.probe = { coverage: 0, top: 0, precip: 0, virga: 0 };
+        this.groundSnowHint = 'none';
+        this.reset = true;
+    }
+
+    async start() { await this.renderer.init(this.canvas); }
+
+    load(scenario) {
+        const world = new World(scenario);
+        this.world = world;
+        this.scenario = scenario;
+        this.cfg = { ...RENDER_DEFAULTS, ...(scenario.render || {}) };
+        this.quality = clamp(this.cfg.quality, 0, QUALITY.length - 1);
+        this.timeScale = this.cfg.timeScale;
+        this.renderer.setWorld(world);
+        this.hud.setStates(world.weather);
+        const L = scenario.lighting || {};
+        this.lightPresets = L.presets || { default: {} };
+        this.lightNames = Object.keys(this.lightPresets);
+        this.setLight(this.lightPresets[L.start] ? L.start : this.lightNames[0]);
+        this.views = scenario.views || [];
+        this.viewIndex = 0;
+        if (this.views[0]) this.jump(this.views[0]);
+        this.reset = true;
+        if (!this.running) { this.running = true; this.last = performance.now(); requestAnimationFrame(t => this.frame(t)); }
+    }
+
+    setLight(name) {
+        const p = this.lightPresets[name] || {};
+        this.lightName = name || 'default';
+        this.sun = { azimuth: (p.azimuth ?? 150) * DEG, elevation: (p.elevation ?? 35) * DEG, intensity: p.intensity ?? 12, exposure: p.exposure ?? 0.45 };
+    }
+
+    jump(v) {
+        const e = v.follow && this.world.get(v.follow);
+        if (e?.focus) {
+            // relative to a moving entity: offset from its focus point, height above the ground there
+            const f = e.focus, o = v.offset || [0, 0, 0], l = v.lookOffset || [0, 2000, 0];
+            const x = f[0] + o[0], z = f[2] + o[2];
+            this.camera.pos = [x, this.world.field.sample(x, z) + o[1], z];
+            this.camera.lookAt([f[0] + l[0], f[1] + l[1], f[2] + l[2]]);
+        } else {
+            this.camera.pos = [...v.pos];
+            if (v.look) this.camera.lookAt(v.look);
+        }
+        if (v.lighting && this.lightPresets[v.lighting]) this.setLight(v.lighting);
+        if (v.weather) { this.world.weather.set(v.weather); this.hud.setStates(this.world.weather); }
+        this.reset = true;
+        this.hud.toast(v.name);
+    }
+
+    handleKeys(pressed) {
+        const w = this.world, wx = w.weather;
+        for (const code of pressed) {
+            const digit = code.match(/^(?:Digit|Numpad)(\d)$/);
+            if (digit) {
+                const k = +digit[1];
+                if (k === 0) { wx.cycle.enabled = !wx.cycle.enabled; wx.cycleClock = wx.cycle.hold; this.hud.toast(`Auto weather ${wx.cycle.enabled ? 'on' : 'off'}`); }
+                else if (wx.names[k - 1]) { wx.set(wx.names[k - 1]); this.hud.toast(`Weather: ${wx.target}`); }
+                this.hud.setStates(wx);
+                continue;
+            }
+            switch (code) {
+                case 'KeyK': {
+                    const cells = w.storms.filter(s => s.state.precip > 0.1);
+                    if (!cells.length) { this.hud.toast('No mature storm cell'); break; }
+                    const near = cells.reduce((a, b) => Math.hypot(a.pos[0] - this.camera.pos[0], a.pos[1] - this.camera.pos[2]) < Math.hypot(b.pos[0] - this.camera.pos[0], b.pos[1] - this.camera.pos[2]) ? a : b);
+                    w.lightning.strike(near, true);
+                    break;
+                }
+                case 'Comma': case 'Period': {
+                    const i = TIME_SCALES.indexOf(this.timeScale);
+                    const j = clamp((i < 0 ? 3 : i) + (code === 'Period' ? 1 : -1), 0, TIME_SCALES.length - 1);
+                    this.timeScale = TIME_SCALES[j];
+                    this.hud.toast(`Weather time ×${this.timeScale}`);
+                    break;
+                }
+                case 'KeyT': {
+                    const i = (this.lightNames.indexOf(this.lightName) + 1) % this.lightNames.length;
+                    this.setLight(this.lightNames[i]);
+                    this.hud.toast(`Lighting: ${this.lightName}`);
+                    break;
+                }
+                case 'KeyR': this.radar = !this.radar; break;
+                case 'KeyM': this.mode = (this.mode + 1) % RENDER_MODES.length; this.hud.toast(`Render: ${RENDER_MODES[this.mode]}`); break;
+                case 'KeyQ': this.quality = (this.quality + 1) % QUALITY.length; this.reset = true; this.hud.toast(`Quality: ${QUALITY[this.quality].name}`); break;
+                case 'KeyV': if (this.views.length) { this.viewIndex = (this.viewIndex + 1) % this.views.length; this.jump(this.views[this.viewIndex]); } break;
+                case 'KeyL': this.hud.showLabels = !this.hud.showLabels; break;
+                case 'KeyP': this.paused = !this.paused; break;
+                case 'KeyH': this.hud.help.style.display = this.hud.help.style.display === 'none' ? '' : 'none'; break;
+            }
+        }
+    }
+
+    // right click: grow a storm cell where the cursor ray meets the ground
+    handleClicks(clicks) {
+        for (const [cx, cy] of clicks) {
+            const rect = this.canvas.getBoundingClientRect();
+            const hit = this.world.field.raycast(this.camera.pos, this.camera.ray(cx - rect.left, cy - rect.top, rect.width, rect.height));
+            const sp = this.world.spawner;
+            if (!hit) { this.hud.toast('Click on the ground'); continue; }
+            if (!sp) { this.hud.toast('No spawner in this scenario'); continue; }
+            const e = sp.spawnAt(hit[0], hit[2]);
+            this.hud.toast(`${e.label} growing ${fmtKm(v3.len(v3.sub(hit, this.camera.pos)))} away`);
+        }
+    }
+
+    updateSun(dt) {
+        const k = this.input.keys, s = this.sun;
+        if (k.has('ArrowLeft')) s.azimuth -= dt * 0.5;
+        if (k.has('ArrowRight')) s.azimuth += dt * 0.5;
+        if (k.has('ArrowUp')) s.elevation = Math.min(s.elevation + dt * 0.25, 85 * DEG);
+        if (k.has('ArrowDown')) s.elevation = Math.max(s.elevation - dt * 0.25, 2 * DEG);
+    }
+
+    // what is falling on the camera, from the weather probe (sampled where precipitation over us left the cloud base)
+    nearPrecip() {
+        const c = this.world.weather.cur, y = this.camera.pos[1], pr = this.probe;
+        const g = this.world.field.base, bottom = lerp(g - 300, c.base, pr.virga);
+        if (y > c.base + 200 || pr.precip < 0.01) return { rain: 0, snow: 0 };
+        const k = pr.precip * smoothstep(bottom, bottom + 300, y);
+        const snow = smoothstep(this.world.weather.freezingLevel - 250, this.world.weather.freezingLevel + 250, y);
+        return { rain: k * (1 - snow), snow: k * snow };
+    }
+
+    writeFrame(dt, wdt) {
+        const r = this.renderer, F = r.frame, cam = this.camera, w = this.world, c = w.weather.cur, cfg = this.cfg, q = QUALITY[this.quality];
+        const sky = Sky.compute(this.sun.azimuth, this.sun.elevation, this.sun.intensity, c);
+        const aspect = r.width / r.height, tanY = Math.tan(cam.fov / 2), tanX = tanY * aspect;
+        const { fwd, right, up } = cam.basis();
+        this.viewProj = m4.mul(m4.reversedInfinite(cam.fov, aspect, NEAR), m4.view(cam.pos, right, up, fwd));
+        // weather map follows the camera, snapped to its texels so it does not swim
+        const ws = cfg.weatherSize, texel = ws / WEATHER_RES;
+        const wo = [Math.floor((cam.pos[0] - ws / 2) / texel) * texel, Math.floor((cam.pos[2] - ws / 2) / texel) * texel];
+        const f = w.field;
+        F.set('viewProj', this.viewProj);
+        F.set('prevViewProj', this.prevViewProj || this.viewProj);
+        F.set('cam', [...cam.pos, this.time % 3600]);
+        F.set('fwd', [...fwd, NEAR]);
+        F.set('right', [...v3.mul(right, tanX), this.frameNo % 1024]);
+        F.set('up', [...v3.mul(up, tanY), this.weatherTime]);
+        F.set('sunDir', [...sky.dir, 0]);
+        F.set('sunCol', [...sky.sun, this.sun.exposure]);
+        F.set('zenith', [...sky.zenith, 0.00007 * c.haze]);
+        F.set('horizon', [...sky.horizon, 1400]);
+        F.set('ambient', [...sky.ambient, 0]);
+        F.set('screen', [r.width, r.height, r.cloudPass.w, r.cloudPass.h]);
+        F.set('cloud', [c.base, Math.max(c.top, c.base + 400), c.density, c.coverage]);
+        F.set('noise', [cfg.shapeScale, cfg.detailScale, cfg.detailStrength, cfg.maxTop]);
+        F.set('wind', [...c.wind, ...w.weather.offset]);
+        F.set('precip', [w.weather.freezingLevel, cfg.slant, cfg.rainExtinction, cfg.snowExtinction]);
+        F.set('wdomain', [wo[0], wo[1], ws, WEATHER_RES]);
+        F.set('tdomain', [f.origin, f.origin, f.size, f.n]);
+        F.set('ground', [w.terrain.fieldSize, w.terrain.pivots, GROUND_RES, this.mode]);
+        F.set('cirrus', [cfg.maxTop + 800, c.cirrus, 9000, c.drizzle]);
+        F.set('march', [q.steps, q.light, cfg.maxDistance, this.radar ? 1 : 0]);
+        // the shadow map refreshes a slice of rows per frame, unless the map moved or the sun / weather jumped
+        const shadowKey = `${wo[0]},${wo[1]},${sky.dir.map(v => v.toFixed(2))},${w.weather.target},${w.weather.blend < 1}`;
+        const full = this.reset || shadowKey !== this.shadowKey || w.weather.blend < 1;
+        this.shadowKey = shadowKey;
+        F.set('lod', [q.checker ? 1 : 0, full ? 1 : SHADOW_SLICES, full ? 0 : this.frameNo % SHADOW_SLICES, q.detail]);
+        this.shadowSlices = full ? 1 : SHADOW_SLICES;
+        F.set('misc', [c.temperature, this.time * cfg.fallSpeed % 52000, f.base, wdt]);
+        w.lightning.write(F);
+
+        const cells = w.gpuCells(cam.pos), cd = r.cellData;
+        cd.fill(0);
+        cells.forEach((s, i) => cd.set([s.x, s.z, s.radius, s.top, s.coverage, s.precip, s.seed, s.virga, s.core, s.offset[0], s.offset[1], 0,
+            s.shelf || 0, s.laminar || 0, s.green || 0, s.wall || 0], i * CELL_FLOATS));
+        const feat = w.features();
+        feat.ms.forEach((m, i) => F.set('ms', m, i * 12));
+        feat.shelves.forEach((sl, i) => F.set('shelves', sl, i * 16));
+        // highest cloud anywhere: nothing to sample above it
+        const tops = [c.top + 200, ...cells.map(cl => cl.top + 200), ...feat.ms.map(m => m[5] + 2500)];
+        for (const d of w.clouds.defs) if (w.clouds.coverage(c, d) > 0.005) tops.push(d.top);
+        F.set('features', [feat.ms.length, feat.shelves.length, Math.min(Math.max(...tops), cfg.maxTop), 0]);
+        // the march and shadow map start at the lowest cloud: wall clouds and shelf lips hang low
+        const lows = [...feat.ms.map(m => m[4] - m[8] - 100), ...feat.shelves.map(sl => f.base + sl[8] - 300)];
+        w.clouds.write(F, c, Math.min(c.base, ...lows.map(y => y + 1300)));
+        F.set('near', [this.near.rain, this.near.snow, this.reset ? 1 : 0, cells.length]);
+        r.device.queue.writeBuffer(r.boltBuf, 0, w.lightning.segs);
+
+        // probe texel: where the precipitation above the camera left the cloud base
+        const drop = Math.max(c.base - cam.pos[1], 0) * cfg.slant;
+        const px = cam.pos[0] - c.wind[0] * drop, pz = cam.pos[2] - c.wind[1] * drop;
+        this.probeTexel = [clamp(Math.floor((px - wo[0]) / texel), 0, WEATHER_RES - 1), clamp(Math.floor((pz - wo[1]) / texel), 0, WEATHER_RES - 1)];
+        this.groundSnowHint = w.weather.freezingLevel < f.base + 150 ? 'settling' : w.weather.freezingLevel < f.max ? 'on the peaks' : 'melting';
+    }
+
+    frame(now) {
+        requestAnimationFrame(t => this.frame(t));
+        const dt = Math.min(0.1, (now - this.last) / 1000);
+        this.last = now;
+        if (dt > 0) this.fps = this.fps * 0.95 + (1 / dt) * 0.05;
+        const io = this.input.consume();
+        this.handleKeys(io.pressed);
+        this.handleClicks(io.clicks);
+        const r = this.renderer, w = this.world;
+        if (r.resize(QUALITY[this.quality].scale)) this.reset = true;
+        const before = [...this.camera.pos];
+        this.camera.update(dt, io, this.input, w.field);
+        if (v3.len(v3.sub(before, this.camera.pos)) > 3000) this.reset = true;
+        this.updateSun(dt);
+
+        const wdt = this.paused ? 0 : dt * this.timeScale;
+        if (!this.paused) { this.time += dt; this.weatherTime += wdt; }
+        w.update(this.paused ? 0 : dt, wdt, this.time);
+        this.probe = r.weatherPass.probe;
+        this.near = this.nearPrecip();
+
+        this.writeFrame(dt, wdt);
+        const enc = r.device.createCommandEncoder();
+        const total = this.near.rain + this.near.snow;
+        r.render(enc, this.probeTexel, total > 0.005 ? this.cfg.particles : 0, w.lightning.count, !!QUALITY[this.quality].checker, this.shadowSlices);
+        r.device.queue.submit([enc.finish()]);
+        r.weatherPass.afterSubmit();
+        r.profiler.afterSubmit();
+        this.prevViewProj = this.viewProj;
+        this.frameNo++;
+        this.reset = false;
+        this.hud.drawLabels(this);
+        this.hud.update(this, now);
+    }
+}
+
+// ------------------------------------------------------------------------------------------------- main
+function showFallback(e) {
+    console.error(e);
+    document.getElementById('error-message').textContent = String(e && (e.stack || e.message) || e);
+    document.getElementById('fallback').classList.add('show');
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+    const app = new App(document.getElementById('view'));
+    app.renderer.onError = showFallback;
+    window.cloudDemo = app;        // devtools: world, renderer, camera
+    try {
+        await app.start();
+        app.load(JSON.parse(document.getElementById('scenario').textContent));
+    } catch (err) {
+        showFallback(err);
+        return;
+    }
+    window.addEventListener('dragover', e => e.preventDefault());
+    window.addEventListener('drop', async e => {
+        e.preventDefault();
+        const file = e.dataTransfer.files[0];
+        if (!file) return;
+        try {
+            app.load(JSON.parse(await file.text()));
+            app.hud.toast(`Loaded ${file.name}`);
+        } catch (err) {
+            app.hud.toast(`Could not load ${file.name}: ${err.message}`, 5000);
+        }
+    });
+});
+</script>
+</body>
+</html>
