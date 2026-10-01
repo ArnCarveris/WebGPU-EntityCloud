@@ -185,7 +185,7 @@
         { "type": "forest", "pos": [-24000, -2000], "radius": 9000, "density": 0.9, "seed": 3 },
 
         { "type": "supercell", "id": "hero", "label": "Supercell", "pos": [1500, -2500], "radius": 6200, "top": 11800, "precip": 1.0,
-          "core": 0.4, "coreOffset": [2600, 2400], "life": [900, 2400, 1200], "lightning": 5, "virga": 0.12, "pinned": true,
+          "core": 0.75, "coreOffset": [900, 800], "life": [900, 2400, 1200], "lightning": 5, "virga": 0.12, "pinned": true,
           "stackRadius": 1.0, "stackDrop": 1300, "stackHeight": 6000, "plates": 5, "twist": 0.5, "spin": 0.03,
           "wallCloud": 700, "wallRadius": 0.3, "green": 0.45 },
         { "type": "squall", "id": "squall", "label": "Squall line", "from": [-26000, -36000], "to": [-20000, 34000], "count": 7,
@@ -238,7 +238,9 @@
 //   5. Volumetrics (compute, reduced resolution): one ray march through clouds (Perlin-Worley shape + Worley detail,
 //      light march + multiple-scattering octaves), rain and snow shafts falling from the cloud base (slanted by the wind,
 //      streaky curtains, virga evaporating before the ground, rain below the freezing level and snow above), and height
-//      haze with crepuscular rays from the shadow map; then temporal reprojection.
+//      haze with crepuscular rays from the shadow map; then temporal reprojection. The light reaching the rain, snow
+//      and haze (cloud shadow, shadow cast by the shafts themselves, sky light, lightning) comes from a froxel volume
+//      filled just before the march.
 //   6. Final (render): composite + tonemap, near-field rain streaks / snow flakes around the camera, lightning bolts, radar.
 //
 // The world is data (the scenario JSON above). Every entity is a class in ENTITY_TYPES: terrain features stamp the heightmap
@@ -258,19 +260,31 @@ const MAX_BOLT_SEGS = 256;
 const GRID_N = 512;                 // terrain mesh vertices per side (inner part covers the heightfield, outer rings run to the horizon)
 const NOISE_SHAPE = 128;
 const NOISE_DETAIL = 32;
+// occupancy grid for empty-space skipping: OCC_RES^2 columns over the weather map, 32 height cells each (one u32 of bits)
+const OCC_RES = 256;
+// cloud tile pre-pass: one ray per CLOUD_TILE^2 volumetric pixels finds the distance bins (64, square-root spaced out to
+// the march distance) where cloud can be; the march evaluates clouds only there. Coverage is padded by TILE_COVER_PAD
+// in the pre-pass, so its clouds are a little larger than the march's and small or thin ones are not missed
+const CLOUD_TILE = 4;
+const TILE_COVER_PAD = 0.15;
 const WEATHER_RES = 512;
 const SHADOW_RES = 384;
 const GROUND_RES = 256;
 const RENDER_MODES = ['shaded', 'no volumetrics', 'clouds only', 'precipitation only'];
-// scale: volumetric resolution; steps / light: march and light-march steps; checker: march half the pixels per frame;
-// detail: distance (m) within which the detail noise erodes clouds (beyond, cheaper LODs)
+// scale: volumetric resolution; steps / light: march and light-march steps; interleave: march 1 of every 1, 2
+// (checkerboard) or 4 (one of each 2x2 block) pixels per frame, in turn, the resolve fills in the others from history;
+// detail: distance (m) within which the detail noise erodes clouds (beyond, cheaper LODs);
+// blur: radius (volumetric texels) of the edge-aware blur that smooths the clouds' march noise at low resolution
 const QUALITY = [
-    { name: 'low', scale: 0.5, steps: 64, light: 3, checker: true, detail: 10000 },
-    { name: 'medium', scale: 0.5, steps: 96, light: 4, checker: true, detail: 16000 },
-    { name: 'high', scale: 0.75, steps: 128, light: 5, checker: true, detail: 22000 },
-    { name: 'ultra', scale: 1.0, steps: 160, light: 6, checker: false, detail: 30000 },
+    { name: 'low', scale: 0.5, steps: 64, light: 3, interleave: 4, detail: 10000, blur: 1.0 },
+    { name: 'medium', scale: 0.5, steps: 96, light: 4, interleave: 4, detail: 16000, blur: 0.7 },
+    { name: 'high', scale: 0.75, steps: 128, light: 5, interleave: 4, detail: 22000, blur: 0 },
+    { name: 'ultra', scale: 1.0, steps: 160, light: 6, interleave: 1, detail: 30000, blur: 0 },
 ];
-const SHADOW_SLICES = 4;              // the cloud shadow map refreshes 1/4 of its rows per frame while nothing jumps
+// froxel lighting volume: frustum cells across x, y and exponential depth slices from FROXEL_NEAR (m) to the march distance
+const FROXEL = [160, 96, 128];
+const FROXEL_NEAR = 40;
+const SHADOW_SLICES = 4;             // the cloud shadow map refreshes 1/4 of its rows per frame while nothing jumps
 const RENDER_DEFAULTS = {
     quality: 1, shapeScale: 11000, detailScale: 1700, detailStrength: 0.32, maxTop: 12500, maxDistance: 60000, weatherSize: 128000,
     rainExtinction: 0.0011, snowExtinction: 0.0026, slant: 0.09, fallSpeed: 40, timeScale: 20, particles: 24000,
@@ -538,7 +552,9 @@ const FRAME_LAYOUT = [
     ['ms', `array<vec4f, ${MAX_MOTHERSHIPS * 3}>`],  // [x, z, radius, spin] [stack bottom, top, plates, twist] [wall drop, wall radius, strength, seed]
     ['shelves', `array<vec4f, ${MAX_SHELVES * 4}>`], // [end a, end b] [bow control, motion dir] [lip height, depth, tiers, strength] [bbox]
     ['features', 'vec4f'],  // motherships, shelf lines, highest cloud top (m), -
-    ['lod', 'vec4f'],       // checkerboard march on, shadow map slices, slice this frame, detail distance (m)
+    ['lod', 'vec4f'],       // march interleave (1, 2, 4), shadow map slices, slice this frame, detail distance (m)
+    ['froxel', 'vec4f'],    // near, far (m), froxels on, -
+    ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, -, -
 ];
 
 class FrameBlock {
@@ -571,6 +587,7 @@ const WORLD_BINDINGS = [
     ['anvilTex', 'tex', 'var anvilTex: texture_2d<f32>'],     // anvil coverage, anvil top, shelf coverage, shelf wedge
     ['layerTex', 'tex', 'var layerTex: texture_2d<f32>'],     // coverage of each cloud genus layer
     ['styleTex', 'tex', 'var styleTex: texture_2d<f32>'],     // laminar plates, green tint, wall cloud lowering (m), -
+    ['occ', 'read', 'var<storage, read> occ: array<u32>'],     // per column, bit k: height cell k may hold noise cloud
 ];
 
 function layoutEntry(binding, visibility, kind) {
@@ -680,6 +697,19 @@ fn aces(x: vec3f) -> vec3f {
 // needs F
 const WGSL_SKY = /* wgsl */`
 fn rayDir(ndc: vec2f) -> vec3f { return normalize(F.fwd.xyz + F.right.xyz * ndc.x + F.up.xyz * ndc.y); }
+
+// interleaved march (F.lod.x): 1 every pixel; 2 a checkerboard, alternating; 4 one pixel of each 2x2 block, cycling
+// diagonally first so consecutive frames are far apart. marchCorner: the 2x2 block's marched pixel this frame
+fn marchCorner() -> vec2u {
+    let k = u32(F.right.w) & 3u;
+    return vec2u(select(0u, 1u, k == 1u || k == 2u), select(0u, 1u, k == 1u || k == 3u));
+}
+fn marchedNow(q: vec2i) -> bool {
+    let n = i32(F.lod.x);
+    if (n >= 4) { return all((vec2u(q) & vec2u(1u)) == marchCorner()); }
+    if (n >= 2) { return ((q.x + q.y + i32(F.right.w)) & 1) == 0; }
+    return true;
+}
 fn tonemap(c: vec3f) -> vec3f { return pow(aces(c * F.sunCol.w), vec3f(1.0 / 2.2)); }
 
 fn skyColor(dir: vec3f) -> vec3f {
@@ -690,35 +720,47 @@ fn skyColor(dir: vec3f) -> vec3f {
     return c + F.sunCol.rgb * (hg(mu, 0.78) * 0.025 + hg(mu, 0.3) * 0.02 * (1.0 - t));
 }
 
-// light of the active lightning flashes at p
-fn flashLight(p: vec3f) -> vec3f {
-    var l = 0.0;
-    for (var k = 0; k < ${MAX_FLASHES}; k++) {
-        let f = F.flash[k];
-        if (f.w > 0.0) { let d = distance(p, f.xyz); l += f.w / (1.0 + d * d * 4e-7); }
-    }
-    return vec3f(0.75, 0.82, 1.0) * l;
-}
+const FLASH_COLOR = vec3f(0.75, 0.82, 1.0);
+
 `;
 
 // needs F, weatherTex, clampSamp
 const WGSL_WEATHER_SAMPLE = /* wgsl */`
-// x coverage, y cloud top (m), z precipitation (0..1), w virga (0 reaches the ground .. 1 evaporates at the cloud base)
+// the shadow map's sun rays climb from the lowest cloud through the slab, no flatter than this (a lower sun would run
+// them off the map)
+fn shadowSunDir() -> vec3f { return normalize(vec3f(F.sunDir.x, max(F.sunDir.y, 0.08), F.sunDir.z)); }
+// the shadow map splits each sun ray's optical depth at this height: just above the convective layer's top
+fn sunSplit() -> f32 { return F.cloud.y + 300.0; }
+
+// how much of the precipitation in weather sample w evaporates before the ground: its virga, which a downpour
+// overwhelms (from intensity 0.6, gone by 1.4); the near-field rain on the CPU mirrors it (nearPrecip)
+fn virgaOf(w: vec4f) -> f32 { return w.w * (1.0 - sat((w.z - 0.6) / 0.8)); }
+
+// x coverage, y cloud top (m), z precipitation (0..2, past 1 in severe storms), w virga (0 reaches the ground .. 1 evaporates at the cloud base)
 fn weatherAt(xz: vec2f) -> vec4f {
     let uv = (xz - F.wdomain.xy) / F.wdomain.z;
     let w = textureSampleLevel(weatherTex, clampSamp, uv, 0.0);
     let e = sat(min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) * 12.0);
     return mix(vec4f(F.cloud.w * 0.6, F.cloud.y, 0.0, 0.0), w, e);
 }
-// precipitation at p left the cloud base upwind: falling takes time and the wind carries it, so shafts slant
-fn precipWeatherAt(p: vec3f) -> vec4f {
-    let drop = max(F.cloud.x - p.y, 0.0);
-    return weatherAt(p.xz - F.wind.xy * drop * F.precip.y);
+// the cloud base precipitation falls from at xz: the layer's base, lowered under a mothership to the bottom of its
+// plate stack (which hangs below the base) and back up across the stack's bell-shaped rim
+fn precipBase(xz: vec2f) -> f32 {
+    var b = F.cloud.x;
+    for (var i = 0; i < i32(F.features.x); i++) {
+        let A = F.ms[i * 3];
+        let B = F.ms[i * 3 + 1];
+        b = min(b, mix(B.x, F.cloud.x, smoothstep(A.z * 0.6, A.z * 1.05, distance(xz, A.xy))));
+    }
+    return b;
 }
 `;
 
 // needs F, shapeTex, detailTex, anvilTex, layerTex, styleTex, repSamp, clampSamp (+ weather sample)
 const WGSL_DENSITY = /* wgsl */`
+// added to every noise cloud's coverage: the tile pre-pass pads the clouds with it, so they reach a little further
+var<private> covBoost: f32 = 0.0;
+
 fn mapUV(xz: vec2f) -> vec2f { return (xz - F.wdomain.xy) / F.wdomain.z; }
 fn mapFade(uv: vec2f) -> f32 { return sat(min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) * 12.0); }
 fn windDir() -> vec2f { let wl = length(F.wind.xy); return select(vec2f(1.0, 0.0), F.wind.xy / wl, wl > 0.1); }
@@ -750,14 +792,14 @@ fn convectiveDensity(p: vec3f, w: vec4f, an: vec4f, st: vec4f, detail: bool) -> 
         h = (p.y - base) / (top - base);
         let tall = sat((top - base - 2500.0) / 6000.0);                       // cumulonimbus towers
         prof = sat(h / 0.025 + 0.15) * sat((1.0 - h) / mix(0.45, 0.14, tall)); // flat bases, rounded tops
-        cov = sat(w.x * mix(1.0, 0.72, h)) * 0.94;                           // towers narrow upwards
+        cov = min(sat(w.x * mix(1.0, 0.72, h)) * 0.94 + covBoost, 1.0);      // towers narrow upwards
     }
     if (p.y > base0 + 2500.0) {
         let band = 2800.0;
         if (an.x > 0.01 && p.y > an.y - band && p.y < an.y) {
             let ha = (p.y - (an.y - band)) / band;
             let pa = sat(ha / 0.35) * sat((1.0 - ha) / 0.2);
-            if (an.x * pa > cov * prof) { cov = an.x; prof = pa; h = max(h, 0.85); }
+            if (an.x * pa > cov * prof) { cov = min(an.x + covBoost, 1.0); prof = pa; h = max(h, 0.85); }
         }
     }
     if (cov <= 0.0 || prof <= 0.0) { return 0.0; }
@@ -795,7 +837,8 @@ fn shelfDensity(p: vec3f, an: vec4f) -> f32 {
     let tiers = 0.5 + 0.5 * smoothstep(0.15, 0.6, abs(fract(h * 3.0 + 0.15 * sin(p.x / 1800.0 + p.z / 2300.0)) * 2.0 - 1.0));
     let s = textureSampleLevel(shapeTex, repSamp, vec3f(p.x - F.wind.z, p.y * 2.0, p.z - F.wind.w) / (F.noise.x * 0.6), 0.0);
     let prof = sat(h / 0.08) * sat((1.0 - h) / 0.35);
-    var d = sat(remap((0.4 + 0.6 * s.x) * prof * tiers, 1.0 - an.z, 1.0, 0.0, 1.0)) * an.z;
+    let sc = min(an.z + covBoost, 1.0);
+    var d = sat(remap((0.4 + 0.6 * s.x) * prof * tiers, 1.0 - sc, 1.0, 0.0, 1.0)) * sc;
     let dn = textureSampleLevel(detailTex, repSamp, vec3f(p.x - F.wind.z, p.y, p.z - F.wind.w) / 1100.0, 0.0);
     d = sat(remap(d, (dn.x * 0.625 + dn.y * 0.25 + dn.z * 0.125) * 0.55, 1.0, 0.0, 1.0));   // ragged scud underneath
     return d * F.cloud.z;
@@ -825,7 +868,8 @@ fn layerDensity(p: vec3f, i: i32, cov: f32, detail: bool) -> f32 {
         n = sat(remap(s.x, s.y * 0.625 + s.z * 0.25 + s.w * 0.125 - 1.0, 1.0, 0.0, 1.0));
         prof = sat(h / 0.05) * sat((1.0 - h) / 0.4);
     }
-    var d = sat(remap(n * prof, 1.0 - cov, 1.0, 0.0, 1.0)) * cov;
+    let cv = min(cov + covBoost, 1.0);
+    var d = sat(remap(n * prof, 1.0 - cv, 1.0, 0.0, 1.0)) * cv;
     if (d <= 0.0) { return 0.0; }
     if (detail && B.w > 0.0) {
         let dn = textureSampleLevel(detailTex, repSamp, lp / (B.y * 0.2) + C.w, 0.0);
@@ -977,7 +1021,11 @@ fn shelfLineDensity(p: vec3f, i: i32, lod: i32) -> vec2f {
 // every kind of cloud at p: x extinction (1/m), y ambient light scale, z green tint.
 // lod: 0 full detail, 1 no detail erosion, 2 shape only (light march, shadow map). feat: bits of the analytic
 // structures this ray can meet (0-3 motherships, 4-5 shelf lines)
-fn cloudSample(p: vec3f, w: vec4f, lod: i32, feat: u32) -> vec3f {
+fn cloudSample(p: vec3f, w: vec4f, lod: i32, feat: u32) -> vec3f { return cloudSampleN(p, w, lod, feat, true); }
+
+// noise: false skips the noise clouds (convective layer, anvils, shelves, genus layers), where the occupancy grid
+// proves there are none; the analytic structures are still evaluated
+fn cloudSampleN(p: vec3f, w: vec4f, lod: i32, feat: u32, noise: bool) -> vec3f {
     var d = 0.0;
     var amb = 0.0;
     var green = 0.0;
@@ -997,7 +1045,7 @@ fn cloudSample(p: vec3f, w: vec4f, lod: i32, feat: u32) -> vec3f {
         d += sl.x;
         amb += sl.x * sl.y;
     }
-    if (p.y > base - 1300.0 && mask < 0.999) {
+    if (noise && p.y > base - 1300.0 && mask < 0.999) {
         // fetch the anvil / shelf map only where those can be (anvils high, cell shelves low) and the style map only
         // near storm cells (they lift the weather map's cloud top)
         var an = vec4f(0.0);
@@ -1011,7 +1059,7 @@ fn cloudSample(p: vec3f, w: vec4f, lod: i32, feat: u32) -> vec3f {
         amb += dc + ds * 0.5;
         green = st.y * sat((base + 3500.0 - p.y) / 3000.0);
     }
-    if (p.y > F.layerInfo.x && p.y < F.layerInfo.y) {
+    if (noise && p.y > F.layerInfo.x && p.y < F.layerInfo.y) {
         let lc = layerCovAt(p.xz);
         for (var i = 0; i < ${MAX_LAYERS}; i++) {
             let dl = layerDensity(p, i, lc[i], lod == 0);
@@ -1025,26 +1073,55 @@ fn cloudSample(p: vec3f, w: vec4f, lod: i32, feat: u32) -> vec3f {
 // shape-only extinction, for light marches and the shadow map
 fn cloudDensity(p: vec3f, w: vec4f) -> f32 { return cloudSample(p, w, 2, 0xffffffffu).x; }
 
-// rain (x) and snow (y) extinction (1/m) at p; w is the slanted weather sample (precipWeatherAt)
+// rain (x) and snow (y) extinction (1/m) at p; w is the weather it fell from (precipSourceAt)
 fn precipDensity(p: vec3f, w: vec4f) -> vec2f {
-    if (w.z < 0.003) { return vec2f(0.0); }
-    let base = F.cloud.x;
-    let bottom = mix(F.misc.z - 300.0, base, w.w);                    // virga: evaporated below here
-    let low = smoothstep(bottom, bottom + max(250.0, (base - bottom) * 0.7 * w.w + 250.0), p.y);
-    let high = sat((base + 700.0 - p.y) / 900.0);                     // shafts start inside the cloud
-    if (low * high <= 0.0) { return vec2f(0.0); }
-    let q = vec3f(p.x - F.wind.z * 0.3, p.y + F.misc.y, p.z - F.wind.w * 0.3);
+    let e = precipEnvelope(p, w);
+    if (e.x + e.y <= 0.0) { return e; }
+    let heavy = sat((w.z - 0.6) / 0.8);                               // storm cores: the curtains merge into a wall
+    let q = vec3f(p.x - F.wind.z, p.y + F.misc.y, p.z - F.wind.w);       // curtains travel with the clouds
     let streak = textureSampleLevel(detailTex, repSamp, vec3f(q.x / 420.0, q.y / 4200.0, q.z / 420.0), 0.0);
     let clump = textureSampleLevel(shapeTex, repSamp, vec3f(q.x / 6000.0, q.y / 24000.0, q.z / 6000.0), 0.0).x;
     let curtain = smoothstep(0.38, 0.9, (streak.x * 0.7 + streak.y * 0.3) * 0.6 + clump * 0.6);
-    let d = w.z * low * high * (0.12 + 0.88 * curtain);
+    return e * mix(0.12 + 0.88 * curtain, 0.7 + 0.3 * curtain, heavy);
+}
+
+// the shaft without its streaky curtains: precipitation, virga and the cloud base shape it, the freezing level splits
+// it into rain (x) and snow (y)
+fn precipEnvelope(p: vec3f, w: vec4f) -> vec2f {
+    if (w.z < 0.003) { return vec2f(0.0); }
+    let base = precipBase(p.xz);
+    let v = virgaOf(w);
+    let bottom = mix(F.misc.z - 300.0, base, v);                      // virga: evaporated below here
+    let low = smoothstep(bottom, bottom + max(250.0, (base - bottom) * 0.7 * v + 250.0), p.y);
+    let high = sat((base + 700.0 - p.y) / 900.0);                     // shafts start inside the cloud
     let snow = smoothstep(F.precip.x - 250.0, F.precip.x + 250.0, p.y);
-    return d * vec2f((1.0 - snow) * F.precip.z, snow * F.precip.w);
+    let rate = w.z * (1.0 + 0.8 * sat((w.z - 0.6) / 0.8));               // heavy precipitation is disproportionately dense
+    return rate * low * high * vec2f((1.0 - snow) * F.precip.z, snow * F.precip.w);
 }
 `;
 
 // needs F, shadowTex, clampSamp
 const WGSL_SHADOW_SAMPLE = /* wgsl */`
+// optical depth of the clouds between p and the sun, from the shadow map: the sun ray through p crosses the lowest
+// cloud's height at one texel, which holds the ray's whole optical depth and the part below sunSplit(); what lies
+// below p is taken off, assuming the cloud spread evenly over each part's height. Cloud lights use it for the sun
+// ray beyond their own short march, so a low sun cannot light the underside of a deck it would have to cross
+fn sunDepthAbove(p: vec3f) -> f32 {
+    let s = shadowSunDir();
+    let base = F.layerInfo.z;
+    let top = F.noise.w;
+    if (p.y >= top) { return 0.0; }
+    let uv = (p.xz - s.xz * (max(p.y, base) - base) / s.y - F.wdomain.xy) / F.wdomain.z;
+    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0))) { return 0.0; }
+    let t = textureSampleLevel(shadowTex, clampSamp, uv, 0.0);
+    let total = -log(max(t.x, 1e-6));
+    let low = min(t.w, total);
+    let split = sunSplit();
+    var below = low * sat((p.y - base) / max(split - base, 1.0));
+    if (p.y > split) { below = mix(low, total, sat((p.y - split) / max(top - split, 1.0))); }
+    return max(total - below, 0.0);
+}
+
 // x: sun transmittance through the cloud slab, y: sky light left under the cloud column above p
 fn shadowAt(p: vec3f) -> vec2f {
     let s = F.sunDir.xyz;
@@ -1054,12 +1131,134 @@ fn shadowAt(p: vec3f) -> vec2f {
     let ua = (xz - F.wdomain.xy) / F.wdomain.z;
     let ub = (p.xz - F.wdomain.xy) / F.wdomain.z;
     let a = textureSampleLevel(shadowTex, clampSamp, ua, 0.0).x;
-    let b = textureSampleLevel(shadowTex, clampSamp, ub, 0.0).y;
+    let b = 0.12 + 0.88 * textureSampleLevel(shadowTex, clampSamp, ub, 0.0).y;
     // beyond the map: no cloud shadows instead of its edge texels smeared outwards
     let ea = sat(min(min(ua.x, 1.0 - ua.x), min(ua.y, 1.0 - ua.y)) * 12.0);
     let eb = sat(min(min(ub.x, 1.0 - ub.x), min(ub.y, 1.0 - ub.y)) * 12.0);
     let above = sat((p.y - base) / max(F.noise.w - base, 1.0));
     return vec2f(mix(mix(1.0, a, ea), 1.0, above), mix(mix(1.0, b, eb), 1.0, above));
+}
+
+// Diffuse light inside a cloud: sky light reaching p through the cloud above it, from the shadow map's column (its
+// optical depth, with the cloud taken as spread evenly from the lowest cloud up to top) and the column's sun
+// transmittance (for light the sunlit ground bounces up). x sky, y sun on the ground below.
+// Light scattered many times, mostly forward, gets through a thick cloud far better than a straight beam does:
+// diffusion gives a transmittance of about 1 / (1 + 0.75 (1 - g) tau), with g = 0.85 for cloud droplets
+fn cloudAbove(p: vec3f, top: f32) -> vec2f {
+    let uv = (p.xz - F.wdomain.xy) / F.wdomain.z;
+    let e = sat(min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) * 12.0);
+    let c = textureSampleLevel(shadowTex, clampSamp, uv, 0.0);
+    let frac = sat((top - p.y) / max(top - F.layerInfo.z, 1.0));
+    let od = -log(max(c.y, 1e-6)) / 0.03 * frac;                      // optical depth above p
+    return mix(vec2f(1.0), vec2f(1.0 / (1.0 + 0.11 * od), c.x), e);
+}
+// The diffuse field flows downward (light enters through the tops, the ground sends little back), so it is brighter
+// looking up than down, more so the more cloud lies above: radiance seen along a ray of direction dir, with sky the
+// light left after the cloud above (1 open sky .. 0 deep in a storm)
+fn diffuseLook(sky: f32, dirY: f32) -> f32 { return 1.0 + 0.6 * (1.0 - sky) * dirY; }
+
+// Lightning at p, seen through the storm: a flash fires inside the cloud, so its light diffuses out through the cloud
+// between it and p (diffusion transmittance, as in cloudAbove). The cloud is that of the flash's column (shadow map
+// optical depth over its height, from the lowest cloud to its top) spread evenly; the part of the flash-to-p segment
+// within those heights crosses it. So the cloud around a flash glows, its base and the rain and ground below get a
+// dimmed, spread-out light, and air beside the storm is lit only by what leaves the cloud
+const FLASH_GAIN = 10.0;
+fn flashLit(p: vec3f) -> f32 {
+    var l = 0.0;
+    for (var k = 0; k < ${MAX_FLASHES}; k++) {
+        let f = F.flash[k];
+        if (f.w <= 0.0) { continue; }
+        let d = distance(p, f.xyz);
+        let uv = (f.xz - F.wdomain.xy) / F.wdomain.z;
+        let base = F.layerInfo.z;
+        let top = max(weatherAt(f.xz).y, base + 400.0);
+        let colOD = -log(max(textureSampleLevel(shadowTex, clampSamp, uv, 0.0).y, 1e-6)) / 0.03;
+        let sigma = colOD / (top - base);                               // mean extinction of the storm column (1/m)
+        let y0 = min(p.y, f.y);
+        let y1 = max(p.y, f.y);
+        var inside = select(0.0, 1.0, p.y > base && p.y < top);         // a level segment: in cloud or not
+        if (y1 - y0 > 1.0) { inside = max(min(y1, top) - max(y0, base), 0.0) / (y1 - y0); }
+        // FLASH_GAIN: a flash outshines the sky by orders of magnitude, so even the few percent that diffuses out of
+        // a storm lights it up
+        l += FLASH_GAIN * f.w / (1.0 + d * d * 4e-7) / (1.0 + 0.11 * sigma * d * inside);
+    }
+    return l;
+}
+
+// share of precipitation that can leave the cloud base at xz: rain needs cloud above it. A storm's rain core sits on
+// its flank and the wind carries the shaft further, so without this some of it would fall from clear sky beside the
+// cloud. The shadow map's z term measures the low cloud above (1 clear .. 0 thick): an anvil overhead does not count
+fn rainCover(xz: vec2f) -> f32 {
+    let low = textureSampleLevel(shadowTex, clampSamp, (xz - F.wdomain.xy) / F.wdomain.z, 0.0).z;
+    return smoothstep(0.03, 0.3, 1.0 - low);
+}
+// the weather precipitation at p fell from. Storms move with the wind aloft and the slower air below holds the falling
+// precipitation back, so a shaft trails behind its cloud: what reaches p left the cloud base downwind of it, and the
+// longer the fall the further. Its rate is cut where no cloud hangs above that point
+fn precipSourceAt(p: vec3f) -> vec4f {
+    let xz = p.xz + F.wind.xy * max(precipBase(p.xz) - p.y, 0.0) * F.precip.y;
+    var w = weatherAt(xz);
+    w.z *= rainCover(xz);
+    return w;
+}
+`;
+
+// ------------------------------------------------------------------------------- WGSL empty-space skipping
+// Occupancy grid, each frame after the weather map: one thread per column, 32 height cells from the lowest cloud
+// (layerInfo.z) to the highest top (features.z). A cell's bit is set where the noise clouds can exist at that height:
+// within the convective layer up to the column's highest top (lowered bases under wall clouds included), in an anvil
+// band, at shelf height, or in a genus layer's band, with the largest values over every weather texel a bilinear
+// fetch in the column can touch. Most empty air the march crosses lies above the column's own top (the slab reaches
+// up to the tallest storm anywhere) or outside the genus bands; a bound on the shape noise as well was measured to
+// skip little more and cost as much as it saved.
+// The analytic structures (motherships, shelf lines) are not in it; the march evaluates them per ray as before.
+const WGSL_OCCUPANCY = /* wgsl */`
+@group(1) @binding(0) var<storage, read_write> occOut: array<u32>;
+
+@compute @workgroup_size(8, 8)
+fn occupancy(@builtin(global_invocation_id) gid: vec3u) {
+    let n = ${OCC_RES}u;
+    if (gid.x >= n || gid.y >= n) { return; }
+    let idx = gid.y * n + gid.x;
+    let wn = i32(F.wdomain.w);
+    let per = wn / i32(n);
+    let t0 = vec2i(gid.xy) * per - 1;
+    let t1 = t0 + per + 1;
+    // near the map edges the samplers blend towards defaults: no bound there
+    let fade = i32(ceil(f32(wn) / 12.0)) + 1;
+    if (any(t0 < vec2i(fade)) || any(t1 >= vec2i(wn - fade))) { occOut[idx] = 0xffffffffu; return; }
+    var w = vec2f(0.0);     // coverage, top
+    var an = vec4f(0.0);    // anvil coverage, anvil top, shelf coverage, -
+    var lc = vec4f(0.0);    // genus coverage
+    var wall = 0.0;         // wall cloud lowering (m)
+    for (var y = t0.y; y <= t1.y; y++) {
+        for (var x = t0.x; x <= t1.x; x++) {
+            let c = vec2i(x, y);
+            w = max(w, textureLoad(weatherTex, c, 0).xy);
+            an = max(an, textureLoad(anvilTex, c, 0));
+            lc = max(lc, textureLoad(layerTex, c, 0));
+            wall = max(wall, textureLoad(styleTex, c, 0).z);
+        }
+    }
+    let base0 = F.cloud.x;
+    let convTop = max(w.y, base0 + 400.0);
+    let Y0 = F.layerInfo.z;
+    let dy = (F.features.z - Y0) / 32.0;
+    var bits = 0u;
+    for (var k = 0u; k < 32u; k++) {
+        let y0 = Y0 + dy * f32(k) - 1.0;
+        let y1 = y0 + dy + 2.0;
+        var on = false;
+        for (var i = 0; i < ${MAX_LAYERS}; i++) {
+            let A = F.layers[i * 3];
+            if (lc[i] >= 0.01 && y1 > A.x && y0 < A.y) { on = true; }
+        }
+        if (an.z > 0.01 && y1 > base0 - 1100.0 && y0 < base0 + 1350.0) { on = true; }
+        if (w.x >= 0.01 && y1 > base0 - wall && y0 < convTop) { on = true; }               // convective layer, towers
+        if (an.x > 0.01 && y1 > base0 + 2500.0 && y0 < an.y) { on = true; }               // anvils
+        if (on) { bits |= 1u << k; }
+    }
+    occOut[idx] = bits;
 }
 `;
 
@@ -1214,11 +1413,11 @@ fn weather(@builtin(global_invocation_id) gid: vec3u) {
         let rp = length(d - c.c.yz) / c.a.z * (0.75 + 0.5 * outline);
         if (c.b.y <= 0.0 || rp > c.c.x * 1.5) { continue; }           // no precipitation core here
         let streaks = fbm2(xz / 900.0 + c.b.z * 17.0, 3);
-        let pc = sat(1.0 - rp / max(c.c.x, 0.05) + (streaks - 0.5) * 0.5);
+        let pc = sat((1.0 - rp / max(c.c.x, 0.05)) * 1.8 + (streaks - 0.5) * 0.4);   // flat-topped: the whole middle pours
         let pv = c.b.y * pc * pc * (3.0 - 2.0 * pc);
         vw += c.b.w * pv;
         vs += pv;
-        pr = 1.0 - (1.0 - pr) * (1.0 - pv);
+        pr += pv * (1.0 - sat(pr));                                   // adds up to the strongest core, past 1 in severe storms
     }
     textureStore(weatherOut, gid.xy, vec4f(cov, top, pr, vw / vs));
     textureStore(anvilOut, gid.xy, vec4f(anvCov, anvTop, shelfCov, shelfW));
@@ -1227,7 +1426,9 @@ fn weather(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
-// cloud shadow map: sun transmittance from the cloud base plane up through the slab, and sky occlusion of the column
+// cloud shadow map: sun transmittance from the cloud base plane up through the slab, sky occlusion of the column, the
+// transmittance of the low cloud (lowest 1.5 km above the base), which decides where precipitation can fall, and the
+// optical depth of the sun ray's part below sunSplit(), for sunDepthAbove()
 const WGSL_SHADOW = /* wgsl */`
 @group(1) @binding(0) var shadowOut: texture_storage_2d<rgba16float, write>;
 
@@ -1239,15 +1440,18 @@ fn shadow(@builtin(global_invocation_id) gid: vec3u) {
     let tex = vec2u(gid.x, gid.y * S + u32(F.lod.z));
     if (tex.x >= dim.x || tex.y >= dim.y) { return; }
     let xz = F.wdomain.xy + (vec2f(tex) + 0.5) / vec2f(dim) * F.wdomain.z;
-    let s = normalize(vec3f(F.sunDir.x, max(F.sunDir.y, 0.08), F.sunDir.z));
+    let s = shadowSunDir();
     let base = F.layerInfo.z;
     let top = F.noise.w;
     let N = 24;
     let ds = (top - base) / s.y / f32(N);
     var od = 0.0;
+    var odLow = 0.0;                                                  // the part below sunSplit()
     for (var i = 0; i < N; i++) {
         let p = vec3f(xz.x, base, xz.y) + s * (f32(i) + 0.5) * ds;
-        od += cloudDensity(p, weatherAt(p.xz)) * ds;
+        let d = cloudDensity(p, weatherAt(p.xz)) * ds;
+        od += d;
+        if (p.y < sunSplit()) { odLow += d; }
         if (od > 12.0) { break; }
     }
     let w = weatherAt(xz);
@@ -1257,7 +1461,13 @@ fn shadow(@builtin(global_invocation_id) gid: vec3u) {
     for (var i = 0; i < M; i++) {
         ov += cloudDensity(vec3f(xz.x, base + (f32(i) + 0.5) * dv, xz.y), w) * dv;
     }
-    textureStore(shadowOut, tex, vec4f(exp(-od), 0.12 + 0.88 * exp(-ov * 0.03), 0.0, 1.0));
+    // low cloud only, up to 1.5 km above the base: where precipitation leaves the cloud (not anvils or high layers)
+    var ol = 0.0;
+    let dl = (F.cloud.x + 1500.0 - base) / 6.0;
+    for (var i = 0; i < 6; i++) {
+        ol += cloudDensity(vec3f(xz.x, base + (f32(i) + 0.5) * dl, xz.y), w) * dl;
+    }
+    textureStore(shadowOut, tex, vec4f(exp(-od), exp(-ov * 0.03), exp(-ol * 0.03), odLow));
 }
 `;
 
@@ -1272,8 +1482,8 @@ fn groundUpdate(@builtin(global_invocation_id) gid: vec3u) {
     let uv = (vec2f(gid.xy) + 0.5) / f32(n);
     let xz = F.tdomain.xy + uv * F.tdomain.z;
     let h = textureSampleLevel(heightTex, clampSamp, uv, 0.0).x;
-    let w = weatherAt(xz);
-    let reach = sat(1.0 - w.w * 1.25);                                // virga never lands
+    let w = precipSourceAt(vec3f(xz.x, h, xz.y));                     // where the slanted shafts land
+    let reach = sat(1.0 - virgaOf(w) * 1.25);                         // virga never lands
     let pr = w.z * reach;
     let temp = F.misc.x - 0.0065 * h;
     let dt = F.misc.w;
@@ -1287,10 +1497,129 @@ fn groundUpdate(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 // ------------------------------------------------------------------------------------- WGSL volumetrics
+// Froxel lighting volume: one cell per (screen x, screen y, exponential depth slice), at the cell centre:
+// x sun transmittance (cloud shadow map times the shadow cast by the rain and snow shafts), y sky light left under the
+// cloud column, z lightning. The march reads it with one trilinear fetch per step below the cloud base. Light changes
+// slowly in space, so the coarse grid holds it; the densities stay per step, and the streaks keep their detail.
+const WGSL_FROXEL = /* wgsl */`
+@group(1) @binding(0) var froxelOut: texture_storage_3d<rgba16float, write>;
+
+@compute @workgroup_size(4, 4, 4)
+fn inject(@builtin(global_invocation_id) gid: vec3u) {
+    let n = textureDimensions(froxelOut);
+    if (any(gid >= n)) { return; }
+    let c = (vec3f(gid) + 0.5) / vec3f(n);
+    let z = F.froxel.x * pow(F.froxel.y / F.froxel.x, c.z);          // view depth of the cell centre
+    let p = F.cam.xyz + (F.fwd.xyz + F.right.xyz * (c.x * 2.0 - 1.0) + F.up.xyz * (c.y * 2.0 - 1.0)) * z;
+    var sh = shadowAt(p);
+    // the shafts shade what lies behind them: march their envelope toward the sun, up to where they start in the cloud
+    let s = F.sunDir.xyz;
+    let top = F.cloud.x + 700.0;
+    if (p.y < top && s.y > 0.0 && sh.x > 0.01) {
+        let ds = min((top - p.y) / max(s.y, 0.05), 12000.0) / 6.0;
+        var od = 0.0;
+        for (var j = 0; j < 6; j++) {
+            let q = p + s * ds * (f32(j) + 0.5);
+            let e = precipEnvelope(q, precipSourceAt(q));
+            od += (e.x + e.y) * ds;
+        }
+        sh.x *= exp(-od * 0.5);                                       // 0.5: the curtains fill about half the shaft
+    }
+    textureStore(froxelOut, gid, vec4f(sh, min(flashLit(p), 60000.0), 0.0));
+}
+`;
+
+// needs F, occ
+const WGSL_SKIP_SAMPLE = /* wgsl */`
+// false where the occupancy grid proves there is no noise cloud at p
+fn cloudPossible(p: vec3f) -> bool {
+    let c = vec2i(floor((p.xz - F.wdomain.xy) / F.wdomain.z * f32(${OCC_RES})));
+    if (any(c < vec2i(0)) || any(c >= vec2i(${OCC_RES}))) { return true; }
+    let k = clamp(i32((p.y - F.layerInfo.z) / (F.features.z - F.layerInfo.z) * 32.0), 0, 31);
+    return ((occ[c.y * ${OCC_RES} + c.x] >> u32(k)) & 1u) != 0u;
+}
+
+// distance bin of the tile pre-pass: 64 bins, square-root spaced out to the march distance (fine near, coarse far)
+fn tileBin(t: f32) -> u32 { return min(u32(sqrt(max(t, 0.0) / F.march.z) * 64.0), 63u); }
+
+// the march's clipping of a ray to the cloud slab, [t0, t1]; t1 < t0 when the ray misses it
+fn slabSpan(ro: vec3f, dir: vec3f, tMax: f32) -> vec2f {
+    var t0 = 0.0;
+    var t1 = tMax;
+    if (abs(dir.y) > 1e-5) {
+        let ta = (F.noise.w - ro.y) / dir.y;
+        let tb = (F.misc.z - 1500.0 - ro.y) / dir.y;
+        t0 = max(t0, min(ta, tb));
+        t1 = min(t1, max(ta, tb));
+    } else if (ro.y > F.noise.w) { t1 = -1.0; }
+    return vec2f(t0, t1);
+}
+`;
+
+// Cloud tile pre-pass: one ray through the centre of each CLOUD_TILE^2 block of volumetric pixels, one shape sample
+// (lod 1: no erosion, which only removes cloud; scud included) per distance bin, with the coverage padded. (Two samples
+// per bin cost twice as much and skipped no less: the padding and the march's widening by a bin carry the margin.) Bit b of the
+// 64-bit mask is set when cloud was found in bin b. The scene depth is ignored (a tile can straddle the horizon).
+const WGSL_TILES = /* wgsl */`
+@group(1) @binding(0) var tileOut: texture_storage_2d<rg32uint, write>;
+
+@compute @workgroup_size(8, 8)
+fn tiles(@builtin(global_invocation_id) gid: vec3u) {
+    let n = textureDimensions(tileOut);
+    if (any(gid.xy >= n)) { return; }
+    let size = F.screen.zw;
+    let uv = min((vec2f(gid.xy) + 0.5) * f32(${CLOUD_TILE}), size) / size;
+    let dir = rayDir(vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0));
+    let ro = F.cam.xyz;
+    let span = slabSpan(ro, dir, F.march.z);
+    covBoost = ${TILE_COVER_PAD};
+    var m = vec2u(0u);
+    if (span.y > span.x) {
+        for (var b = tileBin(span.x); b <= tileBin(span.y); b++) {
+            let f = (f32(b) + 0.5) / 64.0;
+            let t = clamp(f * f * F.march.z, span.x, span.y);
+            let p = ro + dir * t;
+            if (p.y <= F.layerInfo.z || p.y >= F.features.z) { continue; }
+            if (cloudSampleN(p, weatherAt(p.xz), 1, 0xffffffffu, cloudPossible(p)).x > 0.0) {
+                if (b < 32u) { m.x |= 1u << b; } else { m.y |= 1u << (b - 32u); }
+            }
+        }
+    }
+    textureStore(tileOut, gid.xy, vec4u(m, 0u, 0u));
+}
+`;
+
 const WGSL_MARCH = /* wgsl */`
 @group(1) @binding(0) var depthTex: texture_depth_2d;
 @group(1) @binding(1) var outColor: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var outDepth: texture_storage_2d<r32float, write>;
+@group(1) @binding(3) var froxelTex: texture_3d<f32>;
+@group(1) @binding(4) var tileTex: texture_2d<u32>;
+
+// distance bins where the tile pre-pass found cloud, over this pixel's tile and its 8 neighbours (pixel jitter, rays
+// between tile centres), widened by one bin each way
+fn tileMask(px: vec2u) -> vec2u {
+    let n = vec2i(textureDimensions(tileTex));
+    let q = vec2i(px) / ${CLOUD_TILE};
+    var m = vec2u(0u);
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) { m |= textureLoad(tileTex, clamp(q + vec2i(x, y), vec2i(0), n - 1), 0).xy; }
+    }
+    let up = vec2u(m.x << 1u, (m.y << 1u) | (m.x >> 31u));
+    let down = vec2u((m.x >> 1u) | (m.y << 31u), m.y >> 1u);
+    return m | up | down;
+}
+
+// sun transmittance, sky light and lightning at p, from the froxel volume
+fn froxelAt(p: vec3f) -> vec3f {
+    let v = p - F.cam.xyz;
+    let z = max(dot(v, F.fwd.xyz), F.froxel.x);
+    let r = F.right.xyz;
+    let u = F.up.xyz;
+    let uvw = vec3f(dot(v, r) / (dot(r, r) * z) * 0.5 + 0.5, dot(v, u) / (dot(u, u) * z) * 0.5 + 0.5,
+                    log(z / F.froxel.x) / log(F.froxel.y / F.froxel.x));
+    return textureSampleLevel(froxelTex, clampSamp, uvw, 0.0).xyz;
+}
 
 fn hazeDensity(y: f32) -> f32 { return F.zenith.w * exp(-max(y - F.misc.z, 0.0) / F.horizon.w); }
 
@@ -1312,7 +1641,10 @@ fn hazeLight(mu: f32, sh: vec2f) -> vec3f {
 
 // radiance scattered towards the eye by cloud at p
 // lightSteps / stepScale: fewer, longer steps far from the camera (light LOD)
-fn cloudLight(p: vec3f, mu: f32, w: vec4f, lightSteps: i32, stepScale: f32, ambScale: f32) -> vec3f {
+// dirY: the view ray's vertical direction, for the diffuse field's gradient (diffuseLook)
+// side: 1 near a cloud surface the view ray reached through open air, which the sky lights from the side; 0 deep in
+// cloud, where only the light that diffused down through the cloud above is left (marchSide)
+fn cloudLight(p: vec3f, mu: f32, dirY: f32, w: vec4f, lightSteps: i32, stepScale: f32, ambScale: f32, side: f32) -> vec3f {
     let s = F.sunDir.xyz;
     var od = 0.0;
     var ls = 90.0 * stepScale;
@@ -1323,19 +1655,26 @@ fn cloudLight(p: vec3f, mu: f32, w: vec4f, lightSteps: i32, stepScale: f32, ambS
         t += ls;
         ls *= 1.9;
     }
+    // the rest of the way to the sun, from the shadow map: a low sun crosses tens of km of cloud deck
+    od += sunDepthAbove(p + s * t);
     // multiple scattering octaves (Wrenninge): each octave less extinction, less anisotropy
     var sun = 0.0; var a = 1.0; var b = 1.0; var c = 1.0;
     for (var k = 0; k < 3; k++) {
         sun += a * exp(-od * b) * mix(hg(mu, 0.8 * c), hg(mu, -0.25 * c), 0.3);
         a *= 0.55; b *= 0.35; c *= 0.6;
     }
+    // sky light through the cloud above: deep in a storm only a few percent arrives; brighter looking up
     let base = F.cloud.x;
     let top = max(w.y, base + 400.0);
     let h = sat((p.y - base) / (top - base));
+    let ca = cloudAbove(p, top);
+    let deep = (0.05 + 0.95 * ca.x) * diffuseLook(ca.x, dirY);
     let tall = sat((top - base - 2500.0) / 6000.0);
-    let amb = F.ambient.rgb * (0.3 + 0.7 * pow(h, 0.6)) * mix(1.0, 0.3, tall * (1.0 - h)) * ambScale;
-    let bounce = F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.03 * (1.0 - h);
-    return F.sunCol.rgb * sun + amb + bounce + flashLight(p) * 0.05;
+    let surface = (0.3 + 0.7 * pow(h, 0.6)) * mix(1.0, 0.3, tall * (1.0 - h));   // open sky to the side, less under tall towers
+    let amb = F.ambient.rgb * mix(deep, surface, side) * ambScale;
+    // light the ground bounces up into the base, where the sun reaches the ground below
+    let bounce = F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.03 * (1.0 - h) * mix(ca.y, 1.0, side);
+    return F.sunCol.rgb * sun + amb + bounce + FLASH_COLOR * flashLit(p) * 0.05;
 }
 
 fn rayBox(ro: vec3f, rd: vec3f, lo: vec3f, hi: vec3f, t0: f32, t1: f32) -> bool {
@@ -1369,9 +1708,10 @@ fn featureMask(ro: vec3f, rd: vec3f, t0: f32, t1: f32) -> u32 {
 fn march(@builtin(global_invocation_id) gid: vec3u) {
     let size = vec2u(F.screen.zw);
     let frame = F.right.w;
-    // checkerboard: this frame marches the pixels with (x + y + frame) even; the resolve fills the others
+    // interleaved: this frame marches the pixels marchedNow() picks; the resolve fills the others
     var px = gid.xy;
-    if (F.lod.x > 0.5) { px.x = gid.x * 2u + ((gid.y + u32(frame)) & 1u); }
+    if (F.lod.x > 3.5) { px = gid.xy * 2u + marchCorner(); }
+    else if (F.lod.x > 1.5) { px.x = gid.x * 2u + ((gid.y + u32(frame)) & 1u); }
     if (px.x >= size.x || px.y >= size.y) { return; }
     let jit = fract(vec2f(frame * 0.7548776662, frame * 0.5698402910));
     let uv = (vec2f(px) + jit) / vec2f(size);
@@ -1385,17 +1725,13 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
     let doClouds = mode != 3;
     let doPrecip = mode != 2;
     let doHaze = mode == 0;
+    let froxels = F.froxel.z > 0.5;
     let mu = dot(dir, F.sunDir.xyz);
     let base = F.cloud.x;
 
-    var t0 = 0.0;
-    var t1 = min(sceneT, F.march.z);
-    if (abs(dir.y) > 1e-5) {
-        let ta = (F.noise.w - ro.y) / dir.y;
-        let tb = (F.misc.z - 1500.0 - ro.y) / dir.y;
-        t0 = max(t0, min(ta, tb));
-        t1 = min(t1, max(ta, tb));
-    } else if (ro.y > F.noise.w) { t1 = -1.0; }
+    let sp = slabSpan(ro, dir, min(sceneT, F.march.z));
+    let t0 = sp.x;
+    let t1 = sp.y;
 
     var col = vec3f(0.0);
     var T = 1.0;
@@ -1410,6 +1746,14 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
         let feat = featureMask(ro, dir, t0, t1);
         let detailDist = F.lod.w;
         var emptyRun = 0;           // consecutive cloud-free samples: in empty air clouds are evaluated every other step
+        // marchSide: how much open-air sky light reaches the medium at this step. The ray has to have come through
+        // open air (a camera inside cloud or rain sees none), and it fades with the cloud and precipitation optical
+        // depth crossed since: sky light from the side reaches only a few optical depths into the medium
+        var airSeen = false;
+        var odIn = 0.0;
+        let tiles = F.post.y > 0.5;
+        var tm = vec2u(0xffffffffu);
+        if (tiles && doClouds) { tm = tileMask(px); }
         let rainPhase = mix(hg(mu, 0.75), hg(mu, 0.0), 0.45);
         let snowPhase = mix(hg(mu, 0.45), hg(mu, 0.0), 0.6);
         for (var i = 0; i < N; i++) {
@@ -1421,38 +1765,65 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
             let p = ro + dir * t;
             var sigma = 0.0;
             var S = vec3f(0.0);
-            let cloudy = doClouds && p.y > F.layerInfo.z && p.y < F.features.z;
+            let side = select(0.0, exp(-odIn * 0.35), airSeen);
+            var medium = 0.0;       // cloud and precipitation extinction at this step (not haze)
+            var cloudy = doClouds && p.y > F.layerInfo.z && p.y < F.features.z;
+            // distance bins without cloud in the tile pre-pass
+            if (cloudy && tiles) {
+                let b = tileBin(t);
+                if (((select(tm.x, tm.y, b >= 32u) >> (b & 31u)) & 1u) == 0u) { cloudy = false; emptyRun++; }
+            }
+            // empty-space skipping: where the occupancy grid rules out noise cloud, only the analytic structures
+            // this ray passes near are left to evaluate
+            var noise = true;
+            if (cloudy && !cloudPossible(p)) {
+                noise = false;
+                if (feat == 0u) { cloudy = false; emptyRun++; }
+            }
             if (cloudy && emptyRun >= 2 && (emptyRun & 1) == 0) { emptyRun++; }
             else if (cloudy) {
                 let w = weatherAt(p.xz);
                 // LOD by distance: detail erosion near, fine structure mid, shape only far
                 let lod = select(select(2, 1, t < detailDist * 2.5), 0, t < detailDist);
-                let cs = cloudSample(p, w, lod, feat);
+                let cs = cloudSampleN(p, w, lod, feat, noise);
                 let dc = cs.x;
                 if (dc > 0.0) {
                     let nl = i32(F.march.y);
                     let ls = select(select(nl, max(nl - 1, 2), t > detailDist), 2, t > detailDist * 2.5);
                     let tint = mix(vec3f(1.0), vec3f(0.62, 1.0, 0.72), cs.z);   // green storm light
-                    S += dc * cloudLight(p, mu, w, ls, clamp(t / detailDist, 1.0, 3.0), cs.y) * tint;
+                    S += dc * cloudLight(p, mu, dir.y, w, ls, clamp(t / detailDist, 1.0, 3.0), cs.y, side) * tint;
                     sigma += dc;
+                    medium += dc;
                     emptyRun = 0;
                 } else { emptyRun++; }
             }
             if (p.y < base + 700.0) {
-                let sh = shadowAt(p);
+                // light from the froxel volume, or evaluated here (z < 0: lightning not looked up yet)
+                var fx = vec3f(0.0, 0.0, -1.0);
+                if (froxels) { fx = froxelAt(p); } else { fx = vec3f(shadowAt(p), -1.0); }
+                let sh = fx.xy;
                 if (doPrecip) {
-                    let pd = precipDensity(p, precipWeatherAt(p));
+                    let pd = precipDensity(p, precipSourceAt(p));
                     if (pd.x + pd.y > 0.0) {
-                        let amb = F.ambient.rgb * (0.25 + 0.75 * sh.y) + F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.02;
+                        // the diffuse light under the cloud: what the column lets through (sh.y), brighter looking up,
+                        // and what the ground bounces up where the sun reaches it
+                        // (deep in the rain), or with sky from the side near a shaft's edge seen from outside (side)
+                        let deepAmb = sh.y * diffuseLook((sh.y - 0.12) / 0.88, dir.y);
+                        let amb = F.ambient.rgb * mix(deepAmb, 0.25 + 0.75 * sh.y, side) + F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.02 * sh.x;
                         S += pd.x * (F.sunCol.rgb * sh.x * rainPhase + amb * 0.85) * 0.9;
                         S += pd.y * (F.sunCol.rgb * sh.x * snowPhase * 0.6 + amb * 1.25) * 0.95;
-                        S += (pd.x + pd.y) * flashLight(p) * 0.02;
+                        var fl = fx.z;
+                        if (fl < 0.0) { fl = flashLit(p); }
+                        S += (pd.x + pd.y) * FLASH_COLOR * fl * 0.05;
                         sigma += pd.x + pd.y;
+                        medium += pd.x + pd.y;
                     }
                 }
                 if (doHaze) {
                     let hd = hazeDensity(p.y);
-                    S += hd * hazeLight(mu, sh);
+                    var fl = fx.z;
+                    if (fl < 0.0) { fl = flashLit(p); }
+                    S += hd * (hazeLight(mu, sh) + FLASH_COLOR * fl * 0.05);   // the air under a storm lights up too
                     sigma += hd;
                 }
             } else if (doHaze) {
@@ -1460,6 +1831,7 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                 S += hd * hazeLight(mu, vec2f(1.0));
                 sigma += hd;
             }
+            if (medium < 1e-5) { airSeen = true; odIn = 0.0; } else { odIn += medium * ds; }
             if (sigma > 1e-8) {
                 let tr = exp(-sigma * ds);
                 col += T * S / sigma * (1.0 - tr);
@@ -1467,7 +1839,8 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                 depthAcc += t * dT;
                 wsum += dT;
                 T *= tr;
-                if (T < 0.004) { break; }
+                // opaque: what is left would only let the sky through, and the sun disc is bright enough to show
+                if (T < 0.004) { T = 0.0; break; }
             }
         }
     }
@@ -1514,18 +1887,18 @@ fn resolve(@builtin(global_invocation_id) gid: vec3u) {
     let size = vec2i(textureDimensions(curTex));
     let q = vec2i(gid.xy);
     if (q.x >= size.x || q.y >= size.y) { return; }
-    let checker = F.lod.x > 0.5;
-    let fresh = !checker || ((q.x + q.y + i32(F.right.w)) & 1) == 0;   // marched this frame
-    // neighbourhood statistics over pixels marched this frame: the 3x3, or on a checkerboard the centre and diagonals
-    // (fresh pixel) / the four direct neighbours (stale pixel)
+    let il = i32(F.lod.x);
+    let fresh = marchedNow(q);                   // marched this frame
+    // neighbourhood statistics over pixels marched this frame: within 1 pixel (every pixel: the 3x3; checkerboard: the
+    // centre and diagonals, or the four direct neighbours), within 2 when one pixel in four is marched (4 to 9 of them)
     var m1 = vec4f(0.0);
     var m2 = vec4f(0.0);
     var n = 0.0;
     var dsum = 0.0;
-    for (var y = -1; y <= 1; y++) {
-        for (var x = -1; x <= 1; x++) {
-            let same = ((x + y) & 1) == 0;
-            if (checker && same != fresh) { continue; }
+    let r = select(1, 2, il >= 4);
+    for (var y = -r; y <= r; y++) {
+        for (var x = -r; x <= r; x++) {
+            if (!marchedNow(q + vec2i(x, y))) { continue; }
             let o = clamp(q + vec2i(x, y), vec2i(0), size - 1);
             let c = textureLoad(curTex, o, 0);
             m1 += c;
@@ -1549,7 +1922,7 @@ fn resolve(@builtin(global_invocation_id) gid: vec3u) {
         let puv = vec2f(pc.x / pc.w * 0.5 + 0.5, 0.5 - pc.y / pc.w * 0.5);
         if (all(puv > vec2f(0.0)) && all(puv < vec2f(1.0))) {
             let hist = clamp(textureSampleLevel(histTex, clampSamp, puv, 0.0), mn, mx);
-            o = mix(hist, cur, select(0.06, select(0.1, 0.18, checker), fresh));
+            o = mix(hist, cur, select(0.06, select(select(0.1, 0.18, il >= 2), 0.25, il >= 4), fresh));
         }
     }
     textureStore(histOut, q, o);
@@ -1690,7 +2063,7 @@ fn townColor(xz: vec2f, px: f32) -> vec3f {
     let sh = shadowAt(p);
     let s = F.sunDir.xyz;
     let v = normalize(F.cam.xyz - p);
-    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x + F.ambient.rgb * sh.y * (0.55 + 0.45 * n.y) + flashLight(p) * 0.03);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x + F.ambient.rgb * sh.y * (0.55 + 0.45 * n.y) + FLASH_COLOR * flashLit(p) * 0.03);
     // wet ground and open water reflect the sky
     let r = reflect(-v, vec3f(0.0, 1.0, 0.0));
     let fres = 0.02 + 0.98 * pow(1.0 - max(v.y, 0.0), 5.0);
@@ -1735,8 +2108,9 @@ fn radar(px: vec2f, col: vec3f) -> vec3f {
     if (any(q < vec2f(0.0)) || any(q > vec2f(1.0))) { return col; }
     let range = 120000.0;
     let xz = F.cam.xz + (q - 0.5) * range;
-    let w = weatherAt(xz);
-    let reach = sat(1.0 - w.w * 1.25);
+    var w = weatherAt(xz);
+    w.z *= rainCover(xz);
+    let reach = sat(1.0 - virgaOf(w) * 1.25);
     var c = mix(vec3f(0.02, 0.04, 0.05), vec3f(0.22, 0.25, 0.27), sat(w.x));
     let snow = F.precip.x < F.misc.z + 150.0;
     if (w.z * reach > 0.04) { c = radarColor(w.z * reach, snow); }
@@ -1754,9 +2128,33 @@ fn radar(px: vec2f, col: vec3f) -> vec3f {
     return mix(col, c, 0.88);
 }
 
+// volumetrics at i.uv, blurred on the lower quality settings: a 3x3 tent of bilinear taps, radius F.post.x volumetric
+// texels. Taps are weighted down where their transmittance differs from the centre, so the march noise inside a
+// cloud smooths out while cloud edges and the terrain's outline stay sharp. Applied here and not in the resolve, so
+// the history does not blur further every frame.
+fn cloudAt(uv: vec2f) -> vec4f {
+    let c = textureSampleLevel(cloudTex, clampSamp, uv, 0.0);
+    let r = F.post.x;
+    if (r <= 0.0) { return c; }
+    let texel = r / F.screen.zw;
+    var sum = c * 4.0;
+    var wsum = 4.0;
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) { continue; }
+            let s = textureSampleLevel(cloudTex, clampSamp, uv + vec2f(f32(x), f32(y)) * texel, 0.0);
+            let dt = (s.a - c.a) / 0.12;
+            let w = select(2.0, 1.0, x != 0 && y != 0) * exp(-dt * dt);
+            sum += s * w;
+            wsum += w;
+        }
+    }
+    return sum / wsum;
+}
+
 @fragment fn fsComposite(i: FsIn) -> @location(0) vec4f {
     let hdr = textureLoad(hdrTex, vec2i(i.pos.xy), 0).rgb;
-    let c = textureSampleLevel(cloudTex, clampSamp, i.uv, 0.0);
+    let c = cloudAt(i.uv);
     var col = hdr * c.a + c.rgb;
     if (i32(F.ground.w) == 1) { col = hdr; }
     var o = tonemap(col);
@@ -1820,7 +2218,7 @@ fn lineQuad(a: vec4f, b: vec4f, widthPx: f32, corner: u32, o: ptr<function, Line
         let b = F.viewProj * vec4f(wp - vel * 0.035, 1.0);
         if (b.w < 0.5) { return o; }
         lineQuad(a, b, 1.2, vi, &o);
-        o.col = vec4f(lightc * 1.2, (0.12 + 0.12 * seed.z) * fade * sat(total * 2.0));
+        o.col = vec4f(lightc * 1.2, (0.12 + 0.12 * seed.z) * fade * sat(total * 2.0) * (1.0 + 0.8 * sat(total - 1.0)));   // denser in a downpour
     }
     o.uv.x = select(0.0, 1.0, isSnow);    // shape flag for the fragment: streak or flake
     return o;
@@ -2013,7 +2411,7 @@ class StormCell extends Entity {
         const s = this.state;
         s.coverage = grow * (1 - smoothstep(0.35, 1, decay));
         s.top = Math.max(base + 600, lerp(base + 500, d.top || 9000, grow));
-        s.precip = Math.min(1, (d.precip ?? 0.7) * wx.power) * smoothstep(0.55, 1, clamp(this.age / g, 0, 1)) * (1 - smoothstep(0.45, 1, decay));
+        s.precip = Math.min(2, (d.precip ?? 0.7) * wx.power) * smoothstep(0.55, 1, clamp(this.age / g, 0, 1)) * (1 - smoothstep(0.45, 1, decay));
         s.virga = lerp(d.virga ?? 0.1, 0.92, smoothstep(0.2, 0.85, decay));
         s.radius = (d.radius || 4000) * (0.55 + 0.45 * grow) * (1 + 0.3 * decay);
         s.decay = decay;
@@ -2507,7 +2905,7 @@ class WeatherPass {
         const d = r.device, U = GPUTextureUsage, C = GPUShaderStage.COMPUTE;
         this.device = d;
         this.weather = d.createTexture({ size: [WEATHER_RES, WEATHER_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING | U.COPY_SRC });
-        this.shadow = d.createTexture({ size: [SHADOW_RES, SHADOW_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.shadow = d.createTexture({ size: [SHADOW_RES, SHADOW_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING | U.COPY_SRC });
         this.anvil = d.createTexture({ size: [WEATHER_RES, WEATHER_RES], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
         this.weatherView = this.weather.createView();
         this.anvilView = this.anvil.createView();
@@ -2529,8 +2927,16 @@ class WeatherPass {
         this.sGroup = sSet.group({ F: r.frameBuf, shapeTex: r.noise.shapeView, detailTex: r.noise.detailView, weatherTex: this.weatherView, anvilTex: this.anvilView, layerTex: this.layerView, styleTex: this.styleView, repSamp: r.repSamp, clampSamp: r.clampSamp }, 'shadow-in');
         this.sOutGroup = makeGroup(d, sOut, [this.shadowView], 'shadow-out');
 
-        this.probes = [0, 1, 2].map(() => ({ buf: d.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }), busy: false }));
-        this.probe = { coverage: 0, top: 0, precip: 0, virga: 0 };
+        // occupancy grid for the march's empty-space skipping
+        this.occ = makeBuffer(d, OCC_RES * OCC_RES * 4, GPUBufferUsage.STORAGE);
+        const oSet = new BindingSet(d, ['F', 'weatherTex', 'anvilTex', 'layerTex', 'styleTex']);
+        const oOut = makeLayout(d, C, ['storage']);
+        this.pOcc = computePipeline(d, 'occupancy', [oSet.layout, oOut], shaderSource(oSet, WGSL_OCCUPANCY), 'occupancy');
+        this.oGroup = oSet.group({ F: r.frameBuf, weatherTex: this.weatherView, anvilTex: this.anvilView, layerTex: this.layerView, styleTex: this.styleView }, 'occupancy-in');
+        this.oOutGroup = makeGroup(d, oOut, [this.occ], 'occupancy-out');
+
+        this.probes = [0, 1, 2].map(() => ({ buf: d.createBuffer({ size: 512, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }), busy: false }));
+        this.probe = { coverage: 0, top: 0, precip: 0, virga: 0, cover: 0 };
     }
 
     encode(enc, probeTexel, prof, shadowSlices = 1) {
@@ -2539,6 +2945,10 @@ class WeatherPass {
         pass.setBindGroup(0, this.wGroup);
         pass.setBindGroup(1, this.wOutGroup);
         pass.dispatchWorkgroups(WEATHER_RES / 8, WEATHER_RES / 8);
+        pass.setPipeline(this.pOcc);
+        pass.setBindGroup(0, this.oGroup);
+        pass.setBindGroup(1, this.oOutGroup);
+        pass.dispatchWorkgroups(OCC_RES / 8, OCC_RES / 8);
         pass.setPipeline(this.pShadow);
         pass.setBindGroup(0, this.sGroup);
         pass.setBindGroup(1, this.sOutGroup);
@@ -2548,6 +2958,9 @@ class WeatherPass {
         const slot = this.probes.find(p => !p.busy);
         if (slot && probeTexel) {
             enc.copyTextureToBuffer({ texture: this.weather, origin: [probeTexel[0], probeTexel[1], 0] }, { buffer: slot.buf, bytesPerRow: 256 }, [1, 1, 1]);
+            // the same place in the shadow map (same domain, coarser): the cloud above, for rainCover
+            const st = probeTexel.map(t => Math.min(SHADOW_RES - 1, Math.floor((t + 0.5) * SHADOW_RES / WEATHER_RES)));
+            enc.copyTextureToBuffer({ texture: this.shadow, origin: [st[0], st[1], 0] }, { buffer: slot.buf, offset: 256, bytesPerRow: 256 }, [1, 1, 1]);
             this.pending = slot;
         }
     }
@@ -2557,8 +2970,10 @@ class WeatherPass {
         if (!slot) return;
         slot.busy = true;
         slot.buf.mapAsync(GPUMapMode.READ).then(() => {
-            const h = new Uint16Array(slot.buf.getMappedRange(0, 8));
-            this.probe = { coverage: fromHalf(h[0]), top: fromHalf(h[1]), precip: fromHalf(h[2]), virga: fromHalf(h[3]) };
+            const h = new Uint16Array(slot.buf.getMappedRange(0, 264));
+            // cover: as rainCover in WGSL, from the shadow map's low cloud term
+            const cover = smoothstep(0.03, 0.3, 1 - fromHalf(h[130]));
+            this.probe = { coverage: fromHalf(h[0]), top: fromHalf(h[1]), precip: fromHalf(h[2]) * cover, virga: fromHalf(h[3]), cover };
             slot.buf.unmap();
             slot.busy = false;
         }).catch(() => { slot.busy = false; });
@@ -2578,10 +2993,10 @@ class GroundPass {
             init[(j * this.n + i) * 2] = smoothstep(2, -3, temp);
         }
         this.buffer = makeBuffer(d, init.byteLength, GPUBufferUsage.STORAGE, init);
-        const set = new BindingSet(d, ['F', 'weatherTex', 'heightTex', 'clampSamp']);
+        const set = new BindingSet(d, ['F', 'weatherTex', 'shadowTex', 'heightTex', 'clampSamp']);
         const out = makeLayout(d, GPUShaderStage.COMPUTE, ['storage']);
-        this.pipeline = computePipeline(d, 'ground', [set.layout, out], shaderSource(set, WGSL_WEATHER_SAMPLE, WGSL_GROUND), 'groundUpdate');
-        this.group = set.group({ F: r.frameBuf, weatherTex: r.weatherPass.weatherView, heightTex: r.heightView, clampSamp: r.clampSamp }, 'ground-in');
+        this.pipeline = computePipeline(d, 'ground', [set.layout, out], shaderSource(set, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_GROUND), 'groundUpdate');
+        this.group = set.group({ F: r.frameBuf, weatherTex: r.weatherPass.weatherView, shadowTex: r.weatherPass.shadowView, heightTex: r.heightView, clampSamp: r.clampSamp }, 'ground-in');
         this.outGroup = makeGroup(d, out, [this.buffer], 'ground-out');
     }
 
@@ -2597,16 +3012,42 @@ class GroundPass {
     destroy() { this.buffer.destroy(); }
 }
 
+// froxel lighting volume for the precipitation and haze, filled each frame before the march
+class FroxelPass {
+    constructor(r) {
+        const d = r.device, U = GPUTextureUsage;
+        this.r = r;
+        this.tex = d.createTexture({ size: FROXEL, dimension: '3d', format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.view = this.tex.createView({ dimension: '3d' });
+        const out = makeLayout(d, GPUShaderStage.COMPUTE, ['write3d:rgba16float']);
+        this.pipeline = computePipeline(d, 'froxel', [r.worldSet.layout, out],
+            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_FROXEL), 'inject');
+        this.group = makeGroup(d, out, [this.view], 'froxel-out');
+    }
+
+    encode(enc, prof) {
+        const a = enc.beginComputePass({ label: 'froxel', timestampWrites: prof.writes('froxel') });
+        a.setPipeline(this.pipeline);
+        a.setBindGroup(0, this.r.worldGroup);
+        a.setBindGroup(1, this.group);
+        a.dispatchWorkgroups(...FROXEL.map(n => Math.ceil(n / 4)));
+        a.end();
+    }
+}
+
 // volumetric march at reduced resolution + temporal resolve into a ping-pong history
 class CloudPass {
     constructor(r) {
         const d = r.device, C = GPUShaderStage.COMPUTE;
         this.r = r;
-        this.marchOut = makeLayout(d, C, ['depth', 'write:rgba16float', 'write:r32float']);
+        this.marchOut = makeLayout(d, C, ['depth', 'write:rgba16float', 'write:r32float', 'tex3d', 'tex:uint']);
         this.resolveIO = makeLayout(d, C, ['tex', 'tex:unfilterable-float', 'tex', 'write:rgba16float']);
         const rSet = new BindingSet(d, ['F', 'clampSamp']);
         this.pMarch = computePipeline(d, 'march', [r.worldSet.layout, this.marchOut],
-            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_MARCH), 'march');
+            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_SKIP_SAMPLE, WGSL_MARCH), 'march');
+        this.tileOut = makeLayout(d, C, ['write:rg32uint']);
+        this.pTiles = computePipeline(d, 'tiles', [r.worldSet.layout, this.tileOut],
+            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SKIP_SAMPLE, WGSL_TILES), 'tiles');
         this.pResolve = computePipeline(d, 'resolve', [rSet.layout, this.resolveIO], shaderSource(rSet, WGSL_SKY, WGSL_RESOLVE), 'resolve');
         this.rGroup = rSet.group({ F: r.frameBuf, clampSamp: r.clampSamp }, 'resolve-in');
         this.cur = 0;
@@ -2614,26 +3055,40 @@ class CloudPass {
 
     resize(w, h, depthView) {
         const d = this.r.device, U = GPUTextureUsage;
-        for (const t of [this.color, this.depth, ...(this.hist || [])]) t?.destroy();
+        for (const t of [this.color, this.depth, this.tiles, ...(this.hist || [])]) t?.destroy();
         this.w = w;
         this.h = h;
         this.color = d.createTexture({ size: [w, h], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
         this.depth = d.createTexture({ size: [w, h], format: 'r32float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
         this.hist = [0, 1].map(() => d.createTexture({ size: [w, h], format: 'rgba16float', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING }));
         const hv = this.hist.map(t => t.createView());
-        this.marchGroup = makeGroup(d, this.marchOut, [depthView, this.color.createView(), this.depth.createView()], 'march-out');
+        this.tw = Math.ceil(w / CLOUD_TILE);
+        this.th = Math.ceil(h / CLOUD_TILE);
+        this.tiles = d.createTexture({ size: [this.tw, this.th], format: 'rg32uint', usage: U.TEXTURE_BINDING | U.STORAGE_BINDING });
+        this.tileGroup = makeGroup(d, this.tileOut, [this.tiles.createView()], 'tiles-out');
+        this.marchGroup = makeGroup(d, this.marchOut, [depthView, this.color.createView(), this.depth.createView(), this.r.froxelPass.view, this.tiles.createView()], 'march-out');
         // resolveGroups[k] reads history k and writes history 1 - k
         this.resolveGroups = [0, 1].map(k => makeGroup(d, this.resolveIO, [this.color.createView(), this.depth.createView(), hv[k], hv[1 - k]], `resolve-${k}`));
         this.histViews = hv;
     }
 
-    // checker: march every other pixel (alternating each frame); the resolve fills the rest from history
-    encode(enc, prof, checker) {
+    // interleave: march 1 of every 1, 2 or 4 pixels (in turn, each frame); the resolve fills the rest from history
+    // tiles: run the cloud tile pre-pass, so the march evaluates clouds only in the distance bins it found
+    encode(enc, prof, interleave, tiles) {
+        if (tiles) {
+            const t = enc.beginComputePass({ label: 'tiles', timestampWrites: prof.writes('tiles') });
+            t.setPipeline(this.pTiles);
+            t.setBindGroup(0, this.r.worldGroup);
+            t.setBindGroup(1, this.tileGroup);
+            t.dispatchWorkgroups(Math.ceil(this.tw / 8), Math.ceil(this.th / 8));
+            t.end();
+        }
         const a = enc.beginComputePass({ label: 'march', timestampWrites: prof.writes('march') });
         a.setPipeline(this.pMarch);
         a.setBindGroup(0, this.r.worldGroup);
         a.setBindGroup(1, this.marchGroup);
-        a.dispatchWorkgroups(Math.ceil((checker ? Math.ceil(this.w / 2) : this.w) / 8), Math.ceil(this.h / 8));
+        const mw = interleave >= 2 ? Math.ceil(this.w / 2) : this.w, mh = interleave >= 4 ? Math.ceil(this.h / 2) : this.h;
+        a.dispatchWorkgroups(Math.ceil(mw / 8), Math.ceil(mh / 8));
         a.end();
         const b = enc.beginComputePass({ label: 'resolve', timestampWrites: prof.writes('resolve') });
         b.setPipeline(this.pResolve);
@@ -2651,6 +3106,7 @@ class GpuProfiler {
     constructor(device, names) {
         this.names = names;
         this.ms = Object.fromEntries(names.map(n => [n, 0]));
+        this.ran = new Set();       // passes encoded this frame: a skipped pass reads 0, not its last timestamps
         this.enabled = device.features.has('timestamp-query');
         if (!this.enabled) return;
         const n = names.length * 2, B = GPUBufferUsage;
@@ -2662,6 +3118,7 @@ class GpuProfiler {
     // timestampWrites for a pass descriptor
     writes(name) {
         if (!this.enabled) return undefined;
+        this.ran.add(name);
         const i = this.names.indexOf(name);
         return { querySet: this.set, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 };
     }
@@ -2674,14 +3131,15 @@ class GpuProfiler {
     }
 
     afterSubmit() {
-        const slot = this.slot;
+        const slot = this.slot, ran = this.ran;
         this.slot = null;
+        this.ran = new Set();
         if (!slot) return;
         slot.busy = true;
         slot.buf.mapAsync(GPUMapMode.READ).then(() => {
             const t = new BigInt64Array(slot.buf.getMappedRange());
             this.names.forEach((n, i) => {
-                const v = Number(t[i * 2 + 1] - t[i * 2]) / 1e6;
+                const v = ran.has(n) ? Number(t[i * 2 + 1] - t[i * 2]) / 1e6 : 0;
                 if (v >= 0 && v < 500) this.ms[n] = this.ms[n] * 0.9 + v * 0.1;
             });
             slot.buf.unmap();
@@ -2701,7 +3159,7 @@ class Renderer {
         const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
         if (!adapter) throw new Error('No WebGPU adapter available');
         this.device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('timestamp-query') ? ['timestamp-query'] : [] });
-        this.profiler = new GpuProfiler(this.device, ['weather', 'ground', 'scene', 'march', 'resolve', 'final']);
+        this.profiler = new GpuProfiler(this.device, ['weather', 'ground', 'scene', 'froxel', 'tiles', 'march', 'resolve', 'final']);
         this.device.lost.then(info => { if (info.reason !== 'destroyed') this.onError?.(new Error(`GPU device lost: ${info.message}`)); });
         this.device.addEventListener('uncapturederror', e => { console.error(e.error.message); this.lastError = e.error.message; });
         this.canvas = canvas;
@@ -2719,6 +3177,7 @@ class Renderer {
         this.noise = new NoiseVolumes(d);
         this.weatherPass = new WeatherPass(this);
         this.worldSet = new BindingSet(d, WORLD_BINDINGS.map(b => b[0]));
+        this.froxelPass = new FroxelPass(this);
         this.cloudPass = new CloudPass(this);
         this.createPipelines();
         const gi = gridIndices(GRID_N);
@@ -2731,8 +3190,8 @@ class Renderer {
     createPipelines() {
         const d = this.device;
         this.screenLayout = makeLayout(d, GPUShaderStage.FRAGMENT, ['tex', 'tex']);
-        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_SHADOW_SAMPLE, WGSL_SCENE) });
-        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_FINAL) });
+        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SCENE) });
+        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_FINAL) });
         const layoutA = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout] });
         const layoutB = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout, this.screenLayout] });
         const blendAlpha = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
@@ -2766,7 +3225,7 @@ class Renderer {
             F: this.frameBuf, shapeTex: this.noise.shapeView, detailTex: this.noise.detailView, weatherTex: this.weatherPass.weatherView,
             shadowTex: this.weatherPass.shadowView, heightTex: this.heightView, landTex: this.landMap.createView(), repSamp: this.repSamp,
             clampSamp: this.clampSamp, cells: this.cellBuf, ground: this.groundPass.buffer, bolts: this.boltBuf, anvilTex: this.weatherPass.anvilView,
-            layerTex: this.weatherPass.layerView, styleTex: this.weatherPass.styleView,
+            layerTex: this.weatherPass.layerView, styleTex: this.weatherPass.styleView, occ: this.weatherPass.occ,
         }, 'world');
     }
 
@@ -2789,7 +3248,8 @@ class Renderer {
         return true;
     }
 
-    render(enc, probeTexel, particles, bolts, checker, shadowSlices) {
+    // volumetrics false (render mode 'no volumetrics'): no froxel, march or resolve; the composite shows the scene only
+    render(enc, probeTexel, particles, bolts, interleave, shadowSlices, froxels, volumetrics = true, tiles = true) {
         const q = this.device.queue, prof = this.profiler;
         q.writeBuffer(this.frameBuf, 0, this.frame.data);
         q.writeBuffer(this.cellBuf, 0, this.cellData);
@@ -2809,7 +3269,8 @@ class Renderer {
         a.drawIndexed(this.terrainCount);
         a.end();
 
-        const hist = this.cloudPass.encode(enc, prof, checker);
+        if (froxels && volumetrics) this.froxelPass.encode(enc, prof);
+        const hist = volumetrics ? this.cloudPass.encode(enc, prof, interleave, tiles) : this.cloudPass.cur;
 
         const b = enc.beginRenderPass({
             label: 'final', timestampWrites: prof.writes('final'),
@@ -2933,7 +3394,7 @@ class Hud {
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
+            '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
             'drop a scenario .json on the page',
         ].join('\n');
     }
@@ -2958,7 +3419,7 @@ class Hud {
         const wind = Math.hypot(...c.wind), dirDeg = (Math.atan2(c.wind[0], -c.wind[1]) / DEG + 360) % 360;
         const from = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(((dirDeg + 180) % 360) / 45) % 8];
         const here = p.rain + p.snow < 0.01 ? (app.camera.pos[1] > c.base && app.probe.coverage > 0.5 ? '<span class="m">in cloud</span>' : '<span class="m">dry</span>')
-            : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">rain ${(p.rain * 100).toFixed(0)}%</span>`;
+            : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">${p.rain > 1 ? 'torrential rain' : 'rain'} ${(p.rain * 100).toFixed(0)}%</span>`;
         const q = QUALITY[app.quality], cw = app.renderer.cloudPass;
         const lines = [
             `<span class="t">ENTITY CLOUD // ${w.scenario.name || 'scenario'}</span>`,
@@ -2968,7 +3429,7 @@ class Hud {
             `clouds    ${w.clouds.active(c).map(([n, v]) => `${n} ${(v * 100).toFixed(0)}%`).join(' · ') || 'none'}`,
             `storms    ${storms.length} cells · ${raining} raining · ${w.flashCount} flashes`,
             `here      ${here} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
-            `render    ${RENDER_MODES[app.mode]} · ${q.name} ${cw.w}×${cw.h}${q.checker ? ' checker' : ''} ${q.steps} steps · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
+            `render    ${RENDER_MODES[app.mode]} · ${q.name} ${cw.w}×${cw.h}${q.interleave > 1 ? ` 1/${q.interleave} px` : ''}${q.blur ? ' blur' : ''}${app.tiles ? ' tiles' : ''} ${q.steps} steps · froxels ${app.froxels ? FROXEL.join('×') : 'off'} · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
             app.renderer.profiler.enabled
                 ? `gpu       ${app.renderer.profiler.total.toFixed(1)} ms · ${Object.entries(app.renderer.profiler.ms).map(([n, v]) => `${n} ${v.toFixed(1)}`).join(' · ')}`
                 : `gpu       <span class="m">no timestamp queries on this adapter</span>`,
@@ -3022,11 +3483,13 @@ class App {
         this.fps = 60;
         this.mode = 0;
         this.radar = true;
+        this.froxels = true;
+        this.tiles = true;
         this.viewProj = new Float32Array(16);
         this.prevViewProj = null;
         this.frameNo = 0;
         this.near = { rain: 0, snow: 0 };
-        this.probe = { coverage: 0, top: 0, precip: 0, virga: 0 };
+        this.probe = { coverage: 0, top: 0, precip: 0, virga: 0, cover: 0 };
         this.groundSnowHint = 'none';
         this.reset = true;
     }
@@ -3110,7 +3573,9 @@ class App {
                     break;
                 }
                 case 'KeyR': this.radar = !this.radar; break;
-                case 'KeyM': this.mode = (this.mode + 1) % RENDER_MODES.length; this.hud.toast(`Render: ${RENDER_MODES[this.mode]}`); break;
+                case 'KeyG': this.tiles = !this.tiles; this.hud.toast(`Cloud tile pre-pass: ${this.tiles ? 'on' : 'off'}`); break;
+                case 'KeyF': this.froxels = !this.froxels; this.hud.toast(`Froxel lighting: ${this.froxels ? 'on' : 'off'}`); break;
+                case 'KeyM': this.mode = (this.mode + 1) % RENDER_MODES.length; this.reset = true; this.hud.toast(`Render: ${RENDER_MODES[this.mode]}`); break;
                 case 'KeyQ': this.quality = (this.quality + 1) % QUALITY.length; this.reset = true; this.hud.toast(`Quality: ${QUALITY[this.quality].name}`); break;
                 case 'KeyV': if (this.views.length) { this.viewIndex = (this.viewIndex + 1) % this.views.length; this.jump(this.views[this.viewIndex]); } break;
                 case 'KeyL': this.hud.showLabels = !this.hud.showLabels; break;
@@ -3144,7 +3609,9 @@ class App {
     // what is falling on the camera, from the weather probe (sampled where precipitation over us left the cloud base)
     nearPrecip() {
         const c = this.world.weather.cur, y = this.camera.pos[1], pr = this.probe;
-        const g = this.world.field.base, bottom = lerp(g - 300, c.base, pr.virga);
+        // virga, overwhelmed by a downpour as virgaOf() in WGSL
+        const virga = pr.virga * (1 - sat01((pr.precip - 0.6) / 0.8));
+        const g = this.world.field.base, bottom = lerp(g - 300, c.base, virga);
         if (y > c.base + 200 || pr.precip < 0.01) return { rain: 0, snow: 0 };
         const k = pr.precip * smoothstep(bottom, bottom + 300, y);
         const snow = smoothstep(this.world.weather.freezingLevel - 250, this.world.weather.freezingLevel + 250, y);
@@ -3186,8 +3653,10 @@ class App {
         const shadowKey = `${wo[0]},${wo[1]},${sky.dir.map(v => v.toFixed(2))},${w.weather.target},${w.weather.blend < 1}`;
         const full = this.reset || shadowKey !== this.shadowKey || w.weather.blend < 1;
         this.shadowKey = shadowKey;
-        F.set('lod', [q.checker ? 1 : 0, full ? 1 : SHADOW_SLICES, full ? 0 : this.frameNo % SHADOW_SLICES, q.detail]);
+        F.set('lod', [q.interleave, full ? 1 : SHADOW_SLICES, full ? 0 : this.frameNo % SHADOW_SLICES, q.detail]);
         this.shadowSlices = full ? 1 : SHADOW_SLICES;
+        F.set('froxel', [FROXEL_NEAR, cfg.maxDistance, this.froxels ? 1 : 0, 0]);
+        F.set('post', [q.blur || 0, this.tiles ? 1 : 0, 0, 0]);
         F.set('misc', [c.temperature, this.time * cfg.fallSpeed % 52000, f.base, wdt]);
         w.lightning.write(F);
 
@@ -3210,7 +3679,7 @@ class App {
 
         // probe texel: where the precipitation above the camera left the cloud base
         const drop = Math.max(c.base - cam.pos[1], 0) * cfg.slant;
-        const px = cam.pos[0] - c.wind[0] * drop, pz = cam.pos[2] - c.wind[1] * drop;
+        const px = cam.pos[0] + c.wind[0] * drop, pz = cam.pos[2] + c.wind[1] * drop;
         this.probeTexel = [clamp(Math.floor((px - wo[0]) / texel), 0, WEATHER_RES - 1), clamp(Math.floor((pz - wo[1]) / texel), 0, WEATHER_RES - 1)];
         this.groundSnowHint = w.weather.freezingLevel < f.base + 150 ? 'settling' : w.weather.freezingLevel < f.max ? 'on the peaks' : 'melting';
     }
@@ -3239,7 +3708,7 @@ class App {
         this.writeFrame(dt, wdt);
         const enc = r.device.createCommandEncoder();
         const total = this.near.rain + this.near.snow;
-        r.render(enc, this.probeTexel, total > 0.005 ? this.cfg.particles : 0, w.lightning.count, !!QUALITY[this.quality].checker, this.shadowSlices);
+        r.render(enc, this.probeTexel, total > 0.005 ? this.cfg.particles : 0, w.lightning.count, QUALITY[this.quality].interleave, this.shadowSlices, this.froxels, this.mode !== 1, this.tiles);
         r.device.queue.submit([enc.finish()]);
         r.weatherPass.afterSubmit();
         r.profiler.afterSubmit();

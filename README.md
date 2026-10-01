@@ -51,14 +51,25 @@ Each frame runs these passes. All distances are metres and heights are above sea
      the wedge position along the gust front
    - **layers**: the coverage of each cloud genus, which drift with the wind
    - **style**: supercell plates, green tint, and how far the wall cloud lowers
+
+   From these maps an **occupancy grid** (`WGSL_OCCUPANCY`) marks where cloud can exist: 256² columns of 500 m,
+   each with 32 height cells (bits of one `u32`) from the lowest cloud to the highest top of the frame. A cell is set
+   when it reaches into the convective layer below the column's own highest top (lowered under wall clouds), an
+   anvil band, shelf height or a genus layer's band, taking the largest values over every weather texel the march
+   can blend in that column.
 2. **Cloud shadow map** (`WGSL_SHADOW`): 384² texels.
    - Sun transmittance is marched up through the cloud slab from the cloud base plane.
-   - Sky occlusion is integrated over the cloud column above each texel.
+   - Sky occlusion is integrated over the cloud column above each texel (stored as the column's transmittance;
+     the clouds' sky light and the lightning both read the column's optical depth from it).
+   - The sun ray's optical depth below the top of the convective layer, so the clouds' lighting can take off the
+     part of the ray below a point (`sunDepthAbove`).
+   - Low cloud: the transmittance of the lowest 1.5 km of cloud above the base. Precipitation only falls where
+     there is low cloud above the point it left the base (an anvil overhead does not count).
 
    Terrain, precipitation and haze sample it, so cloud shadows sweep across the ground and sunlit gaps
    cut crepuscular rays.
 3. **Ground state** (`WGSL_GROUND`, `GroundPass`): 256² texels of snow cover and wetness. Snow
-   builds up where precipitation reaches the ground below freezing (lapse rate 6.5 °C/km). Rain wets
+   builds up where precipitation reaches the ground below freezing, following the same slanted shafts (lapse rate 6.5 °C/km). Rain wets
    the ground. Snow melts and the ground dries afterwards.
 4. **Scene** (`WGSL_SCENE`): the sky, then the terrain.
    - The terrain mesh is a geometric grid: linear over the heightfield, then rings growing out to
@@ -66,7 +77,23 @@ Each frame runs these passes. All distances are metres and heights are above sea
    - Ground shading: section-line farm fields, centre-pivot circles, towns, forests, rivers and lakes,
      and mountains with rock above the tree line.
    - It is lit with cloud shadows, snow, wet darkening and reflections, and lightning.
-5. **Volumetrics** (`WGSL_MARCH`, `CloudPass`): a compute ray march at reduced resolution. Steps are
+5. **Froxel lighting** (`WGSL_FROXEL`, `FroxelPass`): a 160 × 96 × 128 volume of frustum-aligned cells (froxels),
+   with depth slices spaced exponentially from 40 m out to the march distance. Each froxel stores the light at its
+   centre:
+   - sun transmittance: the cloud shadow map, times the shadow cast by the rain and snow shafts themselves (six
+     steps toward the sun through the shaft envelope, without the streaks), so heavy shafts darken what lies behind
+     them and the haze in their lee
+   - sky light left under the cloud column
+   - lightning
+
+   Light changes slowly across space, so a coarse grid holds it. The march reads it with one trilinear fetch per
+   step below the cloud base, in place of the shadow map lookups and the loop over flashes. The densities stay
+   per step, so the streaks keep their detail. `F` switches it off, and the march then evaluates the light per step
+   (without the shafts' own shadow).
+6. **Volumetrics** (`WGSL_TILES`, `WGSL_MARCH`, `CloudPass`): first a **cloud tile pre-pass**: one ray through the
+   centre of each 4 × 4 block of volumetric pixels takes one shape sample per distance bin (64 bins, square-root
+   spaced out to the march distance), with every noise cloud's coverage padded by 0.15 so its clouds come out a little
+   larger, and records the bins that hold cloud. Then a compute ray march at reduced resolution. Steps are
    spaced quadratically (dense near the camera), with a jittered start. Each step integrates three
    media, energy-conserving:
    - **Clouds** (`cloudSample`): the convective layer and storms, shelf clouds, and up to four genus
@@ -76,13 +103,34 @@ Each frame runs these passes. All distances are metres and heights are above sea
      - **Detail**: a 32³ Worley volume erodes edges: wispy at the base, billowy at the top.
      - **Vertical profile**: flat bases, rounded tops, an anvil band, and wind shear that leans the
        towers.
-     - **Light**: a short march toward the sun, three multiple-scattering octaves (Wrenninge), and
-       ambient light that darkens under tall towers.
+     - **Light**: a short march toward the sun, then the rest of the sun ray from the shadow map, so a low sun
+       does not light the underside of a deck it would have to cross for tens of kilometres. Three
+       multiple-scattering octaves (Wrenninge).
+     - **Sky light**: near a cloud surface the view ray reached through open air, the sky lights the cloud from the
+       side (less under tall towers). Deeper in, and when the camera is inside the cloud or the rain, only the light
+       that diffused down through the cloud above is left (`cloudAbove`): its transmittance is about
+       1 / (1 + 0.11 τ) for the optical depth τ above, so the middle of a storm is dim and it brightens toward the
+       tops. That light flows downward, so it is brighter looking up than down (`diffuseLook`). Rain under a storm
+       is lit the same way.
+     - **Lightning** (`flashLit`): a flash fires inside the cloud and its light diffuses out through the storm
+       column, 1 / (1 + 0.11 τ) for the cloud between the flash and the lit point. The cloud around the flash
+       glows, while the base, the rain shafts, the haze and the ground below get a dimmer, spread-out light.
    - **Rain and snow**: precipitation below the cloud base.
-     - **Slant**: each sample reads the weather where its precipitation left the cloud base, upwind
-       by `wind · drop · slant`, so the shafts slant.
-     - **Streaks**: falling curtains of stretched 3D noise.
-     - **Virga**: the shaft fades out above the ground.
+     - **Slant**: storms move with the wind aloft and the slower air below holds the falling precipitation
+       back, so a shaft trails behind its cloud. Each sample reads the weather where its precipitation left the
+       cloud base, downwind by `wind · drop · slant` (`precipSourceAt`): the foot of the shaft lies upwind of the
+       cloud.
+     - **Source**: the shafts hang from the local cloud base: the layer's base, or the bottom of a mothership's
+       plate stack, which hangs lower (`precipBase`). The rate is cut where no low cloud hangs above the point the
+       precipitation left the base, so a rain core on a storm's flank, carried further by the wind, does not fall
+       from clear sky beside the cloud or from under an anvil (`rainCover`).
+     - **Streaks**: falling curtains of stretched 3D noise, travelling with the clouds.
+     - **Virga**: the shaft fades out above the ground. A downpour overwhelms it: virga fades from intensity 0.6
+       and is gone by 1.4 (`virgaOf`).
+     - **Heavy cores**: a storm cell's precipitation core is flat-topped, so its whole middle pours. Precipitation
+       can pass 1 (up to 2) when the weather state's `power` is above 1, as in severe storms. From 0.6 up, the
+       shaft gets denser than in proportion and its streaky curtains merge into a solid wall, and the HUD reports
+       torrential rain under it.
      - **Rain or snow**: rain below the freezing level and snow above it, each with its own extinction
        and phase. Rain scatters strongly forward, so backlit shafts glow.
    - **Haze**: height fog that is shadowed by the cloud map, and tends to the horizon sky colour far
@@ -90,13 +138,13 @@ Each frame runs these passes. All distances are metres and heights are above sea
    - **Cirrus**: a streaky sheet above the slab.
 
    A **temporal resolve** reprojects the history using the transmittance-weighted depth, clips it to
-   the variance of the 3 × 3 neighbourhood, and blends.
-6. **Final** (`WGSL_FINAL`):
+   the variance of the pixels marched this frame nearby, and blends.
+7. **Final** (`WGSL_FINAL`):
    - Composite and ACES tonemap.
    - Near-field rain streaks and snowflakes in a box that wraps around the camera. Their amount comes
-     from a one-texel GPU readback of the weather map above the camera.
+     from a one-texel GPU readback of the weather map and the shadow map's low cloud above the camera.
    - Lightning bolts.
-   - A weather radar inset. Rain shows in green, yellow and red, snow in blues, and virga aloft in
+   - A weather radar inset, showing the precipitation that leaves the cloud base. Rain shows in green, yellow and red, snow in blues, and virga aloft in
      grey-blue.
 
 The sky and sun colours come from the sun elevation, using Kasten-Young air mass through Rayleigh
@@ -107,9 +155,16 @@ and Mie extinction. They turn greyer and darker with cloud coverage.
 The HUD's `gpu` line shows the GPU time of each pass. It uses timestamp queries (`GpuProfiler`) when the adapter
 offers them.
 
-- **Checkerboard march** (low, medium and high quality): each frame marches half the volumetric pixels, alternating
-  between frames. The resolve rebuilds the other half by reprojecting the history, clamped to the four neighbours
-  marched this frame. This halves the march cost.
+- **Interleaved march** (`interleave` per quality preset): low, medium and high march one pixel of each 2 × 2 block
+  per frame, taking turns over four frames (diagonal first); ultra marches every pixel. A setting of 2 marches a
+  checkerboard. The resolve rebuilds the other pixels by reprojecting the history, clamped to the pixels marched
+  this frame within two pixels (4 to 9 of them), and blends a freshly marched pixel in with a weight of 0.25. One in
+  four instead of one in two took the march from 1.5 to 0.9 ms at medium and from 4.3 to 2.3 ms at high. While
+  turning, the clouds come out a little softer than with the checkerboard, without trails.
+- **Cloud blur** (low and medium quality): the composite smooths the half-resolution volumetrics with a 3 × 3 tent of
+  bilinear taps (radius 1 volumetric texel at low, 0.7 at medium). A tap counts less where its transmittance differs from
+  the centre pixel's, so the march noise inside clouds smooths out while cloud edges and the terrain outline stay sharp.
+  It runs after the temporal resolve, so the history never blurs further. About 0.1 ms.
 - **Distance LOD**: `cloudSample(p, w, lod, feat)` has three levels:
   - lod 0, within the preset's `detail` distance: detail-noise erosion, grooves, striations and scud
   - lod 1, up to 2.5 × that distance: no erosion
@@ -118,13 +173,24 @@ offers them.
   Light marches take fewer, longer steps with distance.
 - **Step-count LOD**: short segments, such as rays looking down at nearby ground, get fewer march steps (at least
   24).
-- **Empty space**: after two cloud-free samples, clouds are evaluated only every other step until one is hit.
-  Nothing is sampled below the lowest cloud or above the highest cloud top of this frame.
+- **Empty space**: march steps in cells the occupancy grid marks empty skip the cloud noise entirely; only the
+  motherships and shelf lines the ray passes near are still evaluated. Most empty air lies above a column's own top,
+  since the slab reaches up to the tallest storm anywhere. Elsewhere, after two cloud-free samples, clouds are
+  evaluated only every other step until one is hit. Nothing is sampled below the lowest cloud or above the highest
+  cloud top of this frame. The grid costs about 0.2 ms and saves 0.6–1.3 ms of march. A bound on the shape noise in
+  the grid was tried too: it skipped little more and cost as much as it saved.
+- **Cloud tiles** (`G` switches them off): the march evaluates clouds only in the distance bins the tile pre-pass found
+  cloud in, over the pixel's tile and its eight neighbours, widened by one bin each way. The pre-pass costs 0.4 ms at
+  medium and 0.7 ms at high and takes 1.0–2.2 ms off the march. It ignores the scene depth (a tile can straddle the
+  horizon) and evaluates every mothership and shelf line. Two samples per bin cost twice as much and skipped no more.
+- **No volumetrics** render mode skips the froxel, tile, march and resolve passes.
 - **Culling**:
   - Each ray tests the bounding boxes of the motherships and shelf lines once, and only evaluates those it can meet.
   - Shelf lines reject points against the line's chord before the curve solve.
   - The anvil and style maps are only read at heights and places where those clouds can exist.
   - The weather map skips storm cells beyond their reach, and skips each cell's noise where it cannot matter.
+- **Froxel lighting**: the precipitation and haze light is computed once per froxel (about 2 million, about 0.1 ms)
+  instead of at every march step.
 - **Time slicing**: the cloud shadow map refreshes a quarter of its rows per frame. It refreshes fully when the map
   moves, the sun moves, or the weather changes.
 
@@ -144,8 +210,10 @@ and from 25–28 ms to 10–12 ms at high.
 | , . | weather time scale (×1 … ×160) |
 | T, arrows | next lighting preset; move the sun (azimuth, elevation) |
 | R | radar inset |
-| M | render mode: shaded, no volumetrics, clouds only, precipitation only |
-| Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, checkerboard, detail distance) |
+| F | froxel lighting on / off |
+| G | cloud tile pre-pass on / off |
+| M | render mode: shaded, no volumetrics (skips the volumetric passes), clouds only, precipitation only |
+| Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, interleave, detail distance, cloud blur) |
 | V, L, P, H | next view, labels, pause weather, help |
 
 ### Analytic storm structures
@@ -200,7 +268,7 @@ The weather map writes each genus's coverage into one channel of a layer map (`l
 | `haze` | aerosol amount |
 | `drizzle` | precipitation from the layer itself, where it is thick |
 | `storms` | multiplier on the spawners' rate |
-| `power` | multiplier on storm precipitation |
+| `power` | multiplier on storm precipitation; above 1, cores reach torrential intensity (up to 2) |
 | `lightning` | multiplier on flash rates |
 
 ### Entity types
@@ -263,13 +331,14 @@ FRAME_LAYOUT, FrameBlock, WORLD_BINDINGS,   uniform block and bindings shared by
 BindingSet                                 struct and declarations are generated from the same lists)
 WGSL_MATH / SKY / WEATHER_SAMPLE /         shared WGSL pieces, composed per pass
 DENSITY / SHADOW_SAMPLE
-WGSL_NOISE, WGSL_WEATHER, WGSL_SHADOW,     compute: noise volumes, weather + anvil maps, shadow map, ground state
-WGSL_GROUND
-WGSL_MARCH, WGSL_RESOLVE                   compute: volumetric march, temporal resolve
+WGSL_OCCUPANCY, WGSL_NOISE, WGSL_WEATHER,  compute: occupancy grid, noise volumes, weather + anvil maps, shadow map,
+WGSL_SHADOW, WGSL_GROUND                   ground state
+WGSL_FROXEL, WGSL_SKIP_SAMPLE,             compute: froxel lighting, occupancy / tile lookups, cloud tile pre-pass,
+WGSL_TILES, WGSL_MARCH, WGSL_RESOLVE       volumetric march, temporal resolve
 WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
 Entity, ENTITY_TYPES                       terrain features, StormCell, Supercell, SquallLine, Spawner
 WeatherSystem, CloudLayers, Sky,           data-driven weather (states blend every value, including genus
 Lightning, World                           coverage), cloud genus layers, sky colours, lightning, world
-NoiseVolumes, WeatherPass, GroundPass, CloudPass, GpuProfiler, Renderer
+NoiseVolumes, WeatherPass, GroundPass, FroxelPass, CloudPass, GpuProfiler, Renderer
 Input, FlyCamera, Hud, App, main
 ```
