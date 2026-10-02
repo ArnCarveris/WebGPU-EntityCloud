@@ -78,7 +78,7 @@ Each frame runs these passes. All distances are metres and heights are above sea
      and mountains with rock above the tree line.
    - It is lit with cloud shadows, snow, wet darkening and reflections, and lightning.
    - Then the **structures** (`vsStruct` / `fsStruct`): houses, a bus shelter, bridges, roads and the river's water in a
-     village, as flat-shaded triangles built on the CPU. They stand on `Heightfield.surface`, the terrain exactly as
+     village, and a town's central bus station, as flat-shaded triangles built on the CPU. They stand on `Heightfield.surface`, the terrain exactly as
      drawn (half-float heights, filtered at the mesh vertices, flat triangles between them), so they neither float
      nor sink. They get cloud shadows, wetness, snow on what faces up, and glass, metal and wet surfaces reflect the
      sky. See **Rain shelter** below.
@@ -147,10 +147,15 @@ Each frame runs these passes. All distances are metres and heights are above sea
 7. **Final** (`WGSL_FINAL`):
    - Composite and ACES tonemap.
    - Near-field rain streaks and snowflakes in a box that wraps around the camera. Their amount comes
-     from a one-texel GPU readback of the weather map and the shadow map's low cloud above the camera.
+     from a one-texel GPU readback of the weather map and the shadow map's low cloud above the camera. How the rain
+     looks follows the state's drop size (see **Rain variants**), and rain runs off the roof edges near the camera.
    - Lightning bolts.
    - A weather radar inset, showing the precipitation that leaves the cloud base. Rain shows in green, yellow and red, snow in blues, and virga aloft in
      grey-blue.
+
+Under cloud, the ground's sun light is the shadow map's transmittance. Points inside the cloud slab get progressively
+more sun (the map's march from the slab's base overstates the cloud toward the sun there), measured from the real
+cloud base: the lowest genus layer or the convective base, not the march's padded lower bound.
 
 The sky and sun colours come from the sun elevation, using Kasten-Young air mass through Rayleigh
 and Mie extinction. They turn greyer and darker with cloud coverage.
@@ -209,6 +214,7 @@ and from 25–28 ms to 10–12 ms at high.
 | drag / WASD / Space, C | look / move / up, down |
 | Shift, Alt, wheel | ×5, ×0.2, speed |
 | right click (or Ctrl + click) | grow a storm cell where the cursor meets the ground |
+| N | rain variants: drizzle, light rain, medium rain, downpour (see **Rain variants**) |
 | 1–9 | weather states: clear, fair cumulus, mackerel sky, warm front, stratus deck, showers, thunderstorm, snow squalls, overcast rain (they blend over `transition` seconds). A 10th, severe storms, is reached by auto-cycle and by the shelf and mothership views |
 | 0 | auto-cycle the weather states |
 | K | lightning from the nearest raining cell |
@@ -221,15 +227,41 @@ and from 25–28 ms to 10–12 ms at high.
 | Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, interleave, detail distance, cloud blur) |
 | V, L, P, H | next view, labels, pause weather, help |
 
+### Rain variants
+
+Four weather states give steady rain from a stratus or nimbostratus deck at four strengths, in light winds (3–7 m/s),
+so the rain falls at no more than about 40° and a roof keeps it off what stands under it. `N` steps through them;
+the scenario's bus station views start in medium rain, a downpour and light rain.
+
+| State | Deck | `rain` | `drops` | Near-field intensity | Looks like |
+|---|---|---|---|---|---|
+| drizzle | stratus | 0.8 | 0 | about 0.1 | a slow mist of fine droplets that drifts with the wind (2.5 m/s fall) |
+| light rain | nimbostratus + stratus | 0.38 | 0.35 | about 0.2 | sparse, thin, short streaks |
+| medium rain | nimbostratus + stratus | 1.0 | 0.6 | about 0.55 | steady streaks; water drips off roof edges |
+| downpour | thick nimbostratus | 2.6 | 1 | about 1.4 | dense, long, fast streaks (10 m/s), up to three times the drops, a grey wall of rain shafts, sheets of water off the roofs |
+
+- **Rate**: `rain` scales the genus layers' precipitation in the weather map. Above 1 the excess adds on top, so a
+  thick deck reaches intensity 1.4 like a severe storm's core: the shafts merge into a solid wall and visibility drops.
+- **Drop size** (`drops`, in the frame as `rain.x`): the fall speed is 2.5 + 7.5 · drops^0.7 m/s. The near-field drops
+  fall at that speed; fine drops come in a smaller, denser box (40 m instead of 70 m across), as faint thin specks; big
+  drops are wider, brighter streaks, and past intensity 0.6 the particle count grows to three times `particles`. The
+  rain shadows use the same speed, so drizzle blows further in under a roof than a downpour does.
+- **Roof runoff**: roofs register their edges with `Structures.drip` (the station's canopy and terminal, the village
+  bus shelter, every house's eaves). Each frame the 8 nearest within 150 m go into the frame (`dripEdges`), and
+  40 000 extra particles fall from them (`drip` in `vsPrecip`): each picks an edge (nearer and longer ones get more),
+  a side, and a spout within 30 m of the camera's place along it, and falls freely to the ground, leaning downwind.
+  They are thinned to at most 100 per metre of edge and grow with the rain rate.
+- The HUD names the rain by its rate and drop size: drizzle, light, moderate, heavy, torrential, downpour.
+
 ### Rain shelter
 
 Structures stand in the shaders as up to 128 boxes (`blockers` in the frame uniform), each turned by its yaw and
 sheared along its length by a slope, so bridge decks follow their ramps and arch. A house is two boxes (walls; roof
-with its eaves), the bus shelter four (roof, back and side panels), and a deck one per 8 m piece, fitted inside the
-curved deck. `WGSL_SHELTER` tests rays against them:
+with its eaves), the bus shelter four (roof, back and side panels), a deck one per 8 m piece, fitted inside the
+curved deck, and the bus station about 27 (canopy, clerestory, pillars, kiosk, buses, terminal, town blocks). `WGSL_SHELTER` tests rays against them:
 
 - **Rain shadow**: a point is dry where the path its drops came along, straight back up against their fall and slanted
-  by the wind (0.8 of the wind, rain at 9.5 m/s, snow at 1.35 m/s, as the near-field particles), enters a box. So the
+  by the wind (0.8 of the wind, rain at the state's fall speed, snow at 1.35 m/s, as the near-field particles), enters a box. So the
   ground under a roof or a deck stays dry and the dry patch shifts downwind; a back wall keeps the rain off the bench
   when the wind blows from behind it; snow blows in further.
   - Terrain and structures: no wetness and no settled snow there.
@@ -239,7 +271,8 @@ curved deck. `WGSL_SHELTER` tests rays against them:
 - **Sun shadows**: the ray toward the sun, so houses shade the street and each other, and decks the river bank.
 - **Sky occlusion**: under roofs and decks (a box's `ao`), less sky light reaches the ground.
 
-A ray starting inside a box does not count, so surfaces do not shade themselves. Each frame a 32 × 32 grid over the
+A ray starting inside a box does not count, so surfaces do not shade themselves. Only boxes within 2.5 km of the camera
+go into the frame (the village and the bus station lie 9 km apart). Each frame a 32 × 32 grid over the
 boxes' bounds lists, per cell, the boxes that can shade it: a capsule from each box toward where its sun shadow and its
 rain shadow fall, as far as a ray from the ground under it to its top runs sideways. A point tests only its cell's
 boxes, which keeps the structures at about 0.2 ms of scene time at street level.
@@ -298,6 +331,8 @@ The weather map writes each genus's coverage into one channel of a layer map (`l
 | `storms` | multiplier on the spawners' rate |
 | `power` | multiplier on storm precipitation; above 1, cores reach torrential intensity (up to 2) |
 | `lightning` | multiplier on flash rates |
+| `rain` | multiplier on the genus layers' precipitation (default 1); past 1 a thick deck pours, past intensity 1 |
+| `drops` | drop size, 0 (drizzle) to 1 (downpour), default 0.8: fall speed, and how the near-field rain looks |
 
 ### Entity types
 
@@ -312,6 +347,7 @@ The weather map writes each genus's coverage into one channel of a layer map (`l
 | `town` | terrain | `pos`, `radius`, `density` (street blocks) |
 | `forest` | terrain | `pos`, `radius`, `density`, `seed` |
 | `village` | structure | a village on a road, laid out from `seed` (below) |
+| `busStation` | structure | a town's central bus station (below) |
 | `storm` | weather | storm cell, below |
 | `supercell` | weather | a storm with a mothership plate stack: `stackRadius` (× radius), `stackDrop` / `stackHeight` (m below / above the cloud base), `plates`, `twist` (plates climbed per turn), `spin` (rad/s), `wallCloud` (m), `wallRadius` (× stack radius) |
 | `squall` | weather | a line of `count` storms from `from` to `to`, carried by the wind (`drift`, `velocity`); it starts over after `travel` m. Also takes `radius`, `top`, `precip`, `lightning`, `green`. Its shelf cloud runs along the gust front, `gap` × radius ahead of the cells and bowed out by `bow` m: `shelf` (strength), `lip` (m above ground), `shelfDepth`, `tiers` |
@@ -332,6 +368,23 @@ A `village` has these parameters:
   true width, since the land-use map's cells (125 m) are wider than the river
 - viewpoints for `views` (`{ follow: "village", spot }`): `bus stop` (under the shelter), `bridges`,
   `under the bridge`, `overview`
+
+A `busStation` is a big rain shelter in the style of a 1970s concrete bus station: a long cantilevered canopy with a
+deep fascia, a ribbed soffit and a glazed clerestory along its spine, on one row of square pillars. Under it an island
+platform has benches, timetables, a kiosk and bay signs; buses stand nose-in at the bays on one side and a
+drive-through lane runs along the other. A terminal building with a flat overhanging roof closes the west end, and town
+blocks stand around the forecourt. The ground is levelled under it. Parameters:
+
+- `pos`, `yaw` (degrees; the canopy runs along it), `length` and `width` (m of canopy, default 96 × 30: it overhangs
+  the 15 m platform by 7.5 m each side, so wind-blown rain does not reach it)
+- `bays` (default 20), `buses` (default 5: nose-in at random bays, one in the lane), `seed`
+- `level` (m, default 200): the terrain is flattened to its mean within this radius, blending out 300 m further
+- viewpoints for `views` (`{ follow: "station", spot }`): `platform` (under the canopy, looking out over the bays),
+  `forecourt` (out in the rain at the canopy's corner), `overview`
+
+The canopy's soffit is 5.4 m up and its fascia hangs to 4.7 m. It is one shader box from the bottom of its fascia to the top of the upstand, so the platform stays dry and the
+deep fascia keeps slanting rain off its edge; the pillars, the kiosk, the buses, the terminal and the town blocks are
+boxes too. The scenario places it in Brightfield at `[-3600, 8400]`.
 
 A `storm` cell has these parameters:
 
@@ -385,7 +438,7 @@ WGSL_FROXEL, WGSL_SKIP_SAMPLE,             compute: froxel lighting, occupancy /
 WGSL_TILES, WGSL_MARCH, WGSL_RESOLVE       volumetric march, temporal resolve
 WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
 WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion
-Entity, ENTITY_TYPES                       terrain features, GroundFrame / Structures / Village, StormCell, Supercell,
+Entity, ENTITY_TYPES                       terrain features, GroundFrame / Structures / Village / BusStation, StormCell, Supercell,
                                            SquallLine, Spawner
 WeatherSystem, CloudLayers, Sky,           data-driven weather (states blend every value, including genus
 Lightning, World                           coverage), cloud genus layers, sky colours, lightning, world

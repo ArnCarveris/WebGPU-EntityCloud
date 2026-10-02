@@ -92,7 +92,8 @@
               ambient (light scale, < 1 darker), precip (drizzle at full coverage) }
     weather   start, transition (s), cycle { enabled, hold (s) }, states { name: { coverage (cumulus), base, top, density, cirrus,
               layers { genus: coverage }, wind [x, z] m/s, temperature (C at sea level), haze, drizzle, storms (spawn rate x),
-              power (storm precipitation x), lightning (x) } }
+              power (storm precipitation x), lightning (x), rain (genus layer precipitation x; past 1 a deck pours),
+              drops (0 drizzle .. 1 downpour: drop size, fall speed, how the near-field rain looks) } }
     entities  { type, id, label, ... }, type in ENTITY_TYPES, applied in order:
               terrain  tilt { dir, drop } | hills { amplitude, scale, octaves, seed, ridged } | mountain { pos, radius, height, roughness }
                        range { path, width, height, roughness, seed } | river { path, width, depth, bank } | lake { pos, radius, level }
@@ -100,6 +101,8 @@
               structure village { pos, radius, river (entity id; else road, degrees), houses, footbridge (m along the river),
                                   busStopSide (1 | -1), channel (m), seed }: houses, a bus shelter, a road bridge and a
                                   footbridge that keep the rain off what lies under them
+                        busStation { pos, yaw (degrees), length, width (m of canopy), bays, buses, level (m levelled around pos), seed }:
+                                  a cantilevered concrete canopy over an island platform, bays with buses, a terminal
               weather  storm { pos, radius, top, precip, core, coreOffset, life [grow, mature, decay] s, lightning (per min), virga, drift,
                                velocity, pinned, hold, shelf, laminar, green, wallCloud }
                        supercell { ...storm, mothership plate stack: stackRadius, stackDrop, stackHeight, plates, twist, spin (rad/s),
@@ -165,7 +168,19 @@
                                "temperature": 16, "haze": 1.6, "drizzle": 0.2, "storms": 0.3, "power": 0.8, "lightning": 0.1 },
             "severe storms": { "coverage": 0.5, "base": 3600, "top": 6200, "density": 0.09, "cirrus": 0.2, "wind": [12, -4],
                                "layers": { "altostratus": 0.75 },
-                               "temperature": 25, "haze": 0.7, "drizzle": 0, "storms": 1.5, "power": 1.4, "lightning": 2 }
+                               "temperature": 25, "haze": 0.7, "drizzle": 0, "storms": 1.5, "power": 1.4, "lightning": 2 },
+            "drizzle":       { "coverage": 0.04, "base": 2600, "top": 3300, "density": 0.06, "cirrus": 0, "wind": [3, -1],
+                               "layers": { "stratus": 1.0, "nimbostratus": 0.25 },
+                               "temperature": 12, "haze": 2.2, "drizzle": 0, "storms": 0, "power": 0.5, "lightning": 0, "rain": 0.8, "drops": 0 },
+            "light rain":    { "coverage": 0.1, "base": 2500, "top": 3800, "density": 0.06, "cirrus": 0, "wind": [4, -3],
+                               "layers": { "nimbostratus": 0.85, "stratus": 0.35 },
+                               "temperature": 14, "haze": 1.5, "drizzle": 0, "storms": 0, "power": 0.5, "lightning": 0, "rain": 0.38, "drops": 0.35 },
+            "medium rain":   { "coverage": 0.15, "base": 2500, "top": 4000, "density": 0.06, "cirrus": 0, "wind": [5, -3],
+                               "layers": { "nimbostratus": 0.95, "stratus": 0.45 },
+                               "temperature": 15, "haze": 1.7, "drizzle": 0, "storms": 0.2, "power": 0.7, "lightning": 0, "rain": 1.0, "drops": 0.6 },
+            "downpour":      { "coverage": 0.3, "base": 2300, "top": 4600, "density": 0.07, "cirrus": 0, "wind": [6, -4],
+                               "layers": { "nimbostratus": 1.0, "stratus": 0.6 },
+                               "temperature": 18, "haze": 2.0, "drizzle": 0, "storms": 0.4, "power": 1.2, "lightning": 0.2, "rain": 2.6, "drops": 1 }
         }
     },
 
@@ -188,6 +203,8 @@
         { "type": "forest", "pos": [-24000, -2000], "radius": 9000, "density": 0.9, "seed": 3 },
         { "type": "village", "id": "village", "label": "Millbrook", "pos": [-12500, 4700], "radius": 380, "river": "platte",
           "houses": 28, "footbridge": 170, "seed": 9 },
+        { "type": "busStation", "id": "station", "label": "Brightfield bus station", "pos": [-3600, 8400], "yaw": 20, "length": 96,
+          "bays": 20, "buses": 5, "seed": 3 },
 
         { "type": "supercell", "id": "hero", "label": "Supercell", "pos": [1500, -2500], "radius": 6200, "top": 11800, "precip": 1.0,
           "core": 0.75, "coreOffset": [900, 800], "life": [900, 2400, 1200], "lightning": 5, "virga": 0.12, "pinned": true,
@@ -225,6 +242,9 @@
         { "name": "Village bus stop",      "follow": "village", "spot": "bus stop", "weather": "overcast rain" },
         { "name": "Village bridges",       "follow": "village", "spot": "bridges", "weather": "overcast rain" },
         { "name": "Under the bridge",      "follow": "village", "spot": "under the bridge", "weather": "overcast rain" },
+        { "name": "Bus station platform",  "follow": "station", "spot": "platform", "weather": "medium rain" },
+        { "name": "Bus station forecourt", "follow": "station", "spot": "forecourt", "weather": "downpour" },
+        { "name": "Bus station overview",  "follow": "station", "spot": "overview", "weather": "light rain" },
         { "name": "Shelf cloud",   "follow": "squall", "offset": [7000, 25, 1500], "lookOffset": [-4000, 2100, -2500],
           "lighting": "storm dusk", "weather": "severe storms" },
         { "name": "Mothership",    "follow": "hero", "offset": [-5500, 25, 8000], "lookOffset": [0, 3000, 0],
@@ -243,7 +263,7 @@
 //   2. Cloud shadow map (compute): sun transmittance through the cloud slab, and the sky occlusion of the column above.
 //   3. Ground state (compute): snow cover and wetness accumulate under precipitation and melt / dry afterwards.
 //   4. Scene (render): sky, then the terrain (farm sections, pivots, towns, mountains) with cloud shadows, snow and wet ground,
-//      then structures (houses, bus shelter, bridges): meshes on the terrain, with boxes in the shaders that cast sun shadows
+//      then structures (houses, bus shelters, bridges, a bus station): meshes on the terrain, with boxes in the shaders that cast sun shadows
 //      and keep rain and snow off the ground, the near-field drops and the shafts under roofs and decks (WGSL_SHELTER).
 //   5. Volumetrics (compute, reduced resolution): one ray march through clouds (Perlin-Worley shape + Worley detail,
 //      light march + multiple-scattering octaves), rain and snow shafts falling from the cloud base (slanted by the wind,
@@ -270,6 +290,10 @@ const MAX_FLASHES = 4;
 const MAX_BOLT_SEGS = 256;
 const MAX_BLOCKERS = 128;            // structure boxes in the frame uniform (sun and rain shadows, see WGSL_SHELTER)
 const BLOCK_GRID = 32;               // cells per side over their bounds, each listing the boxes that can shade it (4 x 32 bits)
+const BLOCK_RANGE = 2500;            // only boxes this close to the camera (m) go into the frame, so the grid stays fine
+const MAX_DRIPS = 8;                 // roof edges near the camera that rain runs off (see vsPrecip)
+const DRIP_DENSITY = 100;           // at most this many of them per metre of edge
+const DRIP_PARTICLES = 40000;        // near-field drops falling off those edges, drawn after the rain
 const STRUCT_FLOATS = 10;            // structure mesh vertex: position, normal, colour, material
 const GRID_N = 512;                 // terrain mesh vertices per side (inner part covers the heightfield, outer rings run to the horizon)
 const NOISE_SHAPE = 128;
@@ -305,8 +329,12 @@ const RENDER_DEFAULTS = {
 };
 const WEATHER_DEFAULTS = {
     coverage: 0.3, base: 3000, top: 4500, density: 0.04, cirrus: 0.2, wind: [8, 0], temperature: 20, haze: 1,
-    drizzle: 0, storms: 1, power: 1, lightning: 1, layers: {},
+    drizzle: 0, storms: 1, power: 1, lightning: 1, layers: {}, rain: 1, drops: 0.8,
 };
+// how fast rain falls (m/s) for a drop size between 0 (drizzle, fine droplets) and 1 (downpour, big drops)
+const rainFall = drops => 2.5 + 7.5 * Math.pow(clamp(drops, 0, 1), 0.7);
+// the rain variants N steps through (weather states of these names)
+const RAIN_VARIANTS = ['drizzle', 'light rain', 'medium rain', 'downpour'];
 // cloud genus layers (scenario `clouds`): kind heap | sheet | cellular
 const LAYER_DEFAULTS = {
     name: 'layer', kind: 'sheet', base: 2000, top: 2600, mapScale: 25000, shapeScale: 9000, stretch: 2, erosion: 0.2,
@@ -601,6 +629,9 @@ const FRAME_LAYOUT = [
     ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, -, -
     ['blocks', 'vec4f'],    // structure boxes: count, lowest bottom, highest top (m), -
     ['blockBox', 'vec4f'],  // their bounds x0, z0, x1, z1, padded for the shadows and rain shadows they cast
+    ['rain', 'vec4f'],      // drop size (0 drizzle .. 1 downpour), rain fall speed (m/s), genus layer precipitation scale, rain particles
+    ['drips', 'vec4f'],     // roof edges in dripEdges, -, -, -
+    ['dripEdges', `array<vec4f, ${MAX_DRIPS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, edge height, drop to the ground] [share of drops up to this edge, edges (0 all four, 1 along local x), share of its drops kept, -]
     ['blockers', `array<vec4f, ${MAX_BLOCKERS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, bottom, top] [sky occlusion, slope, -, -]
     ['blockGrid', `array<vec4u, ${BLOCK_GRID * BLOCK_GRID}>`], // per cell of blockBox: bit k set if box k can shade a point in it
 ];
@@ -1184,7 +1215,11 @@ fn shadowAt(p: vec3f) -> vec2f {
     // beyond the map: no cloud shadows instead of its edge texels smeared outwards
     let ea = sat(min(min(ua.x, 1.0 - ua.x), min(ua.y, 1.0 - ua.y)) * 12.0);
     let eb = sat(min(min(ub.x, 1.0 - ub.x), min(ub.y, 1.0 - ub.y)) * 12.0);
-    let above = sat((p.y - base) / max(F.noise.w - base, 1.0));
+    // inside the slab the map's march from its base overstates the cloud toward the sun; that only starts at the real
+    // cloud base (the lowest layer or the convective base), not at layerInfo.z, which is padded down for wall clouds and
+    // shelf lips and can lie below the ground (which then got a tenth of the sun under a full overcast)
+    let cb = min(F.layerInfo.x, F.cloud.x);
+    let above = sat((p.y - cb) / max(F.noise.w - cb, 1.0));
     return vec2f(mix(mix(1.0, a, ea), 1.0, above), mix(mix(1.0, b, eb), 1.0, above));
 }
 
@@ -1293,10 +1328,11 @@ fn blockerHit(k: i32, o: vec3f, d: vec3f) -> bool {
 }
 
 // the way the rain (or snow) reaching height y came: back up against its fall, slanted by the wind as the near-field
-// drops and flakes are (0.8 of the wind; rain falls at about 9.5 m/s, snow at 1.35 m/s, so snow blows in further)
+// drops and flakes are (0.8 of the wind; rain falls at F.rain.y, from 2.5 m/s for drizzle to 10 m/s in a downpour, snow at
+// 1.35 m/s, so drizzle and snow blow in further)
 fn rainBack(y: f32) -> vec3f {
     let snow = smoothstep(F.precip.x - 250.0, F.precip.x + 250.0, y);
-    return normalize(vec3f(-F.wind.x * 0.8, mix(9.5, 1.35, snow), -F.wind.y * 0.8));
+    return normalize(vec3f(-F.wind.x * 0.8, mix(F.rain.y, 1.35, snow), -F.wind.y * 0.8));
 }
 
 // 1 where rain reaches p, 0 where a structure keeps it off
@@ -1494,8 +1530,10 @@ fn weather(@builtin(global_invocation_id) gid: vec3u) {
     var shelfCov = 0.0;
     var shelfW = 0.0;
     var style = vec4f(0.0);
-    // genus layers: a coverage map each, drifting with the wind; some drizzle (stratus, nimbostratus)
+    // genus layers: a coverage map each, drifting with the wind; some drizzle or rain (stratus, nimbostratus), scaled by
+    // the state's rain (F.rain.z): past 1 a deck pours (a downpour), as a severe storm's core does
     var lcov = vec4f(0.0);
+    var pour = 0.0;
     for (var k = 0; k < ${MAX_LAYERS}; k++) {
         let A = F.layers[k * 3];
         let B = F.layers[k * 3 + 1];
@@ -1504,8 +1542,11 @@ fn weather(@builtin(global_invocation_id) gid: vec3u) {
         let ln = fbm2((xz - F.wind.zw * 0.8) / B.x + C.w * 17.0, 4);
         let lc = sat(A.z * (0.45 + 2.2 * (ln - 0.5)) + A.z * A.z * 0.6);
         lcov[k] = lc;
-        pr = 1.0 - (1.0 - pr) * (1.0 - C.z * smoothstep(0.35, 0.85, lc));
+        let lp = C.z * smoothstep(0.35, 0.85, lc) * F.rain.z;
+        pr = 1.0 - (1.0 - pr) * (1.0 - sat(lp));
+        pour = max(pour, lp - 1.0);
     }
+    pr += pour;
     let wl = length(F.wind.xy);
     let wd = select(vec2f(1.0, 0.0), F.wind.xy / wl, wl > 0.1);
     for (var i = 0u; i < u32(F.near.w); i++) {
@@ -2371,18 +2412,74 @@ fn lineQuad(a: vec4f, b: vec4f, widthPx: f32, corner: u32, o: ptr<function, Line
     (*o).uv = vec2f(e, sd);
 }
 
-// near-field precipitation: drops and flakes in a box that wraps around the camera
+// rain running off roof edges near the camera (F.dripEdges): drop k of the drip particles leaves a point on an edge and
+// falls freely to the ground. The drops gather at spouts along the edge, where the water runs together.
+fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
+    let rain = F.near.x - F.near.y;
+    let pick = rnd(k * 7u + 11u);
+    if (rain <= 0.02 || rnd(k * 7u + 12u) > sat(rain * 1.6)) { return; }
+    var e = 0;
+    for (var j = 0; j < i32(F.drips.x) - 1; j++) { if (pick > F.dripEdges[j * 3 + 2].x) { e = j + 1; } }
+    let A = F.dripEdges[e * 3];
+    let B = F.dripEdges[e * 3 + 1];
+    let alongX = F.dripEdges[e * 3 + 2].y > 0.5;
+    if (rnd(k * 7u + 19u) > F.dripEdges[e * 3 + 2].z) { return; }
+    // a side of the rectangle (by length; only the two along local x for eaves), and a point on it within 30 m of the
+    // camera's place along it, so the drops gather where they can be seen. They run off at spouts every 0.35 m, some
+    // harder than others
+    let side = select(u32(rnd(k * 7u + 13u) * 4.0), u32(rnd(k * 7u + 13u) * 2.0) * 2u, alongX);
+    let onX = side % 2u == 0u;
+    let half = select(A.w, A.z, onX);
+    let r = F.cam.xz - A.xy;
+    let cl = vec2f(r.x * B.x + r.y * B.y, -r.x * B.y + r.y * B.x);
+    let span = min(30.0, half);
+    let mid = clamp(select(cl.y, cl.x, onX), -half + span, half - span);
+    if (!alongX && rnd(k * 7u + 17u) > half / max(A.z, A.w)) { return; }      // short sides get fewer drops
+    let spout = floor((mid + (rnd(k * 7u + 14u) - 0.5) * 2.0 * span + half) / 0.35);
+    if (rnd(u32(spout) * 3u + side * 100003u + u32(e) * 7919u) < 0.3) { return; }
+    let t = (spout + 0.5 + (rnd(k * 7u + 18u) - 0.5) * 0.3) * 0.35 - half;
+    let sg = select(-1.0, 1.0, side >= 2u);
+    let lp = select(vec2f(sg * (A.z + 0.04), t), vec2f(t, sg * (A.w + 0.04)), onX);
+    let top = vec3f(A.x + lp.x * B.x - lp.y * B.y, B.z, A.y + lp.x * B.y + lp.y * B.x);
+    // free fall over the drop B.w: the phase cycles through it, so the stream keeps running
+    let tFall = sqrt(2.0 * B.w / 9.81);
+    let ph = fract(F.cam.w / tFall + rnd(k * 7u + 15u));
+    let ts = ph * tFall;
+    // the wind picks the drops up as they fall, so the stream leans downwind in a straight line
+    let wind = vec3f(F.wind.x, 0.0, F.wind.y) * 0.08;
+    let p = top + (wind - vec3f(0.0, 4.9, 0.0)) * ts * ts;
+    let vel = (wind * 2.0 - vec3f(0.0, 9.81, 0.0)) * ts - vec3f(0.0, 0.4, 0.0);
+    let dist = distance(p, F.cam.xyz);
+    if (dist > 120.0) { return; }
+    let a = F.viewProj * vec4f(p, 1.0);
+    let b = F.viewProj * vec4f(p - vel * 0.05, 1.0);
+    if (a.w < 0.5 || b.w < 0.5) { return; }
+    let focal = F.screen.y * 0.5 / length(F.up.xyz);
+    lineQuad(a, b, clamp(0.005 * focal / a.w, 1.0, 4.0), vi, o);
+    let lightc = F.ambient.rgb * 0.9 + F.sunCol.rgb * 0.05;
+    let fade = sat(dist / 1.5) * sat(1.0 - dist / 120.0) * smoothstep(0.0, 0.05, ph) * (1.0 - smoothstep(0.9, 1.0, ph));
+    (*o).col = vec4f(lightc * 1.3, (0.25 + 0.25 * rnd(k * 7u + 16u)) * fade * sat(rain * 2.0));
+    (*o).uv.x = 0.0;
+}
+
+// near-field precipitation: drops and flakes in a box that wraps around the camera. The drops' size (F.rain.x) sets how
+// they look: drizzle is a dense, slow mist of fine droplets in a small box, a downpour long, heavy, fast streaks.
+// Instances from F.rain.w on are drops running off roof edges (drip).
 @vertex fn vsPrecip(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> LineOut {
     var o: LineOut;
     o.pos = vec4f(0.0, 0.0, -2.0, 1.0);
     o.col = vec4f(0.0);
+    if (f32(ii) >= F.rain.w) { drip(ii - u32(F.rain.w), vi, &o); return o; }
     let total = F.near.x + F.near.y;
+    let size = F.rain.x;
     let isSnow = rnd(ii * 5u + 3u) < F.near.y / max(total, 1e-4);
-    if (rnd(ii * 5u + 4u) > sat(total * 1.3)) { return o; }
+    // fine droplets are many: drizzle shows as many drops as moderate rain, in a smaller box
+    let count = select(total * 1.3 * mix(8.0, 1.0, size), total * 1.3, isSnow);
+    if (rnd(ii * 5u + 4u) > sat(count)) { return o; }
     let seed = vec3f(rnd(ii * 5u), rnd(ii * 5u + 1u), rnd(ii * 5u + 2u));
-    let box = select(vec3f(70.0, 50.0, 70.0), vec3f(36.0, 24.0, 36.0), isSnow);
+    let box = select(mix(vec3f(40.0, 24.0, 40.0), vec3f(70.0, 50.0, 70.0), size), vec3f(36.0, 24.0, 36.0), isSnow);
     let t = F.cam.w;
-    let fall = select(8.0 + 3.0 * seed.x, 1.0 + 0.7 * seed.y, isSnow);
+    let fall = select(F.rain.y * (0.85 + 0.3 * seed.x), 1.0 + 0.7 * seed.y, isSnow);
     let vel = vec3f(F.wind.x * 0.8, -fall, F.wind.y * 0.8);
     var p = seed * box + vel * t;
     if (isSnow) { p += vec3f(sin(t * 1.3 + seed.x * 40.0), 0.0, cos(t * 1.1 + seed.z * 40.0)) * 0.8; }
@@ -2416,8 +2513,9 @@ fn lineQuad(a: vec4f, b: vec4f, widthPx: f32, corner: u32, o: ptr<function, Line
     } else {
         let b = F.viewProj * vec4f(wp - vel * 0.035, 1.0);
         if (b.w < 0.5) { return o; }
-        lineQuad(a, b, 1.2, vi, &o);
-        o.col = vec4f(lightc * 1.2, (0.12 + 0.12 * seed.z) * fade * sat(total * 2.0) * (1.0 + 0.8 * sat(total - 1.0)));   // denser in a downpour
+        lineQuad(a, b, mix(0.9, 1.7, size), vi, &o);
+        // fine droplets are faint each; denser and brighter in a downpour
+        o.col = vec4f(lightc * 1.2, (0.12 + 0.12 * seed.z) * fade * mix(0.9, 1.15, size) * sat(total * mix(10.0, 2.0, size)) * (1.0 + 0.8 * sat(total - 1.0)));
     }
     o.uv.x = select(0.0, 1.0, isSnow);    // shape flag for the fragment: streak or flake
     return o;
@@ -2609,7 +2707,7 @@ const STRUCT_COLORS = {
 };
 
 class Structures {
-    constructor(field) { this.field = field; this.v = []; this.blockers = []; }
+    constructor(field) { this.field = field; this.v = []; this.blockers = []; this.drips = []; }
 
     ground(x, z) { return this.field.surface(x, z); }
 
@@ -2644,6 +2742,13 @@ class Structures {
     blocker(f, ox, oz, hx, hz, y0, y1, ao = 0, slope = 0, base = y0) {
         const [x, z] = f.xz(ox, oz);
         this.blockers.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y0, y1, ao, slope, base });
+    }
+
+    // a roof edge rain runs off (see drip in WGSL): the rectangle around local (ox, oz) in frame f, half sizes hx, hz, at
+    // height y, `drop` m above the ground; alongX: only its two edges along local x drip (a gable roof's eaves)
+    drip(f, ox, oz, hx, hz, y, drop, alongX = false) {
+        const [x, z] = f.xz(ox, oz);
+        this.drips.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y, drop, alongX, per: alongX ? 4 * hx : 4 * (hx + hz) });
     }
 
     // a strip on the ground from a to b ([x, z]), half width hw, lifted a little above the terrain
@@ -2725,6 +2830,7 @@ class Structures {
         // shader boxes: the walls, and the roof with its eaves (which keep the rain off the top of the walls)
         this.blocker(f, 0, 0, hx, hz, gLo - 1, ye, 0);
         this.blocker(rf, 0, 0, ex, rz + e, yE - th, lerp(ye, yr, 0.55), 0.25, 0, gLo - 1);
+        this.drip(rf, 0, 0, ex, rz + e, yE - th, yE - th - (floor - 0.35), true);
     }
 
     // bus shelter: a roof on four posts, glass back and side panels, a bench, a timetable and the stop sign by the kerb.
@@ -2747,6 +2853,7 @@ class Structures {
         this.blocker(f, 0, 0, 2.35, 1.2, yr, yr + 0.14, 0.6, 0, gLo);
         this.blocker(f, 0, 0.85, 2.0, 0.02, floor, yr - 0.08, 0.1, 0, gLo);
         for (const sx of [-2.05, 2.05]) this.blocker(f, sx, 0.3, 0.02, 0.55, floor, yr - 0.08, 0.05, 0, gLo);
+        this.drip(f, 0, 0, 2.35, 1.2, yr, yr - floor + 0.12);
         return floor;
     }
 
@@ -2791,16 +2898,17 @@ class Structures {
         return top;
     }
 
-    // the boxes nearest `around` into the frame uniform, their bounds, and the grid of which boxes can shade each cell,
+    // the roof edges near `around` that rain runs off (returns how many), and the boxes nearest it into the frame uniform, their bounds, and the grid of which boxes can shade each cell,
     // for this sun (sunDir) and wind ([x, z]; snow, which blows further, when the freezing level is near the boxes)
-    write(F, around, sunDir, wind, freezing) {
-        let list = this.blockers;
-        if (list.length > MAX_BLOCKERS) {
-            const d = b => Math.hypot(b.x - around[0], b.z - around[2]);
-            list = [...list].sort((p, q) => d(p) - d(q)).slice(0, MAX_BLOCKERS);
-        }
-        if (!list.length) { F.set('blocks', [0, 0, 0, 0]); return; }
-        if (list !== this.listed) {
+    write(F, around, sunDir, wind, freezing, fall = 9.5) {
+        const drips = this.writeDrips(F, around);
+        // the boxes within BLOCK_RANGE (the village and the bus station lie kilometres apart: one grid over both would
+        // be too coarse to help), nearest first when there are too many
+        const d = b => Math.hypot(b.x - around[0], b.z - around[2]);
+        let list = this.blockers.filter(b => d(b) < BLOCK_RANGE + Math.hypot(b.hx, b.hz));
+        if (list.length > MAX_BLOCKERS) list = list.sort((p, q) => d(p) - d(q)).slice(0, MAX_BLOCKERS);
+        if (!list.length) { F.set('blocks', [0, 0, 0, 0]); this.listed = null; return drips; }
+        if (!this.listed || list.length !== this.listed.length || list.some((b, i) => b !== this.listed[i])) {
             this.listed = list;
             this.data = new Float32Array(MAX_BLOCKERS * 12);
             list.forEach((b, i) => this.data.set([b.x, b.z, b.hx, b.hz, b.cs, b.sn, b.y0, b.y1, b.ao, b.slope, 0, 0], i * 12));
@@ -2809,7 +2917,8 @@ class Structures {
         }
         // a box shades what lies down-sun of it (its sun shadow) and downwind of it (its rain shadow), as far as a ray
         // from the ground under it climbs to its top: a capsule each way from its centre, as wide as the box
-        const snow = freezing < this.hi + 250, fall = snow ? 1.35 : 9.5, wl = Math.hypot(...wind);
+        const snow = freezing < this.hi + 250, wl = Math.hypot(...wind);
+        if (snow) fall = 1.35;
         const sunL = Math.hypot(sunDir[0], sunDir[2]), sunUp = sunDir[1] > 0 && sunL > 1e-4;
         const sunSlant = sunUp ? Math.min(sunL / Math.max(sunDir[1], 0.05), 20) : 0, rainSlant = wl * 0.8 / fall;
         const caps = list.map(b => {
@@ -2841,6 +2950,29 @@ class Structures {
         F.set('blocks', [list.length, this.lo, this.hi, 0]);
         F.set('blockBox', [x0, z0, x1, z1]);
         F.setBits('blockGrid', grid);
+        return drips;
+    }
+
+    // the roof edges nearest `around` (within 150 m) that rain runs off, with each one's share of the drip particles
+    writeDrips(F, around) {
+        const d = e => Math.max(Math.abs((around[0] - e.x) * e.cs + (around[2] - e.z) * e.sn) - e.hx, 0)
+            + Math.max(Math.abs(-(around[0] - e.x) * e.sn + (around[2] - e.z) * e.cs) - e.hz, 0) + Math.abs(around[1] - e.y) * 0.5;
+        const list = this.drips.filter(e => d(e) < 150).sort((p, q) => d(p) - d(q)).slice(0, MAX_DRIPS);
+        // nearer edges get more drops, but a long edge gets more than a short one
+        const wts = list.map(e => e.per / (1 + d(e) / 25)), sum = wts.reduce((a, b) => a + b, 0);
+        let acc = 0;
+        const data = this.dripData ??= new Float32Array(MAX_DRIPS * 12);
+        data.fill(0);
+        list.forEach((e, i) => {
+            acc += wts[i] / sum;
+            // the drops land within 30 m of the camera along each side: thin them to about DRIP_DENSITY per metre there
+            const seen = Math.min(60, 2 * e.hx) * 2 + (e.alongX ? 0 : Math.min(60, 2 * e.hz) * 2);
+            const keep = Math.min(1, DRIP_DENSITY * seen / (DRIP_PARTICLES * wts[i] / sum));
+            data.set([e.x, e.z, e.hx, e.hz, e.cs, e.sn, e.y, Math.max(e.drop, 0.5), acc, e.alongX ? 1 : 0, keep, 0], i * 12);
+        });
+        F.set('drips', [list.length, 0, 0, 0]);
+        F.set('dripEdges', data);
+        return list.length;
     }
 
     // blockerHit in WGSL: the ray from o along d enters box b
@@ -3028,6 +3160,167 @@ class Village extends Entity {
         }
         const ov = [cx - dir[0] * R * 0.9 - along[0] * R * 0.6, cz - dir[1] * R * 0.9 - along[1] * R * 0.6];
         this.spots.overview = { pos: [ov[0], f.sample(...ov) + 90, ov[1]], look: [cx, f.sample(cx, cz), cz] };
+    }
+}
+
+// A town's central bus station: a long cantilevered concrete canopy on one row of pillars, deep fascia, ribbed soffit and a
+// glazed clerestory along its spine, over an island platform with benches, a kiosk and bay signs. Buses stand nose-in
+// at the bays on one side, a drive-through lane runs along the other, and a terminal building closes one end. The ground
+// is levelled under it (`level` m around `pos`). Parameters: pos, yaw (degrees; the canopy runs along it), length and
+// width (m of canopy; 96 x 30), bays, buses, seed. Viewpoints (`spot`): "platform" (under the canopy), "forecourt", "overview".
+class BusStation extends Entity {
+    stamp(f) {
+        const d = this.def, [cx, cz] = d.pos, r0 = d.level ?? 200, r1 = r0 + 300;
+        let sum = 0, n = 0;
+        f.each(cx - r0, cz - r0, cx + r0, cz + r0, (idx, x, z) => { if (Math.hypot(x - cx, z - cz) < r0) { sum += f.h[idx]; n++; } });
+        const flat = n ? sum / n : f.sample(cx, cz);
+        f.each(cx - r1, cz - r1, cx + r1, cz + r1, (idx, x, z) => {
+            const k = 1 - smoothstep(r0, r1, Math.hypot(x - cx, z - cz));
+            if (k > 0) f.h[idx] = lerp(f.h[idx], flat, k);
+        });
+    }
+
+    get anchor() { const p = this.def.pos; return [p[0], this.world.field.sample(p[0], p[1]) + (this.def.labelHeight ?? 90), p[1]]; }
+    get focus() { const p = this.def.pos; return [p[0], this.world.field.sample(p[0], p[1]), p[1]]; }
+
+    build(S) {
+        const d = this.def, C = STRUCT_COLORS, rnd = mulberry32(d.seed ?? 3), r = (a, b) => a + (b - a) * rnd();
+        const f = new GroundFrame(d.pos, (d.yaw ?? 20) * DEG), L = (d.length ?? 96) / 2;
+        const canopy = [0.80, 0.78, 0.72], pillar = [0.62, 0.60, 0.56], tiles = [0.56, 0.55, 0.52], red = [0.58, 0.12, 0.09];
+        const at = (x, z) => S.ground(...f.xz(x, z));
+        const foot = [];
+        for (let x = -L - 34; x <= L + 16; x += 8) for (let z = -30; z <= 30; z += 6) foot.push(at(x, z));
+        const gLo = Math.min(...foot) - 0.6, gHi = Math.max(...foot), plat = gHi + 0.18;
+
+        // forecourt and lanes: concrete paving, asphalt lanes either side of the island platform, painted bays
+        const strip = (x0, z0, x1, z1, col, mat, lift) => S.strip(f.xz(x0, (z0 + z1) / 2), f.xz(x1, (z0 + z1) / 2), (z1 - z0) / 2, col, mat, lift);
+        strip(-L - 34, -30, L + 16, 30, tiles, 0, 0.12);
+        strip(-L - 2, 7.5, L + 10, 25, C.asphalt, 3, 0.16);           // nose-in bays
+        strip(-L - 2, -21, L + 10, -7.5, C.asphalt, 3, 0.16);         // drive-through lane
+        const bays = d.bays ?? 20, bw = (2 * L - 4) / bays;
+        for (let i = 0; i <= bays; i++) {
+            const x = -L + 2 + i * bw;
+            S.strip(f.xz(x, 8), f.xz(x, 21), 0.08, C.paint, 0, 0.18);
+        }
+        for (let x = -L; x < L + 8; x += 9) S.strip(f.xz(x, -14.2), f.xz(x + 4, -14.2), 0.08, C.paint, 0, 0.18);
+        // island platform with kerbs
+        S.box(f, 0, 0, L, 7.5, gLo, plat, tiles);
+        for (const sz of [-1, 1]) S.box(f, 0, sz * 7.45, L, 0.12, gLo, plat + 0.02, C.concrete);
+
+        // the canopy: slab, deep fascia with an upstand, ribs under the slab, a spine beam on the pillars, clerestory
+        const hz = d.width ? d.width / 2 : 15, yt = plat + 6.2, yf = plat + 4.7, slab = yt - 0.4;
+        S.box(f, 0, 0, L, hz, slab, yt, canopy);
+        for (const sz of [-1, 1]) S.box(f, 0, sz * (hz - 0.15), L, 0.15, yf, yt + 0.2, canopy);
+        for (const sx of [-1, 1]) S.box(f, sx * (L - 0.15), 0, 0.15, hz, yf, yt + 0.2, canopy);
+        for (let x = -L + 4; x < L - 1; x += 4) S.box(f, x, 0, 0.18, hz - 0.3, slab - 0.75, slab, canopy);
+        S.box(f, 0, 0, L - 0.3, 0.55, slab - 1.4, slab, pillar);
+        S.box(f, 0, 0, L - 8, 3.5, yt, yt + 2.1, C.glass, 2);
+        S.box(f, 0, 0, L - 7.4, 4.1, yt + 2.1, yt + 2.5, canopy);
+        for (let x = -L + 8; x <= L - 8; x += 8) for (const sz of [-1, 1]) S.box(f, x, sz * 3.5, 0.08, 0.08, yt, yt + 2.1, C.metal, 4);
+        const pillars = [];
+        for (let x = -L + 6; x <= L - 5.9; x += 12) pillars.push(x);
+        for (const x of pillars) S.box(f, x, 0, 0.45, 0.45, plat, slab - 1.4, pillar);
+        // bay signs hanging under the fascia on the bays' side, and lights along the soffit
+        for (let i = 0; i < bays; i++) {
+            const x = -L + 2 + (i + 0.5) * bw;
+            S.box(f, x, hz - 0.45, 0.32, 0.03, yf - 0.55, yf - 0.05, red, 4);
+            S.box(f, x, hz - 0.49, 0.18, 0.012, yf - 0.47, yf - 0.13, [0.92, 0.92, 0.88]);
+        }
+        for (let x = -L + 2; x < L - 1; x += 4) for (const sz of [-hz * 0.75, -hz * 0.3, hz * 0.3, hz * 0.75]) S.box(f, x, sz, 0.6, 0.08, slab - 0.06, slab, [0.95, 0.93, 0.85], 2);
+
+        // on the platform: kiosk, benches, timetables, bins
+        const kx = -L * 0.3;
+        S.box(f, kx, 2.6, 2.2, 1.6, plat, plat + 2.4, [0.30, 0.31, 0.30], 4);
+        S.box(f, kx, 2.6, 2.3, 1.7, plat + 2.4, plat + 2.95, red, 4);
+        for (const sz of [-1, 1]) S.box(f, kx, 2.6 + sz * 1.62, 1.8, 0.02, plat + 0.9, plat + 2.2, C.glass, 2);
+        S.blocker(f, kx, 2.6, 2.3, 1.7, plat, plat + 2.95, 0.1);
+        for (let i = 0; i + 1 < pillars.length; i++) {
+            const x = (pillars[i] + pillars[i + 1]) / 2;
+            if (Math.abs(x - kx) < 4) continue;
+            for (const sz of [-1, 1]) {
+                const z = sz * 4.6;
+                S.box(f, x, z, 1.4, 0.22, plat + 0.42, plat + 0.48, C.wood);
+                S.box(f, x, z + sz * 0.2, 1.4, 0.03, plat + 0.48, plat + 0.95, C.wood);
+                for (const lx of [-1.2, 1.2]) S.box(f, x + lx, z, 0.04, 0.2, plat, plat + 0.42, C.metal, 4);
+            }
+            if (i % 2 === 0) {
+                S.box(f, x + 3.5, 0, 0.6, 0.06, plat + 0.6, plat + 2.2, [0.85, 0.85, 0.82]);
+                S.box(f, x + 3.5, 0, 0.66, 0.08, plat + 2.2, plat + 2.3, C.metal, 4);
+                S.box(f, x - 4.2, 1.6, 0.22, 0.22, plat, plat + 0.9, [0.20, 0.32, 0.20], 4);
+            }
+        }
+
+        // terminal building at the west end: offices and a waiting hall, window bands, a flat roof that overhangs
+        const tx = -L - 18, thx = 12, thz = 13, th = gHi + 7.6;
+        S.box(f, tx, 0, thx, thz, gLo, th, [0.74, 0.72, 0.66]);
+        for (const sz of [-1, 1]) {
+            S.box(f, tx, sz * (thz + 0.02), thx - 1, 0.03, gHi + 1.0, gHi + 3.0, C.window, 5);
+            S.box(f, tx, sz * (thz + 0.02), thx - 1, 0.03, gHi + 4.6, gHi + 6.4, C.window, 5);
+        }
+        S.box(f, tx + thx + 0.02, 0, 0.03, thz - 2, gHi + 0.2, gHi + 3.0, C.glass, 2);
+        S.box(f, tx - thx - 0.02, 0, 0.03, thz - 2, gHi + 4.6, gHi + 6.4, C.window, 5);
+        S.box(f, tx, 0, thx + 1.6, thz + 1.6, th, th + 0.45, canopy);
+        S.blocker(f, tx, 0, thx, thz, gLo, th, 0);
+        S.blocker(f, tx, 0, thx + 1.6, thz + 1.6, th, th + 0.45, 0.4, 0, gLo);
+        S.drip(f, tx, 0, thx + 1.6, thz + 1.6, th, th - gHi);
+        // railing along the forecourt's open side
+        for (let x = -L - 33; x <= L + 15; x += 2.5) S.box(f, x, -29.5, 0.03, 0.03, gHi + 0.12, gHi + 1.1, C.metal, 4);
+        S.box(f, -9, -29.5, L + 24, 0.03, gHi + 1.05, gHi + 1.12, C.metal, 4);
+        S.box(f, -9, -29.5, L + 24, 0.02, gHi + 0.55, gHi + 0.6, C.metal, 4);
+
+        // buses: nose-in at some bays, one in the drive-through lane
+        const liveries = [[0.16, 0.36, 0.18], [0.70, 0.66, 0.58], [0.14, 0.30, 0.48], [0.62, 0.16, 0.12]];
+        const bus = (bf, len) => {
+            const hl = len / 2, hw = 1.27;
+            const g = Math.max(...[[-hl, -hw], [hl, -hw], [hl, hw], [-hl, hw]].map(([x, z]) => S.ground(...bf.xz(x, z)))) + 0.16;
+            const col = liveries[Math.floor(rnd() * liveries.length)];
+            S.box(bf, 0, 0, hl, hw, g + 0.35, g + 3.15, col, 4);
+            S.box(bf, 0, 0, hl - 0.2, hw - 0.1, g + 3.15, g + 3.35, [0.82, 0.82, 0.80], 4);
+            for (const sz of [-1, 1]) S.box(bf, 0.4, sz * (hw + 0.02), hl - 1.3, 0.02, g + 1.25, g + 2.75, C.window, 5);
+            S.box(bf, hl + 0.02, 0, 0.02, hw - 0.12, g + 1.0, g + 2.85, C.window, 5);
+            S.box(bf, -hl - 0.02, 0, 0.02, hw - 0.3, g + 1.9, g + 2.85, C.window, 5);
+            for (const x of [-hl + 2.6, hl - 2.4]) for (const sz of [-1, 1]) S.box(bf, x, sz * (hw - 0.15), 0.5, 0.17, g, g + 1.0, [0.05, 0.05, 0.05]);
+            S.blocker(bf, 0, 0, hl, hw, g, g + 3.35, 0.35);
+        };
+        const nBus = Math.min(d.buses ?? 5, bays);
+        const used = new Set();
+        for (let k = 0; k < nBus - 1; k++) {
+            let i = Math.floor(rnd() * bays);
+            while (used.has(i)) i = (i + 1) % bays;
+            used.add(i);
+            const x = -L + 2 + (i + 0.5) * bw, len = r(11.5, 12.6);
+            bus(new GroundFrame(f.xz(x, 8.6 + len / 2), f.yaw + Math.PI / 2 + (rnd() < 0.5 ? Math.PI : 0)), len);
+        }
+        if (nBus > 0) bus(new GroundFrame(f.xz(r(-L * 0.4, L * 0.4), -11), f.yaw), 12.2);
+
+        // town-centre blocks around the forecourt: flat roofs, window bands per storey
+        const blocks = [[-L - 10, 52, 22, 9], [-L + 40, 50, 16, 8], [-L + 82, 54, 24, 10], [L + 4, 48, 14, 9],
+            [L + 38, 6, 10, 20], [-L - 10, -52, 24, 10], [-L + 44, -50, 18, 9], [L - 6, -54, 20, 11], [-L - 62, 6, 9, 18]];
+        for (const [bx, bz, bhx, bhz] of blocks) {
+            const storeys = 2 + Math.floor(rnd() * 4), top = gHi + 0.3 + storeys * 3.2;
+            const col = C.walls[Math.floor(rnd() * C.walls.length)];
+            S.box(f, bx, bz, bhx, bhz, gLo, top, col);
+            S.box(f, bx, bz, bhx + 0.25, bhz + 0.25, top, top + 0.5, C.concrete);
+            for (let k = 0; k < storeys; k++) {
+                const y0 = gHi + 1.2 + k * 3.2;
+                for (const sz of [-1, 1]) S.box(f, bx, bz + sz * (bhz + 0.02), bhx - 0.8, 0.02, y0, y0 + 1.5, C.window, 5);
+                for (const sx of [-1, 1]) S.box(f, bx + sx * (bhx + 0.02), bz, 0.02, bhz - 0.8, y0, y0 + 1.5, C.window, 5);
+            }
+            S.blocker(f, bx, bz, bhx, bhz, gLo, top + 0.5, 0);
+        }
+
+        // shader boxes: the canopy slab with its fascia (dry under it; the deep fascia keeps slanting rain off its
+        // edges), the clerestory, the pillars (sun shadows); rain runs off the fascia's edges
+        S.blocker(f, 0, 0, L, hz, yf, yt + 0.2, 0.55, 0, gLo);
+        S.blocker(f, 0, 0, L - 7.4, 4.1, yt, yt + 2.5, 0.2, 0, gLo);
+        for (const x of pillars) S.blocker(f, x, 0, 0.45, 0.45, plat, slab - 1.4, 0);
+        S.drip(f, 0, 0, L, hz, yf, yf - plat + 0.18);
+
+        this.spots = {
+            platform: { pos: f.at(-L * 0.55, plat + 1.65, -2.2), look: f.at(-L * 0.05, plat + 2.4, 24) },
+            forecourt: { pos: f.at(-L - 4, gHi + 1.7, -27), look: f.at(-L * 0.45, plat + 3.8, 2) },
+            overview: { pos: f.at(-L - 70, gHi + 34, -80), look: f.at(-L * 0.2, gHi, 0) },
+        };
     }
 }
 
@@ -3258,6 +3551,7 @@ const ENTITY_TYPES = {
     town: Town,
     forest: Forest,
     village: Village,
+    busStation: BusStation,
     storm: StormCell,
     supercell: Supercell,
     squall: SquallLine,
@@ -4045,6 +4339,9 @@ class FlyCamera {
 }
 
 // -------------------------------------------------------------------------------------------------- hud
+// what falling rain is called: by its rate (near-field intensity) and how fine its drops are
+const rainName = (rate, drops) => drops < 0.2 && rate < 0.3 ? 'drizzle' : rate < 0.3 ? 'light rain' : rate < 0.7 ? 'moderate rain'
+    : rate <= 1 ? 'heavy rain' : drops > 0.9 ? 'downpour' : 'torrential rain';
 const fmtKm = d => d < 1000 ? `${d.toFixed(0)} m` : `${(d / 1000).toFixed(d < 10000 ? 1 : 0)} km`;
 
 class Hud {
@@ -4060,14 +4357,14 @@ class Hud {
         this.help.innerHTML = [
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
-            '<b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
+            '<b>N</b> rain: drizzle / light / medium / downpour   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
             '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
             'drop a scenario .json on the page',
         ].join('\n');
     }
 
     setStates(weather) {
-        this.statesEl.innerHTML = weather.names.map((n, i) => `<b>${i + 1}</b> <span class="${n === weather.target ? 'sel' : ''}">${n}</span>`).join('\n')
+        this.statesEl.innerHTML = weather.names.map((n, i) => `<b>${RAIN_VARIANTS.includes(n) ? 'N' : i < 9 ? i + 1 : '·'}</b> <span class="${n === weather.target ? 'sel' : ''}">${n}</span>`).join('\n')
             + `\n<b>0</b> auto cycle ${weather.cycle.enabled ? '<span class="sel">on</span>' : 'off'}`;
     }
 
@@ -4086,7 +4383,7 @@ class Hud {
         const wind = Math.hypot(...c.wind), dirDeg = (Math.atan2(c.wind[0], -c.wind[1]) / DEG + 360) % 360;
         const from = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(((dirDeg + 180) % 360) / 45) % 8];
         const here = p.rain + p.snow < 0.01 ? (app.camera.pos[1] > c.base && app.probe.coverage > 0.5 ? '<span class="m">in cloud</span>' : '<span class="m">dry</span>')
-            : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">${p.rain > 1 ? 'torrential rain' : 'rain'} ${(p.rain * 100).toFixed(0)}%</span>`;
+            : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">${rainName(p.rain, c.drops)} ${(p.rain * 100).toFixed(0)}%</span>`;
         const q = QUALITY[app.quality], cw = app.renderer.cloudPass;
         const lines = [
             `<span class="t">ENTITY CLOUD // ${w.scenario.name || 'scenario'}</span>`,
@@ -4244,6 +4541,15 @@ class App {
                     this.hud.toast(`Lighting: ${this.lightName}`);
                     break;
                 }
+                case 'KeyN': {
+                    // step through the rain variants: drizzle, light rain, medium rain, downpour
+                    const names = RAIN_VARIANTS.filter(n => wx.states[n]);
+                    if (!names.length) { this.hud.toast('No rain variants in this scenario'); break; }
+                    wx.set(names[(names.indexOf(wx.target) + 1) % names.length]);
+                    this.hud.toast(`Rain: ${wx.target}`);
+                    this.hud.setStates(wx);
+                    break;
+                }
                 case 'KeyR': this.radar = !this.radar; break;
                 case 'KeyG': this.tiles = !this.tiles; this.hud.toast(`Cloud tile pre-pass: ${this.tiles ? 'on' : 'off'}`); break;
                 case 'KeyF': this.froxels = !this.froxels; this.hud.toast(`Froxel lighting: ${this.froxels ? 'on' : 'off'}`); break;
@@ -4329,7 +4635,10 @@ class App {
         this.shadowSlices = full ? 1 : SHADOW_SLICES;
         F.set('froxel', [FROXEL_NEAR, cfg.maxDistance, this.froxels ? 1 : 0, 0]);
         F.set('post', [q.blur || 0, this.tiles ? 1 : 0, 0, 0]);
-        w.structures.write(F, cam.pos, sky.dir, c.wind, w.weather.freezingLevel);
+        // heavy rain: up to three times the drops (big drops, past intensity 0.6)
+        this.rainParticles = Math.round(cfg.particles * (1 + 2 * sat01((this.near.rain - 0.6) / 0.8) * c.drops));
+        F.set('rain', [c.drops, rainFall(c.drops), c.rain, this.rainParticles]);
+        this.drips = w.structures.write(F, cam.pos, sky.dir, c.wind, w.weather.freezingLevel, rainFall(c.drops));
         F.set('misc', [c.temperature, this.time * cfg.fallSpeed % 52000, f.base, wdt]);
         w.lightning.write(F);
 
@@ -4378,13 +4687,14 @@ class App {
         this.probe = r.weatherPass.probe;
         this.near = this.nearPrecip();
         // under a roof or a deck: the way the drops come (as rainBack in WGSL) is blocked
-        const c = w.weather.cur, fall = this.near.snow > this.near.rain ? 1.35 : 9.5;
+        const c = w.weather.cur, fall = this.near.snow > this.near.rain ? 1.35 : rainFall(c.drops);
         this.sheltered = this.near.rain + this.near.snow > 0.01 && w.structures.shelters(this.camera.pos, v3.norm([-c.wind[0] * 0.8, fall, -c.wind[1] * 0.8]));
 
         this.writeFrame(dt, wdt);
         const enc = r.device.createCommandEncoder();
         const total = this.near.rain + this.near.snow;
-        r.render(enc, this.probeTexel, total > 0.005 ? this.cfg.particles : 0, w.lightning.count, QUALITY[this.quality].interleave, this.shadowSlices, this.froxels, this.mode !== 1, this.tiles);
+        const particles = total > 0.005 ? this.rainParticles + (this.drips && this.near.rain > 0.02 ? DRIP_PARTICLES : 0) : 0;
+        r.render(enc, this.probeTexel, particles, w.lightning.count, QUALITY[this.quality].interleave, this.shadowSlices, this.froxels, this.mode !== 1, this.tiles);
         r.device.queue.submit([enc.finish()]);
         r.weatherPass.afterSubmit();
         r.profiler.afterSubmit();
