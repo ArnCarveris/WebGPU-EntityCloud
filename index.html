@@ -103,6 +103,8 @@
                                   footbridge that keep the rain off what lies under them
                         busStation { pos, yaw (degrees), length, width (m of canopy), bays, buses, level (m levelled around pos), seed }:
                                   a cantilevered concrete canopy over an island platform, bays with buses, a terminal
+              vehicle   bus { from (busStation id), to (village id), speed, village (m/s), dwell [station, village] s, livery [r, g, b] }:
+                                  a bus to ride, on a road it builds between them; its cabin is a rain shelter that moves
               weather  storm { pos, radius, top, precip, core, coreOffset, life [grow, mature, decay] s, lightning (per min), virga, drift,
                                velocity, pinned, hold, shelf, laminar, green, wallCloud }
                        supercell { ...storm, mothership plate stack: stackRadius, stackDrop, stackHeight, plates, twist, spin (rad/s),
@@ -112,7 +114,8 @@
                        spawner { area [x0, z0, x1, z1], rate (cells per weather hour), max, initial, seed, template { key: [min, max] } }
     lighting  start, presets { name: { azimuth, elevation, intensity, exposure } }
     views     { name, pos [x, y, z], look [x, y, z] } or { name, follow (entity id), offset [x, height above ground, z], lookOffset }
-              or { name, follow (entity id), spot (a viewpoint it laid out) }; optional lighting (preset name) and weather (state name)
+              or { name, follow (entity id), spot (a viewpoint it laid out; a bus's "seat") }; optional lighting (preset name),
+              weather (state name) and walk (true: on foot from there)
 -->
 <script type="application/json" id="scenario">
 {
@@ -205,6 +208,8 @@
           "houses": 28, "footbridge": 170, "seed": 9 },
         { "type": "busStation", "id": "station", "label": "Brightfield bus station", "pos": [-3600, 8400], "yaw": 20, "length": 96,
           "bays": 20, "buses": 5, "seed": 3 },
+        { "type": "bus", "id": "bus", "label": "Bus 7", "from": "station", "to": "village", "speed": 22, "village": 10,
+          "dwell": [60, 30], "livery": [0.12, 0.36, 0.62] },
 
         { "type": "supercell", "id": "hero", "label": "Supercell", "pos": [1500, -2500], "radius": 6200, "top": 11800, "precip": 1.0,
           "core": 0.75, "coreOffset": [900, 800], "life": [900, 2400, 1200], "lightning": 5, "virga": 0.12, "pinned": true,
@@ -245,6 +250,8 @@
         { "name": "Bus station platform",  "follow": "station", "spot": "platform", "weather": "medium rain" },
         { "name": "Bus station forecourt", "follow": "station", "spot": "forecourt", "weather": "downpour" },
         { "name": "Bus station overview",  "follow": "station", "spot": "overview", "weather": "light rain" },
+        { "name": "On foot at the bus station", "follow": "station", "spot": "platform", "weather": "medium rain", "walk": true },
+        { "name": "Riding the bus",        "follow": "bus", "spot": "seat", "weather": "medium rain", "walk": true },
         { "name": "Shelf cloud",   "follow": "squall", "offset": [7000, 25, 1500], "lookOffset": [-4000, 2100, -2500],
           "lighting": "storm dusk", "weather": "severe storms" },
         { "name": "Mothership",    "follow": "hero", "offset": [-5500, 25, 8000], "lookOffset": [0, 3000, 0],
@@ -271,7 +278,11 @@
 //      haze with crepuscular rays from the shadow map; then temporal reprojection. The light reaching the rain, snow
 //      and haze (cloud shadow, shadow cast by the shafts themselves, sky light, lightning) comes from a froxel volume
 //      filled just before the march.
-//   6. Final (render): composite + tonemap, near-field rain streaks / snow flakes around the camera, lightning bolts, radar.
+//   6. Final (render): composite + tonemap, near-field rain streaks / snow flakes around the camera, the bus's windows,
+//      lightning bolts, radar.
+//
+// On foot (Walker) the camera walks on the terrain and the structures and can board a bus (BusLine) that drives between
+// the bus station and the village. Its cabin is one box in the frame uniform: no rain, snow or volumetrics inside it.
 //
 // The world is data (the scenario JSON above). Every entity is a class in ENTITY_TYPES: terrain features stamp the heightmap
 // and paint land use; structures build meshes on it; storm cells live, drift with the wind, rain and flash; spawners keep
@@ -342,6 +353,17 @@ const LAYER_DEFAULTS = {
 };
 const LAYER_KINDS = { heap: 0, sheet: 1, cellular: 2 };
 const TIME_SCALES = [1, 5, 10, 20, 40, 80, 160];
+// The bus (BusLine) in its own frame: x forward (the front at +hl), y up from the road, z to its right, where the doors are.
+// The side windows fill `bays` bays of `bay` m from bay0, a pillar between each; the front door fills bay 7, the middle
+// door bay 3. Its body, from the skirt to the roof, is the cabin: no rain, snow or volumetrics inside it (inCabin in WGSL)
+const BUS = {
+    hl: 6, hw: 1.27, floor: 0.36, ceil: 2.5, roof: 2.92, skirt: 0.3, winLo: 1.05, winHi: 2.25, bay0: -5.65, bay: 1.4125, bays: 8,
+    pillar: 0.12, doorBays: [7, 3], axleF: 3.4, axleR: -3.1, wheel: 0.5, wall: 0.07,
+};
+const BUS_IN = 64;           // material flag: inside the cabin (lit through its windows and by its lamps, see fsBus)
+const BUS_LEAF = [8, 16];    // material flags: door leaves that slide toward -x / +x as the doors open (busVertex)
+// walking (Walker): body radius, highest step, eye height (m), speeds (m/s)
+const WALK = { radius: 0.2, step: 0.5, head: 1.75, eye: 1.62, speed: 1.5, run: 4.5 };
 
 // -------------------------------------------------------------------------------------------------- math
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
@@ -634,6 +656,13 @@ const FRAME_LAYOUT = [
     ['dripEdges', `array<vec4f, ${MAX_DRIPS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, edge height, drop to the ground] [share of drops up to this edge, edges (0 all four, 1 along local x), share of its drops kept, -]
     ['blockers', `array<vec4f, ${MAX_BLOCKERS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, bottom, top] [sky occlusion, slope, -, -]
     ['blockGrid', `array<vec4u, ${BLOCK_GRID * BLOCK_GRID}>`], // per cell of blockBox: bit k set if box k can shade a point in it
+    // the bus (BusLine): its frame to clip space (built in doubles about the camera, so it does not jitter), to world and back
+    ['busMVP', 'mat4x4f'],
+    ['busModel', 'mat4x4f'],
+    ['busInv', 'mat4x4f'],
+    ['cabinLo', 'vec4f'],   // its body in its frame (inCabin): min corner, bus on
+    ['cabinHi', 'vec4f'],   // max corner, -
+    ['busInfo', 'vec4f'],   // speed (m/s), doors open (0..1), -, -
 ];
 
 class FrameBlock {
@@ -1365,12 +1394,45 @@ fn structureLight(p: vec3f, sun: bool, rain: bool) -> vec3f {
             let k = i32(w * 32u + countTrailingZeros(bits));
             bits &= bits - 1u;
             if (doSun && o.x > 0.0 && blockerHit(k, p, s)) { o.x = 0.0; }
-            if (rain && o.y > 0.0 && blockerHit(k, p, r)) { o.y = 0.0; }
+            // a moving box (the bus) does not leave a dry patch: the ground it passes over stays wet
+            if (rain && o.y > 0.0 && F.blockers[k * 3 + 2].z < 0.5 && blockerHit(k, p, r)) { o.y = 0.0; }
             let ao = F.blockers[k * 3 + 2].x;
             if (ao > 0.0 && blockerHit(k, p, vec3f(0.0, 1.0, 0.0))) { o.z = min(o.z, 1.0 - ao); }
         }
     }
     return o;
+}
+
+// The bus's cabin: one box in the bus's frame (F.busInv), so the tests are O(1). Inside it no rain or snow falls (near-
+// field drops, drips) and the volumetric march takes nothing (rain shafts, haze): a rain shelter that moves.
+fn busLocal(p: vec3f) -> vec3f { return (F.busInv * vec4f(p, 1.0)).xyz; }
+
+fn inCabin(p: vec3f) -> bool {
+    if (F.cabinLo.w < 0.5) { return false; }
+    let q = busLocal(p);
+    return all(q > F.cabinLo.xyz) && all(q < F.cabinHi.xyz);
+}
+
+// where the ray from o along unit d is inside the cabin: [t in, t out] (t out < t in when it misses)
+fn cabinSpan(o: vec3f, d: vec3f) -> vec2f {
+    if (F.cabinLo.w < 0.5) { return vec2f(1.0, 0.0); }
+    let q = busLocal(o);
+    let ld = (F.busInv * vec4f(d, 0.0)).xyz;
+    let inv = 1.0 / select(ld, vec3f(1e-6), abs(ld) < vec3f(1e-6));
+    let a = (F.cabinLo.xyz - q) * inv;
+    let b = (F.cabinHi.xyz - q) * inv;
+    let tn = max(max(min(a.x, b.x), min(a.y, b.y)), min(a.z, b.z));
+    let tf = min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z));
+    return vec2f(max(tn, 0.0), tf);
+}
+
+// a bus vertex in its frame: door leaves (material flags ${BUS_LEAF[0]}, ${BUS_LEAF[1]}) slide apart outside the body as the doors open
+fn busVertex(p: vec3f, mat: f32) -> vec3f {
+    let m = u32(mat + 0.5);
+    let o = F.busInfo.y;
+    if ((m & ${BUS_LEAF[0]}u) != 0u) { return p + vec3f(-0.6 * o, 0.0, 0.07 * smoothstep(0.0, 0.25, o)); }
+    if ((m & ${BUS_LEAF[1]}u) != 0u) { return p + vec3f(0.6 * o, 0.0, 0.07 * smoothstep(0.0, 0.25, o)); }
+    return p;
 }
 `;
 
@@ -1933,6 +1995,8 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
         let rainPhase = mix(hg(mu, 0.75), hg(mu, 0.0), 0.45);
         // rays through the structures' bounds: no rain under their roofs and decks
         let sheltered = F.blocks.x > 0.5 && rayBox(ro, dir, vec3f(F.blockBox.x, F.blocks.y, F.blockBox.y), vec3f(F.blockBox.z, F.blocks.z, F.blockBox.w), t0, t1);
+        // the stretch of the ray inside the bus's cabin (one box test per ray): no rain, snow or haze in there
+        let cab = cabinSpan(ro, dir);
         let snowPhase = mix(hg(mu, 0.45), hg(mu, 0.0), 0.6);
         for (var i = 0; i < N; i++) {
             let fa = f32(i) / f32(N);
@@ -1975,7 +2039,9 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                     emptyRun = 0;
                 } else { emptyRun++; }
             }
-            if (p.y < base + 700.0) {
+            if (t > cab.x && t < cab.y) {
+                // in the bus: sheltered, nothing to take
+            } else if (p.y < base + 700.0) {
                 // light from the froxel volume, or evaluated here (z < 0: lightning not looked up yet)
                 var fx = vec3f(0.0, 0.0, -1.0);
                 if (froxels) { fx = froxelAt(p); } else { fx = vec3f(shadowAt(p), -1.0); }
@@ -2267,12 +2333,80 @@ struct StructOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @lo
     return o;
 }
 
-@fragment fn fsStruct(i: StructOut) -> @location(0) vec4f {
-    let p = i.world;
+@fragment fn fsStruct(i: StructOut) -> @location(0) vec4f { return vec4f(shadeStruct(i.world, i.n, i.col.rgb, i32(i.col.a + 0.5)), 1.0); }
+
+// the moving bus (BusLine): its mesh is in its own frame (busVertex), drawn with F.busMVP
+@vertex fn vsBus(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec4f) -> StructOut {
+    let q = busVertex(p, c.a);
+    var o: StructOut;
+    o.world = (F.busModel * vec4f(q, 1.0)).xyz;
+    o.n = (F.busModel * vec4f(n, 0.0)).xyz;
+    o.col = c;
+    o.pos = F.busMVP * vec4f(q, 1.0);
+    return o;
+}
+
+// the sun reaches q (in the bus's frame) through glass: where its ray d leaves the body, if that is in a side window (not a
+// pillar), the windscreen or the rear window. O(1): one box exit
+fn throughGlass(q: vec3f, d: vec3f) -> f32 {
+    let inv = 1.0 / select(d, vec3f(1e-6), abs(d) < vec3f(1e-6));
+    let t = max((F.cabinLo.xyz - q) * inv, (F.cabinHi.xyz - q) * inv);
+    let te = min(t.x, min(t.y, t.z));
+    let e = q + d * te;
+    if (te == t.z) {
+        // side: the window band, or a door's glass (lower) on the right
+        let k = (e.x - ${BUS.bay0}) / ${BUS.bay};
+        let bay = floor(k);
+        let inPane = abs(fract(k) - 0.5) * ${BUS.bay} < ${(BUS.bay - BUS.pillar) / 2} && bay >= 0.0 && bay < ${BUS.bays}.0;
+        let door = d.z > 0.0 && (bay == ${BUS.doorBays[0]}.0 || bay == ${BUS.doorBays[1]}.0);
+        let lo = select(${BUS.winLo}, ${BUS.floor + 0.35}, door);
+        return select(0.0, 1.0, inPane && e.y > lo && e.y < ${BUS.winHi});
+    }
+    if (te == t.x) {
+        if (d.x > 0.0) { return select(0.0, 1.0, e.y > 0.95 && e.y < 2.45); }
+        return select(0.0, 1.0, e.y > 1.4 && e.y < 2.3 && abs(e.z) < 0.9);
+    }
+    return 0.0;                                                          // roof or floor
+}
+
+// inside the cabin: sky light that comes in through the windows (less low down, under them), the sun where it shines in
+// through glass, and the ceiling lamps, whose light the eye adapts to (so they read the same at any exposure)
+fn shadeCabin(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
     let v = normalize(F.cam.xyz - p);
-    var n = normalize(i.n);
+    var n = normalize(nIn);
+    if (dot(n, v) < 0.0) { n = -n; }
+    let sh = shadowAt(p);
+    let s = F.sunDir.xyz;
+    let q = busLocal(p + n * 0.02);
+    let ls = (F.busInv * vec4f(s, 0.0)).xyz;
+    var sun = 0.0;
+    if (s.y > 0.0 && sh.x * dot(n, s) > 0.002) { sun = throughGlass(q, ls); }
+    let out = structureLight(p, sun > 0.0, false);                     // a canopy over the bus shades it too
+    let low = smoothstep(${BUS.floor}, ${BUS.winHi}, q.y);
+    let sky = F.ambient.rgb * sh.y * out.z * (0.10 + 0.22 * low) * (0.7 + 0.3 * abs(n.y));
+    let lamp = vec3f(1.0, 0.93, 0.80) * 0.16 / max(F.sunCol.w, 0.2) * (0.35 + 0.65 * sat(-n.y * 0.5 + 0.5));
+    let alb = colIn * (0.92 + 0.16 * vnoise2(vec2f(q.x + q.z, q.y) * 9.0));
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sun * out.x + sky + lamp);
+    if (mat == 4) {
+        let r = reflect(-v, n);
+        col += (skyColor(r) * sh.y * 0.25 + lamp * 0.5) * (0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0)) * 0.3;
+    }
+    return col;
+}
+
+@fragment fn fsBus(i: StructOut) -> @location(0) vec4f {
+    let m = u32(i.col.a + 0.5);
+    let mat = i32(m & 7u);
+    if (mat == 7) { return vec4f(i.col.rgb * 1.6 / max(F.sunCol.w, 0.2), 1.0); }   // lamps, lights, the destination display
+    if ((m & ${BUS_IN}u) != 0u) { return vec4f(shadeCabin(i.world, i.n, i.col.rgb, mat), 1.0); }
+    return vec4f(shadeStruct(i.world, i.n, i.col.rgb, mat), 1.0);
+}
+
+// a structure surface lit by the sky and the sun, under the cloud shadow, wet or snowy where the weather reaches it
+fn shadeStruct(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
+    let v = normalize(F.cam.xyz - p);
+    var n = normalize(nIn);
     if (dot(n, v) < 0.0) { n = -n; }                                  // thin panels are seen from both sides
-    let mat = i32(i.col.a + 0.5);
     // weather on it: snow settles on what faces up, rain wets what it reaches (walls less than roofs and roads)
     let gs = groundAt(p.xz);
     let sh = shadowAt(p);
@@ -2280,7 +2414,7 @@ struct StructOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @lo
     let sl = structureLight(p + n * 0.06, sh.x * dot(n, s) > 0.002, gs.x + gs.y > 0.002 && mat != 6);
     let snow = sat(gs.x * 3.0) * smoothstep(0.55, 0.85, n.y) * sl.y * select(1.0, 0.0, mat == 6);
     let wet = gs.y * sl.y * (0.35 + 0.65 * sat(n.y)) * (1.0 - snow);
-    var alb = i.col.rgb * (0.9 + 0.2 * vnoise2(vec2f(p.x + p.z, p.y) * 1.7 + n.xz * 13.0));
+    var alb = colIn * (0.9 + 0.2 * vnoise2(vec2f(p.x + p.z, p.y) * 1.7 + n.xz * 13.0));
     let glass = mat == 2 || mat == 5;
     if (!glass) { alb *= 1.0 - select(0.35, 0.55, mat == 3) * wet; }
     alb = mix(alb, vec3f(0.85, 0.88, 0.92), snow);
@@ -2298,7 +2432,7 @@ struct StructOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @lo
         let fw = 0.02 + 0.98 * pow(1.0 - max(v.y, 0.0), 5.0);
         col = vec3f(0.01, 0.02, 0.025) * F.ambient.rgb * sl.z + spec * fw;
     }
-    return vec4f(col, 1.0);
+    return col;
 }
 `;
 
@@ -2450,7 +2584,7 @@ fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
     let p = top + (wind - vec3f(0.0, 4.9, 0.0)) * ts * ts;
     let vel = (wind * 2.0 - vec3f(0.0, 9.81, 0.0)) * ts - vec3f(0.0, 0.4, 0.0);
     let dist = distance(p, F.cam.xyz);
-    if (dist > 120.0) { return; }
+    if (dist > 120.0 || inCabin(p)) { return; }
     let a = F.viewProj * vec4f(p, 1.0);
     let b = F.viewProj * vec4f(p - vel * 0.05, 1.0);
     if (a.w < 0.5 || b.w < 0.5) { return; }
@@ -2485,6 +2619,8 @@ fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
     if (isSnow) { p += vec3f(sin(t * 1.3 + seed.x * 40.0), 0.0, cos(t * 1.1 + seed.z * 40.0)) * 0.8; }
     let rel = (fract((p - F.cam.xyz) / box + 0.5) - 0.5) * box;
     let wp = F.cam.xyz + rel;
+    // none inside the bus
+    if (inCabin(wp)) { return o; }
     // none under roofs and decks or in the lee of walls: the path back up against this drop's fall meets a structure
     if (nearStructures(wp)) {
         let back = normalize(-vel);
@@ -2525,6 +2661,64 @@ fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
     let across = 1.0 - abs(i.uv.y);
     let a = select(i.col.w * across, i.col.w * smoothstep(0.0, 0.6, across), i.uv.x > 0.5);
     return vec4f(tonemap(i.col.rgb), a);
+}
+
+// the bus's windows, drawn over the composite (they write no depth, so the march and the particles see through them):
+// a faint grey tint, the sky reflected at grazing angles, and rain drops on them while it rains, which the wind of the
+// bus's speed streaks back along the side windows. O(1) per pixel: one hash per 2.5 cm cell
+struct GlassOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @location(1) n: vec3f, @location(2) local: vec3f, @location(3) kind: f32 };
+
+@vertex fn vsGlass(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec4f) -> GlassOut {
+    let q = busVertex(p, c.a);
+    var o: GlassOut;
+    o.world = (F.busModel * vec4f(q, 1.0)).xyz;
+    o.n = (F.busModel * vec4f(n, 0.0)).xyz;
+    o.local = q;
+    o.kind = f32(u32(c.a + 0.5) & 7u);
+    o.pos = F.busMVP * vec4f(q, 1.0);
+    return o;
+}
+
+@fragment fn fsGlass(i: GlassOut) -> @location(0) vec4f {
+    let p = i.world;
+    let v = normalize(F.cam.xyz - p);
+    var n = normalize(i.n);
+    if (dot(n, v) < 0.0) { n = -n; }
+    let sh = shadowAt(p);
+    let s = F.sunDir.xyz;
+    let r = reflect(-v, n);
+    let fres = 0.04 + 0.96 * pow(1.0 - abs(dot(n, v)), 5.0);
+    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 600.0) * 6.0;
+    // drops: a hashed 2 cm cell holds one or not (more of them the harder it rains), 2-5 mm across; they come and go.
+    // On the side windows the wind of the bus's speed draws them out backwards into thin streaks (cells up to 8 times
+    // longer along the bus, the drop as long), and sweeps some away
+    let rain = sat(F.near.x * 1.5);
+    var drop = 0.0;
+    var rim = 0.0;
+    if (rain > 0.01) {
+        let side = i.kind < 0.5;
+        let u = select(i.local.z, i.local.x, side);
+        let k = select(0.0, sat(F.busInfo.x / 15.0), side);
+        let stretch = 1.0 + 7.0 * k;
+        let g = vec2f(u / (0.02 * stretch), i.local.y / 0.02 + u * 3.0 * k);    // streaks run back and a little down
+        let cell = floor(g);
+        let cx = u32(cell.x + 100000.0);
+        let cy = u32(cell.y + 1000.0);
+        let life = floor(F.cam.w * mix(0.4, 1.5, k) + rnd(cx * 7919u + cy));
+        let h = rnd((cx * 73856093u) ^ (cy * 19349663u) ^ (u32(life) * 83492791u));
+        if (h < rain * mix(0.35, 0.2, k)) {
+            let c = vec2f(rnd(u32(h * 1e6)), rnd(u32(h * 1e6) + 7u)) * 0.5 + 0.25;
+            let d = length(fract(g) - c) / (0.12 + 0.12 * fract(h * 13.0));
+            drop = 1.0 - smoothstep(0.6, 1.0, d);
+            rim = smoothstep(0.25, 0.85, d);
+        }
+    }
+    // a drop is a little lens: the dark ground below shows in its middle, the bright sky above in its rim
+    let sky = F.ambient.rgb * sh.y;
+    let dropCol = mix(sky * 0.25, sky * 2.2 + F.sunCol.rgb * sh.x * 0.05, rim);
+    let a = sat(0.06 + fres * 0.85 + drop * 0.6);
+    let col = (spec * fres * (1.0 - drop) + vec3f(0.02, 0.025, 0.03) * F.ambient.rgb + dropCol * drop * 0.6) / a;
+    return vec4f(tonemap(col), a);
 }
 
 // lightning bolts: segment k = (bolts[2k] start + brightness, bolts[2k + 1] end + width in m)
@@ -2707,9 +2901,38 @@ const STRUCT_COLORS = {
 };
 
 class Structures {
-    constructor(field) { this.field = field; this.v = []; this.blockers = []; this.drips = []; }
+    constructor(field) { this.field = field; this.v = []; this.blockers = []; this.drips = []; this.solids = []; }
 
     ground(x, z) { return this.field.surface(x, z); }
+
+    // what a walker collides with (see Walker): every box, and the bridges' decks and parapets. { x, z, hx, hz, cs, sn,
+    // y0, y1 (at the centre), slope (m per m along local x) }. A top within a step of the feet is a floor, else a wall
+    solid(f, ox, oz, hx, hz, y0, y1, slope = 0) {
+        const [x, z] = f.xz(ox, oz);
+        this.solids.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y0, y1, slope });
+        this.solidGrid = null;
+    }
+
+    // the solids that reach within r of x, z (a 16 m grid over their footprints, built on first use)
+    solidsNear(x, z, r) {
+        const G = 16, key = (i, j) => i * 65536 + j;
+        if (!this.solidGrid) {
+            this.solidGrid = new Map();
+            for (const b of this.solids) {
+                const e = Math.hypot(b.hx, b.hz);
+                for (let i = Math.floor((b.x - e) / G); i <= Math.floor((b.x + e) / G); i++)
+                    for (let j = Math.floor((b.z - e) / G); j <= Math.floor((b.z + e) / G); j++) {
+                        const k = key(i, j);
+                        if (!this.solidGrid.has(k)) this.solidGrid.set(k, []);
+                        this.solidGrid.get(k).push(b);
+                    }
+            }
+        }
+        const out = new Set();
+        for (let i = Math.floor((x - r) / G); i <= Math.floor((x + r) / G); i++)
+            for (let j = Math.floor((z - r) / G); j <= Math.floor((z + r) / G); j++) for (const b of this.solidGrid.get(key(i, j)) || []) out.add(b);
+        return [...out];
+    }
 
     tri(a, b, c, col, mat = 0) {
         const n = v3.norm(v3.cross(v3.sub(b, a), v3.sub(c, a)));          // facing either way: the shader turns it to the eye
@@ -2723,6 +2946,7 @@ class Structures {
         for (let k = 0; k < 4; k++) this.quad(p(c[k], y0), p(c[(k + 1) % 4], y0), p(c[(k + 1) % 4], y1), p(c[k], y1), col, mat);
         this.quad(...c.map(q => p(q, y1)), col, mat);
         this.quad(...c.map(q => p(q, y0)), col, mat);
+        this.solid(f, ox, oz, hx, hz, y0, y1);
     }
 
     // a rectangular section swept along a path: at point k ([x, z]) it spans offsets o0..o1 along `side` (a horizontal
@@ -2749,6 +2973,16 @@ class Structures {
     drip(f, ox, oz, hx, hz, y, drop, alongX = false) {
         const [x, z] = f.xz(ox, oz);
         this.drips.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y, drop, alongX, per: alongX ? 4 * hx : 4 * (hx + hz) });
+    }
+
+    // a road along a curve (points [x, z]; neighbouring pieces share their edges), half width hw, lifted above the terrain
+    ribbon(pts, hw, col, mat = 3, lift = 0.14) {
+        const n = pts.length, side = pts.map((p, k) => {
+            const a = pts[Math.max(k - 1, 0)], b = pts[Math.min(k + 1, n - 1)], dx = b[0] - a[0], dz = b[1] - a[1], l = Math.hypot(dx, dz) || 1;
+            return [-dz / l, dx / l];
+        });
+        const edge = (k, o) => { const x = pts[k][0] + side[k][0] * o, z = pts[k][1] + side[k][1] * o; return [x, this.ground(x, z) + lift, z]; };
+        for (let k = 0; k + 1 < n; k++) this.quad(edge(k, -hw), edge(k, hw), edge(k + 1, hw), edge(k + 1, -hw), col, mat);
     }
 
     // a strip on the ground from a to b ([x, z]), half width hw, lifted a little above the terrain
@@ -2893,7 +3127,11 @@ class Structures {
             const slope = (top(t1) - top(t0)) / len, mid = (top(t0) + top(t1)) / 2;
             const dev = ks.map(k => top(lerp(t0, t1, k)) - lerp(top(t0), top(t1), k));
             const base = Math.min(...ks.map(k => this.ground(...at(lerp(t0, t1, k))))) - 1;
-            this.blocker(new GroundFrame(at(tm), yaw), 0, 0, len / 2, hw, mid + Math.max(...dev) - o.thick + 0.03, mid + Math.min(...dev) - 0.03, 0.55, slope, base);
+            const pf = new GroundFrame(at(tm), yaw);
+            this.blocker(pf, 0, 0, len / 2, hw, mid + Math.max(...dev) - o.thick + 0.03, mid + Math.min(...dev) - 0.03, 0.55, slope, base);
+            // to walk on: the deck, and its parapets or railings
+            this.solid(pf, 0, 0, len / 2, hw, mid - o.thick, mid + Math.max(...dev), slope);
+            for (const sg of [-1, 1]) this.solid(pf, 0, sg * (hw - 0.1), len / 2, 0.1, mid - o.thick, mid + Math.max(...dev) + 1.0, slope);
         }
         return top;
     }
@@ -2908,10 +3146,12 @@ class Structures {
         let list = this.blockers.filter(b => d(b) < BLOCK_RANGE + Math.hypot(b.hx, b.hz));
         if (list.length > MAX_BLOCKERS) list = list.sort((p, q) => d(p) - d(q)).slice(0, MAX_BLOCKERS);
         if (!list.length) { F.set('blocks', [0, 0, 0, 0]); this.listed = null; return drips; }
-        if (!this.listed || list.length !== this.listed.length || list.some((b, i) => b !== this.listed[i])) {
+        // moving boxes (the bus, `dyn`) are rewritten every frame
+        if (!this.listed || list.length !== this.listed.length || list.some((b, i) => b !== this.listed[i] || b.dyn)) {
             this.listed = list;
-            this.data = new Float32Array(MAX_BLOCKERS * 12);
-            list.forEach((b, i) => this.data.set([b.x, b.z, b.hx, b.hz, b.cs, b.sn, b.y0, b.y1, b.ao, b.slope, 0, 0], i * 12));
+            this.data ??= new Float32Array(MAX_BLOCKERS * 12);
+            this.data.fill(0);
+            list.forEach((b, i) => this.data.set([b.x, b.z, b.hx, b.hz, b.cs, b.sn, b.y0, b.y1, b.ao, b.slope, b.dyn ? 1 : 0, 0], i * 12));
             this.lo = Math.min(...list.map(b => Math.min(b.base, b.y0 - Math.abs(b.slope) * b.hx)));
             this.hi = Math.max(...list.map(b => b.y1 + Math.abs(b.slope) * b.hx));
         }
@@ -3060,11 +3300,12 @@ class Village extends Entity {
 
         // main road, with the bridge where it meets the river
         const span = river ? wetSpan(P, -R, R) : null;
-        let bA = R, bB = R;
+        let bA = R, bB = R, deck = null;
         this.spots = {};
         if (span) {
             bA = span[0] - 26; bB = span[1] + 26;
             const top = S.bridge(P(bA), P(bB), { width: 8, thick: 1.1, rise: 4, ramp: 22, arch: 1.5, parapet: true, surface: true, deck: C.stone, pier: C.stone, pierEvery: 24, pierHalf: 1.2 });
+            deck = { a: bA, b: bB, top };
             roads.push([P(bA), P(bB), 5]);
             // under the deck on the bank, looking along the river past the dry ground below it
             for (let t = 0.02; t < 0.5; t += 0.005) {
@@ -3100,6 +3341,9 @@ class Village extends Entity {
         taken.push([...stopC, 4], [...across, 10]);      // and an open lot across the road, so the shelter looks out on the street
         const toward = sB > sJ ? -1 : 1, aim = P(sB + toward * 35);       // out across the street, toward the junction
         this.spots['bus stop'] = { pos: stop.at(0.4, floor + 1.65, 0.15), look: [aim[0] - out[0] * 20, floor + 2.4, aim[1] - out[1] * 20] };
+        // for a bus line (BusLine): the main road runs through c along dir (s from -R to R), the bridge's deck over [a, b]
+        // (its height at t = (s - a) / (b - a)), the shelter `out` of the road at s
+        this.road = { c: [cx, cz], dir, R, half: roadHalf, deck, stop: { s: sB, out } };
 
         // houses along both streets, facing them
         const C2 = STRUCT_COLORS;
@@ -3263,10 +3507,18 @@ class BusStation extends Entity {
         S.blocker(f, tx, 0, thx, thz, gLo, th, 0);
         S.blocker(f, tx, 0, thx + 1.6, thz + 1.6, th, th + 0.45, 0.4, 0, gLo);
         S.drip(f, tx, 0, thx + 1.6, thz + 1.6, th, th - gHi);
+        // a bus line from here (BusLine) comes in through a gap in the railing, stops in the drive-through lane by the
+        // platform, and leaves past the east end; its road runs along the south side of the town blocks (local z = road)
+        const served = (this.world.scenario.entities || []).some(e => e.type === 'bus' && e.from === this.id);
+        this.frame = f;
+        this.busWay = served ? { lane: -9.2, road: -80, east: L + 21, gap: -L + 20, west: -L - 80, stop: 0 } : null;
         // railing along the forecourt's open side
-        for (let x = -L - 33; x <= L + 15; x += 2.5) S.box(f, x, -29.5, 0.03, 0.03, gHi + 0.12, gHi + 1.1, C.metal, 4);
-        S.box(f, -9, -29.5, L + 24, 0.03, gHi + 1.05, gHi + 1.12, C.metal, 4);
-        S.box(f, -9, -29.5, L + 24, 0.02, gHi + 0.55, gHi + 0.6, C.metal, 4);
+        const gap = x => served && Math.abs(x - this.busWay.gap) < 5;
+        for (let x = -L - 33; x <= L + 15; x += 2.5) if (!gap(x)) S.box(f, x, -29.5, 0.03, 0.03, gHi + 0.12, gHi + 1.1, C.metal, 4);
+        for (const [a, b] of served ? [[-L - 33, this.busWay.gap - 5], [this.busWay.gap + 5, L + 15]] : [[-L - 33, L + 15]]) {
+            S.box(f, (a + b) / 2, -29.5, (b - a) / 2, 0.03, gHi + 1.05, gHi + 1.12, C.metal, 4);
+            S.box(f, (a + b) / 2, -29.5, (b - a) / 2, 0.02, gHi + 0.55, gHi + 0.6, C.metal, 4);
+        }
 
         // buses: nose-in at some bays, one in the drive-through lane
         const liveries = [[0.16, 0.36, 0.18], [0.70, 0.66, 0.58], [0.14, 0.30, 0.48], [0.62, 0.16, 0.12]];
@@ -3291,7 +3543,11 @@ class BusStation extends Entity {
             const x = -L + 2 + (i + 0.5) * bw, len = r(11.5, 12.6);
             bus(new GroundFrame(f.xz(x, 8.6 + len / 2), f.yaw + Math.PI / 2 + (rnd() < 0.5 ? Math.PI : 0)), len);
         }
-        if (nBus > 0) bus(new GroundFrame(f.xz(r(-L * 0.4, L * 0.4), -11), f.yaw), 12.2);
+        if (nBus > 0) {
+            // the lane is the bus line's when it has one (the same draws either way, so the town looks the same)
+            const lx = r(-L * 0.4, L * 0.4);
+            if (served) rnd(); else bus(new GroundFrame(f.xz(lx, -11), f.yaw), 12.2);
+        }
 
         // town-centre blocks around the forecourt: flat roofs, window bands per storey
         const blocks = [[-L - 10, 52, 22, 9], [-L + 40, 50, 16, 8], [-L + 82, 54, 24, 10], [L + 4, 48, 14, 9],
@@ -3322,6 +3578,351 @@ class BusStation extends Entity {
             overview: { pos: f.at(-L - 70, gHi + 34, -80), look: f.at(-L * 0.2, gHi, 0) },
         };
     }
+}
+
+// --- vehicles
+
+// a path through control points { p: [x, z], r (corner radius, m) }: straight between them, the corners rounded by arcs,
+// resampled evenly about every `step` m. Closed: a loop starting at ctrl[0] (which should be on a straight), the last
+// point one step short of it; open: from the first point to the last
+function roundPath(ctrl, step = 1, closed = true) {
+    const n = ctrl.length, pts = [];
+    for (let i = 0; i < n; i++) {
+        if (!closed && (i === 0 || i === n - 1)) { pts.push(ctrl[i].p); continue; }
+        const A = ctrl[(i + n - 1) % n].p, B = ctrl[i].p, C = ctrl[(i + 1) % n].p;
+        const l1 = Math.hypot(B[0] - A[0], B[1] - A[1]), l2 = Math.hypot(C[0] - B[0], C[1] - B[1]);
+        const u1 = [(B[0] - A[0]) / l1, (B[1] - A[1]) / l1], u2 = [(C[0] - B[0]) / l2, (C[1] - B[1]) / l2];
+        const th = Math.acos(clamp(u1[0] * u2[0] + u1[1] * u2[1], -1, 1)), sg = Math.sign(u1[0] * u2[1] - u1[1] * u2[0]);
+        if (th < 1e-3) { pts.push(B); continue; }
+        // the arc is tangent to both legs, its centre on the side the path turns to (right of travel: (-z, x))
+        const dd = Math.min(ctrl[i].r * Math.tan(th / 2), 0.48 * Math.min(l1, l2)), r = dd / Math.tan(th / 2);
+        const P1 = [B[0] - u1[0] * dd, B[1] - u1[1] * dd], O = [P1[0] - u1[1] * sg * r, P1[1] + u1[0] * sg * r];
+        const a0 = Math.atan2(P1[1] - O[1], P1[0] - O[0]), k1 = Math.max(2, Math.ceil(th * r / 0.5));
+        for (let k = 0; k <= k1; k++) { const a = a0 + sg * th * k / k1; pts.push([O[0] + Math.cos(a) * r, O[1] + Math.sin(a) * r]); }
+    }
+    if (closed) pts.push(pts[0]);
+    const cum = [0];
+    for (let k = 1; k < pts.length; k++) cum.push(cum[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
+    const total = cum[cum.length - 1], N = Math.max(1, Math.round(total / step)), out = [];
+    for (let i = 0, k = 0; i < N + (closed ? 0 : 1); i++) {
+        const s = i * total / N;
+        while (k + 2 < cum.length && cum[k + 1] < s) k++;
+        const t = (s - cum[k]) / (cum[k + 1] - cum[k] || 1);
+        out.push([lerp(pts[k][0], pts[k + 1][0], t), lerp(pts[k][1], pts[k + 1][1], t)]);
+    }
+    return { pts: out, length: total, step: total / N };
+}
+
+// the polyline `o` m to the right of travel (right of a heading [x, z] is [-z, x]), mitred at the corners
+function offsetLine(pts, o) {
+    const nrm = (a, b) => { const dx = b[0] - a[0], dz = b[1] - a[1], l = Math.hypot(dx, dz); return [-dz / l, dx / l]; };
+    return pts.map((p, k) => {
+        const n1 = k > 0 ? nrm(pts[k - 1], p) : nrm(p, pts[1]), n2 = k + 1 < pts.length ? nrm(p, pts[k + 1]) : n1;
+        const m = [n1[0] + n2[0], n1[1] + n2[1]], d = m[0] * n1[0] + m[1] * n1[1];
+        return [p[0] + m[0] / d * o, p[1] + m[1] / d * o];
+    });
+}
+
+// A bus line between a bus station (`from`) and a village's bus stop (`to`): one bus (`label`, `livery` colour) drives a
+// loop from the station's platform, along a two-lane road (built here) to the village, through it to a turning loop
+// past its far end, and back; it stops by the village's shelter on the pass that has it on the right, and dwells at
+// each stop (`dwell` [station, village] s) with its doors open. Cruises at `speed` m/s, slower in the village (`village`
+// m/s) and the station. The bus can be walked into (Walker): its floor, walls, seats and doors are colliders in its frame.
+// Viewpoint (`spot`): "seat" (seated aboard).
+class BusLine extends Entity {
+    constructor(def, world) {
+        super(def, world);
+        this.s = 0;
+        this.v = 0;
+        this.doors = 1;
+        this.mode = 'dwell';
+        this.stop = 0;                   // the stop it stands at or drives to: 0 the station, 1 the village
+        this.clock = (def.dwell || [60, 30])[0];
+    }
+
+    spawn() { this.world.bus = this; }
+    get anchor() { const p = this.pose; return p ? [p.x, p.y + 5, p.z] : null; }
+    get focus() { const p = this.pose; return p ? [p.x, p.y, p.z] : null; }
+
+    build(S) {
+        const d = this.def, st = this.world.get(d.from), vil = this.world.get(d.to), f = this.world.field;
+        const W = st?.busWay, V = vil?.road;
+        if (!W || !V) throw new Error('bus: `from` must be a busStation and `to` a village');
+        const sf = (x, z) => st.frame.xz(x, z), P = s => [V.c[0] + V.dir[0] * s, V.c[1] + V.dir[1] * s];
+        const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+        const lane = 1.75, head = sf(W.west, W.road);
+        // into the village from the road end nearer the station, out past the other end
+        const sig = dist(P(V.R), head) < dist(P(-V.R), head) ? 1 : -1;
+        const E1 = P(sig * V.R), F2 = P(-sig * (V.R + 15));
+        const CL = [sf(W.east, W.road), sf(W.gap, W.road), head, E1, F2];        // the two-lane road's centre line
+        const out = offsetLine(CL, lane), back = offsetLine([F2, E1, head, sf(W.gap, W.road)], lane);
+        const u = [(F2[0] - E1[0]) / dist(F2, E1), (F2[1] - E1[1]) / dist(F2, E1)], rt = [-u[1], u[0]];
+        const T = (a, b) => [F2[0] + u[0] * a + rt[0] * b, F2[1] + u[1] * a + rt[1] * b];
+        // a balloon loop past the village's far end: out to the right, round to the left, back in the other lane
+        const turn = [T(14, 12), T(36, 11), T(44, -5), T(28, -17), T(10, -lane)];
+        const C = (p, r = 12) => ({ p, r });
+        const ctrl = [C(sf(W.stop, W.lane)), C(sf(W.east, W.lane), 11), ...out.map((p, k) => C(p, k === 3 ? 40 : 11)),
+            ...turn.map(p => C(p, 9)), ...back.map((p, k) => C(p, k === 1 ? 40 : 11)), C(sf(W.gap, W.lane), 10)];
+        const loop = roundPath(ctrl);
+        this.path = loop.pts;
+        this.len = loop.length;
+        this.step = loop.step;
+        const n = this.path.length;
+        // where each point is: 0 the station, 1 the open road, 2 the village, 3 the turning loop
+        const sc = st.frame.c, zone = p => dist(p, sc) < 160 ? 0 : dist(p, V.c) < V.R + 20 ? 2 : dist(p, T(25, 0)) < 40 ? 3 : 1;
+        this.zones = this.path.map(zone);
+        // road height: the bridge's deck in the village, else the terrain as drawn (the roads' lift)
+        const height = (x, z) => {
+            const rx = x - V.c[0], rz = z - V.c[1], s = rx * V.dir[0] + rz * V.dir[1], side = Math.abs(-rx * V.dir[1] + rz * V.dir[0]);
+            if (V.deck && side < 4.5 && s > V.deck.a && s < V.deck.b) return V.deck.top((s - V.deck.a) / (V.deck.b - V.deck.a)) + 0.03;
+            return S.ground(x, z) + 0.14;
+        };
+        this.heights = this.path.map(p => height(...p));
+        // the stops: the station's at s = 0; the village's where the front door is by the shelter
+        const kerb = [P(V.stop.s)[0] + V.stop.out[0] * lane, P(V.stop.s)[1] + V.stop.out[1] * lane];
+        let best = 0;
+        this.path.forEach((p, i) => { if (dist(p, kerb) < dist(this.path[best], kerb)) best = i; });
+        const doorX = BUS.bay0 + (BUS.doorBays[0] + 0.5) * BUS.bay;
+        this.stops = [0, (best * this.step - doorX + this.len) % this.len];
+        // speed limits: cruising on the open road, slower in the village, at the station and round the loop, and through
+        // bends (1.3 m/s^2 sideways); then braking (1 m/s^2) ahead of every slower stretch, twice round the loop
+        const cruise = d.speed ?? 22, slow = d.village ?? 10;
+        const head8 = i => { const a = this.path[(i + n - 4) % n], b = this.path[i], c = this.path[(i + 4) % n];
+            const h1 = Math.atan2(b[1] - a[1], b[0] - a[0]), h2 = Math.atan2(c[1] - b[1], c[0] - b[0]);
+            return Math.abs(Math.atan2(Math.sin(h2 - h1), Math.cos(h2 - h1))) / (8 * this.step); };
+        const vmax = this.path.map((p, i) => Math.min([6, cruise, slow, 6][this.zones[i]], Math.sqrt(1.3 / Math.max(head8(i), 1e-6))));
+        for (let k = 2 * n - 1; k >= 0; k--) { const i = k % n; vmax[i] = Math.min(vmax[i], Math.sqrt(vmax[(i + 1) % n] ** 2 + 2 * this.step)); }
+        this.vmax = vmax;
+        // roads: the two-lane road to the village (dashed centre line), the station's one-way lanes and the turning loop
+        const C2 = STRUCT_COLORS, road = roundPath([C(sf(W.east, W.road)), C(head, 11), C(E1, 40), C(P(sig * (V.R - 30)))], 4, false).pts;
+        const roadPts = [];
+        for (const p of road) { roadPts.push(p); if (dist(p, E1) < 3) break; }
+        S.ribbon(roadPts, 3.6, C2.asphalt);
+        for (let k = 0; k + 1 < roadPts.length; k++) {
+            const a = roadPts[k], b = roadPts[k + 1];
+            if (k % 3 === 0 && dist(a, sc) > 150) S.strip(a, [lerp(a[0], b[0], 0.75), lerp(a[1], b[1], 0.75)], 0.08, C2.paint, 0, 0.17);
+        }
+        S.ribbon([P(-sig * (V.R - 2)), F2], 3.5, C2.asphalt);
+        const lanes = [];
+        let cur = null;
+        this.path.forEach((p, i) => {
+            const z = this.zones[i];
+            if ((z === 0 || z === 3) && i % 3 === 0) { if (!cur) lanes.push(cur = []); cur.push(p); } else if (z !== 0 && z !== 3) cur = null;
+        });
+        for (const l of lanes) if (l.length > 1) S.ribbon(l, 3.1, C2.asphalt, 3, 0.15);
+        // the bus: mesh and glass in its own frame, colliders, seats; a moving shader box (rain shadow, sun shadow)
+        this.mesh = buildBus(d.livery || [0.12, 0.36, 0.62]);
+        this.box = { x: 0, z: 0, hx: BUS.hl, hz: BUS.hw, cs: 1, sn: 0, y0: 0, y1: 1, ao: 0.35, slope: 0, base: 0, dyn: true };
+        S.blockers.push(this.box);
+        this.world.busMesh = this.mesh;
+        this.place();
+    }
+
+    // position, height on the path at arc length s
+    at(s) {
+        const n = this.path.length, x = ((s % this.len) + this.len) % this.len / this.step, i = Math.floor(x) % n, j = (i + 1) % n, t = x - Math.floor(x);
+        const a = this.path[i], b = this.path[j];
+        return [lerp(a[0], b[0], t), lerp(this.heights[i], this.heights[j], t), lerp(a[1], b[1], t)];
+    }
+
+    // pose from the axles on the path: heading from the rear axle to the front one, pitched by their heights
+    place() {
+        const K = BUS, r = this.at(this.s + K.axleR), f = this.at(this.s + K.axleF);
+        const dx = f[0] - r[0], dz = f[2] - r[2], l = Math.hypot(dx, dz) || 1, cs = dx / l, sn = dz / l, slope = (f[1] - r[1]) / l;
+        const x = r[0] - cs * K.axleR, z = r[2] - sn * K.axleR, y = r[1] - slope * K.axleR;
+        const cp = 1 / Math.hypot(1, slope), sp = slope * cp;
+        // local -> world, column-major: x along the heading (pitched), y up, z to the right
+        this.model = [cs * cp, sp, sn * cp, 0, -cs * sp, cp, -sn * sp, 0, -sn, 0, cs, 0, x, y, z, 1];
+        this.pose = { x, y, z, cs, sn, slope };
+        Object.assign(this.box, { x, z, cs, sn, slope, y0: y + K.skirt, y1: y + K.roof, base: y - 1 });
+    }
+
+    toWorld(q, w = 1) { const m = this.model; return [0, 1, 2].map(r => m[r] * q[0] + m[4 + r] * q[1] + m[8 + r] * q[2] + m[12 + r] * w); }
+    toLocal(p, w = 1) {
+        const m = this.model, d = w ? [p[0] - m[12], p[1] - m[13], p[2] - m[14]] : p;
+        return [0, 1, 2].map(c => m[c * 4] * d[0] + m[c * 4 + 1] * d[1] + m[c * 4 + 2] * d[2]);
+    }
+    // the FlyCamera yaw that looks along the bus
+    get yaw() { return Math.atan2(-this.pose.cs, -this.pose.sn); }
+
+    update(dt) {
+        dt *= this.world.busBoost || 1;
+        const dwell = this.def.dwell || [60, 30];
+        if (this.mode === 'dwell') {
+            this.clock -= dt;
+            if (this.clock <= 0 && this.doors <= 0) { this.mode = 'drive'; this.stop = 1 - this.stop; }
+        } else {
+            // up to the speed limit here, braking to stop at the next stop (1 m/s^2), pulling away at 1.1 m/s^2
+            const left = (this.stops[this.stop] - this.s + this.len) % this.len;
+            const i = Math.floor(this.s / this.step) % this.path.length;
+            const vt = Math.min(this.vmax[i], Math.sqrt(2 * Math.max(left - 0.02, 0)));
+            this.v = vt < this.v ? vt : Math.min(vt, this.v + 1.1 * dt);
+            const ds = Math.min(this.v * dt, left);
+            this.s = (this.s + ds) % this.len;
+            if (left - ds < 0.03) { this.s = this.stops[this.stop]; this.v = 0; this.mode = 'dwell'; this.clock = dwell[this.stop]; }
+        }
+        // the doors open once the bus stands, and close 3 s before it leaves (1.5 s each way)
+        const open = this.mode === 'dwell' && this.clock > 3;
+        this.doors = clamp(this.doors + (open ? dt : -dt) / 1.5, 0, 1);
+        this.place();
+    }
+
+    // where it is, for the HUD
+    describe() {
+        const names = [this.world.get(this.def.from)?.label || 'station', this.world.get(this.def.to)?.label || 'village'];
+        if (this.mode === 'dwell') return `at ${names[this.stop]} · ${this.clock > 3 ? `doors open, leaves in ${Math.ceil(this.clock)} s` : 'doors closing'}`;
+        const left = (this.stops[this.stop] - this.s + this.len) % this.len;
+        return `to ${names[this.stop]} · ${fmtKm(left)} · ${(this.v * 3.6).toFixed(0)} km/h`;
+    }
+
+    // colliders in the bus's frame: the floor (walkable), walls, the driver's cab, wheel arches, seats, and the door leaves
+    // while the doors are not open
+    colliders() {
+        const m = this.mesh;
+        return this.doors > 0.85 ? m.solids : m.solids.concat(m.doorSolids);
+    }
+}
+
+// the bus's mesh in its own frame (see BUS): opaque parts, glass (drawn see-through in the final pass), the solids a walker
+// collides with, and the seats ({ x, z, y (cushion top), eye [x, y, z], name })
+function buildBus(livery) {
+    const K = BUS, f0 = new GroundFrame([0, 0], 0), B = new Structures(null), G = new Structures(null), C = STRUCT_COLORS;
+    const { hl, hw, floor, ceil, roof, skirt, winLo, winHi, wall } = K;
+    const box = (S, x0, x1, y0, y1, z0, z1, col, mat = 0) => S.box(f0, (x0 + x1) / 2, (z0 + z1) / 2, (x1 - x0) / 2, (z1 - z0) / 2, y0, y1, col, mat);
+    const pane = (S, a, b, c, d, mat) => S.quad(a, b, c, d, [0.5, 0.56, 0.58], mat);
+    const dark = [0.05, 0.05, 0.06], white = [0.84, 0.84, 0.82], lining = [0.66, 0.68, 0.70], vinyl = [0.22, 0.23, 0.24];
+    const fabric = [0.13, 0.17, 0.34], yellow = [0.85, 0.62, 0.10], IN = BUS_IN;
+    const bx = k => K.bay0 + k * K.bay, door = k => K.doorBays.includes(k), axles = [K.axleF, K.axleR];
+    const solids = [], doorSolids = [], S0 = (x0, x1, z0, z1, y0, y1, list = solids) => list.push({ x: (x0 + x1) / 2, z: (z0 + z1) / 2, hx: (x1 - x0) / 2, hz: (z1 - z0) / 2, cs: 1, sn: 0, y0, y1, slope: 0 });
+    // chassis and floor, roof and ceiling with its lamps
+    box(B, -hl, hl, skirt, floor - 0.02, -hw, hw, dark);
+    box(B, -hl + wall, hl - wall, floor - 0.02, floor, -hw + wall, hw - wall, vinyl, IN);
+    box(B, -hl, hl, ceil + 0.03, roof, -hw, hw, white, 1);
+    box(B, -hl + wall, hl - wall, ceil, ceil + 0.03, -hw + wall, hw - wall, [0.80, 0.80, 0.78], IN);
+    for (const sz of [-1, 1]) box(B, -hl + 0.6, hl - 1.9, ceil - 0.015, ceil, sz * 0.36, sz * 0.5, [1.0, 0.95, 0.85], 7 + IN);
+    box(B, -2.2, 1.2, roof, roof + 0.26, -0.8, 0.8, white, 1);                                       // air conditioning
+    S0(-hl, hl, -hw, hw, -0.5, floor);
+    // sides: skin outside, lining inside; below the windows (open over the wheels and at the doors), above them, pillars
+    for (const sd of [-1, 1]) {
+        const zo = [sd * (hw - 0.035), sd * hw].sort((a, b) => a - b), zi = [sd * (hw - wall), sd * (hw - 0.035)].sort((a, b) => a - b);
+        const zw = [sd * (hw - wall), sd * hw].sort((a, b) => a - b);
+        let cuts = axles.map(a => [a - 0.62, a + 0.62]);
+        if (sd > 0) cuts = cuts.concat(K.doorBays.map(k => [bx(k) + K.pillar / 2, bx(k + 1) - K.pillar / 2]));
+        cuts.sort((a, b) => a[0] - b[0]);
+        let x = -hl;
+        for (const [a, b] of [...cuts, [hl, hl]]) {
+            if (a > x) { box(B, x, a, skirt, winLo, ...zo, livery); box(B, x, a, floor, winLo, ...zi, lining, IN); }
+            x = Math.max(x, b);
+        }
+        for (const a of axles) box(B, a - 0.62, a + 0.62, skirt + 0.75, winLo, ...zo, livery);       // over the wheel arches
+        box(B, -hl, hl, winHi, ceil + 0.03, ...zo, white);
+        box(B, -hl + wall, hl - wall, winHi, ceil, ...zi, lining, IN);
+        for (let k = 0; k <= K.bays; k++) {
+            const x0 = k === 0 ? -hl : bx(k) - K.pillar / 2, x1 = k === K.bays ? hl : bx(k) + K.pillar / 2;
+            box(B, x0, x1, winLo, winHi, ...zo, dark, 4);
+            box(B, Math.max(x0, -hl + wall), Math.min(x1, hl - wall), winLo, winHi, ...zi, lining, IN);
+        }
+        for (let k = 0; k < K.bays; k++) {
+            if (sd > 0 && door(k)) continue;
+            const x0 = bx(k) + K.pillar / 2, x1 = bx(k + 1) - K.pillar / 2, z = sd * (hw - 0.035);
+            pane(G, [x0, winLo, z], [x1, winLo, z], [x1, winHi, z], [x0, winHi, z], 0);
+        }
+        // the wall to walk into: all of it but the door openings
+        let wx = -hl;
+        for (const k of sd > 0 ? [...K.doorBays].sort((a, b) => a - b) : []) { S0(wx, bx(k) + K.pillar / 2, ...zw, 0, roof); wx = bx(k + 1) - K.pillar / 2; }
+        S0(wx, hl, ...zw, 0, roof);
+    }
+    // doors: two glazed leaves per door bay that slide apart outside the body (BUS_LEAF)
+    for (const k of K.doorBays) {
+        const x0 = bx(k) + K.pillar / 2, x1 = bx(k + 1) - K.pillar / 2, xm = (x0 + x1) / 2, z = hw - 0.02;
+        for (const [a, b, tag] of [[x0, xm, BUS_LEAF[0]], [xm, x1, BUS_LEAF[1]]]) {
+            box(B, a, b, floor - 0.05, floor + 0.35, z - 0.015, z + 0.015, dark, 4 + tag);
+            box(B, a, b, winHi - 0.06, winHi, z - 0.015, z + 0.015, dark, 4 + tag);
+            for (const e of [a, b - 0.05]) box(B, e, e + 0.05, floor + 0.35, winHi - 0.06, z - 0.015, z + 0.015, dark, 4 + tag);
+            pane(G, [a + 0.05, floor + 0.35, z], [b - 0.05, floor + 0.35, z], [b - 0.05, winHi - 0.06, z], [a + 0.05, winHi - 0.06, z], tag);
+        }
+        S0(x0 - 0.06, x1 + 0.06, hw - wall, hw, 0, roof, doorSolids);
+        box(B, x0, x1, skirt, floor - 0.05, z - 0.03, z, dark);
+    }
+    // front: lower panel and bumper, windscreen between corner pillars, the destination display, headlights
+    const fw = [0.95, 2.45];
+    box(B, hl - 0.05, hl, skirt, fw[0], -hw, hw, livery);
+    box(B, hl - wall, hl - 0.05, floor, fw[0], -hw + wall, hw - wall, dark, IN);
+    box(B, hl, hl + 0.07, skirt, skirt + 0.25, -hw + 0.05, hw - 0.05, dark, 4);
+    for (const sz of [-1, 1]) box(B, hl - 0.1, hl, fw[0], fw[1], ...[sz * (hw - 0.1), sz * hw].sort((a, b) => a - b), dark, 4);
+    box(B, hl - 0.06, hl, fw[1], roof, -hw, hw, white);
+    box(B, hl, hl + 0.01, fw[1] + 0.06, fw[1] + 0.36, -0.95, 0.95, [1.0, 0.55, 0.08], 7);
+    for (const sz of [-1, 1]) box(B, hl, hl + 0.02, 0.55, 0.72, ...[sz * 0.72, sz * 1.1].sort((a, b) => a - b), [1.0, 0.97, 0.9], 7);
+    pane(G, [hl - 0.03, fw[0], -hw + 0.1], [hl - 0.03, fw[0], hw - 0.1], [hl - 0.03, fw[1], hw - 0.1], [hl - 0.03, fw[1], -hw + 0.1], 1);
+    S0(hl - wall, hl, -hw, hw, 0, roof);
+    // mirrors on arms
+    for (const sz of [-1, 1]) { box(B, hl - 0.05, hl + 0.32, 2.3, 2.34, ...[sz * hw, sz * (hw + 0.12)].sort((a, b) => a - b), dark, 4); box(B, hl + 0.26, hl + 0.32, 1.9, 2.32, ...[sz * (hw + 0.05), sz * (hw + 0.24)].sort((a, b) => a - b), dark, 4); }
+    // rear: panel round the rear window, tail lights
+    const rw = [1.4, 2.3, 0.9];
+    box(B, -hl, -hl + 0.05, skirt, rw[0], -hw, hw, livery);
+    box(B, -hl, -hl + 0.05, rw[1], roof, -hw, hw, white);
+    for (const sz of [-1, 1]) {
+        const zz = [sz * rw[2], sz * hw].sort((a, b) => a - b);
+        box(B, -hl, -hl + 0.05, rw[0], rw[1], ...zz, livery);
+        box(B, -hl + 0.05, -hl + wall, rw[0], rw[1], ...[sz * rw[2], sz * (hw - wall)].sort((a, b) => a - b), lining, IN);
+        box(B, -hl - 0.02, -hl, 0.6, 1.0, ...[sz * 0.95, sz * 1.18].sort((a, b) => a - b), [0.9, 0.06, 0.04], 7);
+    }
+    box(B, -hl + 0.05, -hl + wall, floor, rw[0], -hw + wall, hw - wall, lining, IN);
+    box(B, -hl + 0.05, -hl + wall, rw[1], ceil, -hw + wall, hw - wall, lining, IN);
+    pane(G, [-hl + 0.03, rw[0], -rw[2]], [-hl + 0.03, rw[0], rw[2]], [-hl + 0.03, rw[1], rw[2]], [-hl + 0.03, rw[1], -rw[2]], 1);
+    S0(-hl, -hl + wall, -hw, hw, 0, roof);
+    // wheels (twelve-sided), and their arches inside
+    for (const a of axles) for (const sz of [-1, 1]) {
+        const zz = [sz * (hw - 0.32), sz * (hw - 0.03)], ring = k => { const t = k / 12 * 2 * Math.PI; return [a + Math.cos(t) * K.wheel, K.wheel + Math.sin(t) * K.wheel]; };
+        for (let k = 0; k < 12; k++) {
+            const p = ring(k), q = ring(k + 1);
+            B.quad([p[0], p[1], zz[0]], [q[0], q[1], zz[0]], [q[0], q[1], zz[1]], [p[0], p[1], zz[1]], [0.04, 0.04, 0.04]);
+            for (const z of zz) B.tri([a, K.wheel, z], [p[0], p[1], z], [q[0], q[1], z], z === zz[1] ? [0.45, 0.46, 0.47] : [0.04, 0.04, 0.04], 4);
+        }
+        const zi = [sz * (hw - 0.55), sz * (hw - wall)].sort((p, q) => p - q);
+        box(B, a - 0.65, a + 0.65, floor, 1.05, ...zi, [0.30, 0.31, 0.32], IN);
+        S0(a - 0.65, a + 0.65, ...zi, 0, 1.05);
+    }
+    // driver's cab: partition, dashboard, seat, steering wheel, the driver
+    const dz = [-hw + wall, -0.2];
+    box(B, hl - 1.75, hl - 1.7, floor, 1.45, ...dz, lining, IN);
+    box(B, hl - 0.65, hl - wall, floor, 1.0, -hw + wall, -0.1, [0.10, 0.10, 0.11], IN);
+    box(B, hl - 1.45, hl - 1.0, floor, floor + 0.5, -0.95, -0.5, dark, IN);
+    box(B, hl - 1.5, hl - 1.42, floor + 0.5, floor + 1.25, -0.95, -0.5, dark, IN);
+    box(B, hl - 0.85, hl - 0.75, 1.05, 1.1, -0.95, -0.5, dark, 4 + IN);
+    box(B, hl - 1.4, hl - 1.1, floor + 0.55, floor + 1.15, -0.9, -0.55, [0.16, 0.22, 0.36], IN);
+    box(B, hl - 1.33, hl - 1.13, floor + 1.18, floor + 1.42, -0.82, -0.63, [0.72, 0.55, 0.45], IN);
+    box(B, hl - 1.1, hl - 0.75, floor + 0.85, floor + 0.95, -0.9, -0.82, [0.16, 0.22, 0.36], IN);
+    box(B, hl - 1.1, hl - 0.75, floor + 0.85, floor + 0.95, -0.63, -0.55, [0.16, 0.22, 0.36], IN);
+    box(B, hl - 1.95, hl - 1.85, floor, floor + 1.25, 0.55, 0.68, yellow, 4 + IN);                    // ticket validator
+    S0(hl - 1.75, hl, -hw, -0.15, 0, 1.45);
+    // seats facing forward in pairs either side of the aisle (none by the middle door: room to stand), raised over the
+    // wheel arches, and a bench across the back; poles and rails to hold on to
+    const seats = [], seat = (x, z, raise, name) => {
+        const y = floor + 0.45 + raise;
+        if (raise) box(B, x - 0.25, x + 0.22, floor, y - 0.1, z - 0.22, z + 0.22, lining, IN);
+        box(B, x - 0.21, x + 0.21, y - 0.1, y, z - 0.21, z + 0.21, fabric, IN);
+        box(B, x - 0.26, x - 0.19, y, y + 0.62, z - 0.21, z + 0.21, fabric, IN);
+        if (!raise) box(B, x - 0.05, x + 0.05, floor, y - 0.1, z - 0.15, z + 0.15, [0.35, 0.36, 0.37], 4 + IN);
+        S0(x - 0.26, x + 0.22, z - 0.22, z + 0.22, 0, y + 0.62);
+        seats.push({ x, z, y, eye: [x + 0.02, y + 0.78, z * 0.8], name });            // the head a little in from the window
+    };
+    let row = 0;
+    for (let x = 3.6; x > -4.9; x -= 0.8) {
+        row++;
+        const raise = axles.some(a => Math.abs(x - a) < 0.7) ? 0.35 : 0;
+        for (const sd of [-1, 1]) {
+            if (sd > 0 && x > -2.1 && x < 0.5) continue;
+            const side = sd < 0 ? 'left' : 'right';
+            seat(x, sd * (hw - wall - 0.24), raise, `window seat, row ${row} ${side}`);
+            seat(x, sd * (hw - wall - 0.69), raise, `aisle seat, row ${row} ${side}`);
+            if (row % 2) box(B, x - 0.32, x - 0.29, floor, ceil, sd * 0.3 - 0.015, sd * 0.3 + 0.015, yellow, 4 + IN);
+        }
+    }
+    for (let k = -2; k <= 2; k++) seat(-hl + wall + 0.47, k * 0.47, 0.18, `back bench, seat ${k + 3}`);
+    for (const sd of [-1, 1]) box(B, -hl + 1.2, hl - 2.0, floor + 1.86, floor + 1.89, sd * 0.32 - 0.015, sd * 0.32 + 0.015, yellow, 4 + IN);
+    for (const x of [-1.9, 0.3]) box(B, x - 0.015, x + 0.015, floor, ceil, 0.6, 0.63, yellow, 4 + IN);
+    return { v: B.v, glass: G.v, solids, doorSolids, seats };
 }
 
 // --- weather
@@ -3552,6 +4153,7 @@ const ENTITY_TYPES = {
     forest: Forest,
     village: Village,
     busStation: BusStation,
+    bus: BusLine,
     storm: StormCell,
     supercell: Supercell,
     squall: SquallLine,
@@ -3761,6 +4363,8 @@ class World {
         this.entities = [];
         this.byId = new Map();
         this.flashCount = 0;
+        this.bus = null;                 // the BusLine, if any (one bus is drawn and ridden)
+        this.busBoost = 1;               // its time runs this many times as fast (hold Z)
         for (const def of scenario.entities || []) this.add(def, false);
         for (const e of this.entities) { e.stamp(this.field); this.field.updateRange(); }
         this.field.freeze();
@@ -4152,12 +4756,15 @@ class Renderer {
         });
         this.pSky = pipe(layoutA, scene, 'vsSky', 'fsSky', 'rgba16float', { write: false, compare: 'always' });
         this.pTerrain = pipe(layoutA, scene, 'vsTerrain', 'fsTerrain', 'rgba16float', { write: true, compare: 'greater' });
-        this.pStruct = pipe(layoutA, scene, 'vsStruct', 'fsStruct', 'rgba16float', { write: true, compare: 'greater' }, undefined, [{
+        const structVerts = [{
             arrayStride: STRUCT_FLOATS * 4, attributes: [
                 { shaderLocation: 0, offset: 0, format: 'float32x3' }, { shaderLocation: 1, offset: 12, format: 'float32x3' },
                 { shaderLocation: 2, offset: 24, format: 'float32x4' }],
-        }]);
+        }];
+        this.pStruct = pipe(layoutA, scene, 'vsStruct', 'fsStruct', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
+        this.pBus = pipe(layoutA, scene, 'vsBus', 'fsBus', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
         this.pComposite = pipe(layoutB, final, 'vsFull', 'fsComposite', this.format, { write: false, compare: 'always' });
+        this.pGlass = pipe(layoutB, final, 'vsGlass', 'fsGlass', this.format, { write: false, compare: 'greater' }, blendAlpha, structVerts);
         this.pPrecip = pipe(layoutB, final, 'vsPrecip', 'fsPrecip', this.format, { write: false, compare: 'greater' }, blendAlpha);
         this.pBolt = pipe(layoutB, final, 'vsBolt', 'fsBolt', this.format, { write: false, compare: 'greater' }, blendAdd);
     }
@@ -4177,6 +4784,14 @@ class Renderer {
         const sv = new Float32Array(world.structures.v);
         this.structCount = sv.length / STRUCT_FLOATS;
         this.structBuf = this.structCount ? makeBuffer(d, sv.byteLength, GPUBufferUsage.VERTEX, sv) : null;
+        // the bus, in its own frame: opaque mesh and glass
+        this.busBuf?.destroy();
+        this.glassBuf?.destroy();
+        const bm = world.busMesh, bv = new Float32Array(bm ? bm.v : []), gv = new Float32Array(bm ? bm.glass : []);
+        this.busCount = bv.length / STRUCT_FLOATS;
+        this.glassCount = gv.length / STRUCT_FLOATS;
+        this.busBuf = this.busCount ? makeBuffer(d, bv.byteLength, GPUBufferUsage.VERTEX, bv) : null;
+        this.glassBuf = this.glassCount ? makeBuffer(d, gv.byteLength, GPUBufferUsage.VERTEX, gv) : null;
         this.worldGroup = this.worldSet.group({
             F: this.frameBuf, shapeTex: this.noise.shapeView, detailTex: this.noise.detailView, weatherTex: this.weatherPass.weatherView,
             shadowTex: this.weatherPass.shadowView, heightTex: this.heightView, landTex: this.landMap.createView(), repSamp: this.repSamp,
@@ -4228,6 +4843,11 @@ class Renderer {
             a.setVertexBuffer(0, this.structBuf);
             a.draw(this.structCount);
         }
+        if (this.busCount) {
+            a.setPipeline(this.pBus);
+            a.setVertexBuffer(0, this.busBuf);
+            a.draw(this.busCount);
+        }
         a.end();
 
         if (froxels && volumetrics) this.froxelPass.encode(enc, prof);
@@ -4243,6 +4863,8 @@ class Renderer {
         b.setPipeline(this.pComposite);
         b.draw(3);
         if (particles) { b.setPipeline(this.pPrecip); b.draw(6, particles); }
+        // the bus's windows after the rain outside them (seen from inside, the drops on the glass are in front of it)
+        if (this.glassCount) { b.setPipeline(this.pGlass); b.setVertexBuffer(0, this.glassBuf); b.draw(this.glassCount); }
         if (bolts) { b.setPipeline(this.pBolt); b.draw(6, bolts); }
         b.end();
         prof.resolve(enc);
@@ -4338,6 +4960,189 @@ class FlyCamera {
     }
 }
 
+// Pushes a walker at feet p ([x, y, z], changed in place) out of the walls among `boxes` (Structures.solid's shape) and
+// returns the highest floor under it: a box whose top is within a step of the feet is a floor, one that reaches higher
+// is a wall, unless it is all above the head.
+function collideWalker(p, boxes, ground) {
+    const R = WALK.radius;
+    for (let it = 0; it < 3; it++) {
+        for (const b of boxes) {
+            const rx = p[0] - b.x, rz = p[2] - b.z;
+            let lx = rx * b.cs + rz * b.sn, lz = -rx * b.sn + rz * b.cs;
+            if (Math.abs(lx) > b.hx + R || Math.abs(lz) > b.hz + R) continue;
+            const top = b.y1 + b.slope * lx, bot = b.y0 + b.slope * lx;
+            if (bot > p[1] + WALK.head || top <= p[1] + WALK.step) continue;
+            const cx = clamp(lx, -b.hx, b.hx), cz = clamp(lz, -b.hz, b.hz), dx = lx - cx, dz = lz - cz, d2 = dx * dx + dz * dz;
+            if (d2 >= R * R) continue;
+            if (d2 > 1e-10) { const d = Math.sqrt(d2), k = (R - d) / d; lx += dx * k; lz += dz * k; }
+            else if (b.hx - Math.abs(lx) < b.hz - Math.abs(lz)) lx = Math.sign(lx || 1) * (b.hx + R);
+            else lz = Math.sign(lz || 1) * (b.hz + R);
+            p[0] = b.x + lx * b.cs - lz * b.sn;
+            p[2] = b.z + lx * b.sn + lz * b.cs;
+        }
+    }
+    for (const b of boxes) {
+        const rx = p[0] - b.x, rz = p[2] - b.z, lx = rx * b.cs + rz * b.sn, lz = -rx * b.sn + rz * b.cs;
+        if (Math.abs(lx) > b.hx || Math.abs(lz) > b.hz) continue;
+        const top = b.y1 + b.slope * lx;
+        if (top <= p[1] + WALK.step) ground = Math.max(ground, top);
+    }
+    return ground;
+}
+
+// On foot: walks on the terrain as drawn and on what stands on it (Structures' boxes, bridge decks), into the bus and
+// out of it. Aboard, the walker lives in the bus's frame (`local`), so it rides along; seated, its eye is the seat's.
+// The camera's yaw turns with the bus while aboard.
+class Walker {
+    constructor() {
+        this.active = false;
+        this.feet = [0, 0, 0];         // world, or the bus's frame while aboard
+        this.bus = null;
+        this.seat = null;
+        this.vy = 0;
+        this.lag = 0;                  // eye height still to catch up after a step (smooths stairs and kerbs)
+        this.prompt = '';
+    }
+
+    // on foot at x, z, on whatever is there within a step of height y (default: the ground)
+    place(app, x, z, y) {
+        this.active = true;
+        this.bus = null;
+        this.seat = null;
+        this.vy = this.lag = 0;
+        const g = app.world.field.surface(x, z);
+        this.feet = [x, Math.max(y ?? g, g), z];
+        this.feet[1] = this.floorAt(app, this.feet, -Infinity);
+    }
+
+    // seated aboard the bus (seat index, or the best free window seat)
+    sit(app, bus, k) {
+        const seats = bus.mesh.seats, s = seats[k ?? seats.findIndex(q => q.name.startsWith('window seat, row 5 left'))] || seats[0];
+        this.active = true;
+        this.bus = bus;
+        this.seat = s;
+        this.feet = [s.x, BUS.floor, s.z];
+        this.lag = 0;
+        app.camera.yaw = bus.yaw;
+        app.camera.pitch = -0.08;
+        this.busYaw = bus.yaw;
+    }
+
+    // world: the terrain or the highest box top under the feet (within a step); the bus's walls and floor near it too
+    floorAt(app, p, below) {
+        const w = app.world, bus = w.bus, boxes = w.structures.solidsNear(p[0], p[2], 2);
+        if (bus && Math.hypot(p[0] - bus.pose.x, p[2] - bus.pose.z) < 10) {
+            for (const b of bus.colliders()) {
+                const c = bus.toWorld([b.x, b.y0, b.z]);
+                boxes.push({ x: c[0], z: c[2], hx: b.hx, hz: b.hz, cs: bus.pose.cs, sn: bus.pose.sn, y0: c[1], y1: c[1] + b.y1 - b.y0, slope: 0 });
+            }
+        }
+        return collideWalker(p, boxes, Math.max(below, w.field.surface(p[0], p[2])));
+    }
+
+    // open water at x, z (the land-use map's, or a river's own channel, which villages draw at its true width)
+    water(app, x, z) {
+        const w = app.world;
+        return w.field.landAt(x, z, 2) > 0.4 || w.entities.some(e => e instanceof River && e.distance(x, z) < (e.def.width || 60) / 2 - 2);
+    }
+
+    update(dt, io, input, app) {
+        const cam = app.camera, k = input.keys, bus = app.world.bus;
+        // the view turns with the bus while aboard
+        if (this.bus) { cam.yaw += this.bus.yaw - this.busYaw; this.busYaw = this.bus.yaw; }
+        cam.yaw -= io.dx * 0.0025;
+        cam.pitch = clamp(cam.pitch - io.dy * 0.0025, -1.45, 1.45);
+        const pressed = io.pressed.includes('KeyE');
+        if (this.seat) {
+            if (pressed) {                                          // stand up into the aisle beside the seat
+                this.feet = [this.seat.x + 0.3, BUS.floor, 0];
+                this.lag = this.seat.eye[1] - BUS.floor - WALK.eye;
+                this.seat = null;
+            } else { this.prompt = `seated: ${this.seat.name} · E stand up`; this.eye(app); return; }
+        }
+        // where to: along the ground, the way the camera looks
+        const f = [-Math.sin(cam.yaw), -Math.cos(cam.yaw)], r = [Math.cos(cam.yaw), -Math.sin(cam.yaw)];
+        let mx = 0, mz = 0;
+        if (k.has('KeyW')) { mx += f[0]; mz += f[1]; }
+        if (k.has('KeyS')) { mx -= f[0]; mz -= f[1]; }
+        if (k.has('KeyD')) { mx += r[0]; mz += r[1]; }
+        if (k.has('KeyA')) { mx -= r[0]; mz -= r[1]; }
+        const l = Math.hypot(mx, mz), speed = (k.has('ShiftLeft') || k.has('ShiftRight') ? WALK.run : WALK.speed) * (k.has('AltLeft') ? 0.3 : 1);
+        if (l > 0) { mx *= speed * dt / l; mz *= speed * dt / l; }
+        if (this.bus) {
+            // aboard: move in the bus's frame, against its walls, seats and doors; out through an open door
+            const d = this.bus.toLocal([mx, 0, mz], 0), p = this.feet, y0 = p[1];
+            p[0] += d[0]; p[2] += d[2];
+            const g = collideWalker(p, this.bus.colliders(), -Infinity);
+            this.settle(g, y0, dt);
+            if (Math.abs(p[0]) > BUS.hl || Math.abs(p[2]) > BUS.hw) {
+                this.feet = this.bus.toWorld(p);
+                this.bus = null;
+            }
+        } else {
+            const p = this.feet, y0 = p[1], was = [p[0], p[2]], f0 = app.world.field;
+            p[0] += mx; p[2] += mz;
+            let g = this.floorAt(app, p, -Infinity);
+            // no wading into the water (a bridge's deck over it is fine)
+            if (l > 0 && g < f0.surface(p[0], p[2]) + 0.5 && this.water(app, p[0], p[2]) && !this.water(app, ...was)) {
+                p[0] = was[0]; p[2] = was[1];
+                g = this.floorAt(app, p, -Infinity);
+            }
+            this.settle(g, y0, dt);
+            // stepped into the bus (through a door): ride along in its frame
+            if (bus) {
+                const q = bus.toLocal(p);
+                if (Math.abs(q[0]) < BUS.hl - 0.05 && Math.abs(q[2]) < BUS.hw - 0.05 && q[1] > BUS.floor - 0.4) {
+                    this.bus = bus;
+                    this.busYaw = bus.yaw;
+                    this.feet = [q[0], Math.max(q[1], BUS.floor), q[2]];
+                }
+            }
+        }
+        // a seat in view within reach: E sits down in it
+        this.prompt = '';
+        this.aim = null;
+        if (this.bus) {
+            const { fwd } = cam.basis(), d = this.bus.toLocal(fwd, 0), o = [this.feet[0], this.feet[1] + WALK.eye + this.lag, this.feet[2]];
+            let best = 2.2;
+            for (const s of this.bus.mesh.seats) {
+                const lo = [s.x - 0.27, s.y - 0.12, s.z - 0.23], hi = [s.x + 0.23, s.y + 0.62, s.z + 0.23];
+                let tn = 0, tf = best;
+                for (let a = 0; a < 3; a++) {
+                    if (Math.abs(d[a]) < 1e-9) { if (o[a] < lo[a] || o[a] > hi[a]) { tn = Infinity; } continue; }
+                    const t0 = (lo[a] - o[a]) / d[a], t1 = (hi[a] - o[a]) / d[a];
+                    tn = Math.max(tn, Math.min(t0, t1)); tf = Math.min(tf, Math.max(t0, t1));
+                }
+                if (tn <= tf && tn < best) { best = tn; this.aim = s; }
+            }
+            if (this.aim) {
+                this.prompt = `E sit: ${this.aim.name}`;
+                if (pressed) { this.seat = this.aim; this.aim = null; cam.yaw = this.bus.yaw; this.busYaw = this.bus.yaw; }
+            } else this.prompt = 'aboard · look at a seat to sit';
+        }
+        this.eye(app);
+    }
+
+    // feet onto the floor g: up a step at once (the eye follows), or falling to it
+    settle(g, y0, dt) {
+        const p = this.feet;
+        if (g >= p[1]) { this.lag -= g - p[1]; p[1] = g; this.vy = 0; }
+        else {
+            this.vy -= 9.81 * dt;
+            p[1] = Math.max(g, p[1] + this.vy * dt);
+            if (p[1] === g) this.vy = 0;
+        }
+        this.lag *= Math.exp(-dt * 10);
+        if (Math.abs(this.lag) < 1e-3) this.lag = 0;
+    }
+
+    // the camera at the eye: standing, or the seat's
+    eye(app) {
+        const e = this.seat ? this.seat.eye : [this.feet[0], this.feet[1] + WALK.eye + this.lag, this.feet[2]];
+        app.camera.pos = this.bus ? this.bus.toWorld(e) : e;
+    }
+}
+
 // -------------------------------------------------------------------------------------------------- hud
 // what falling rain is called: by its rate (near-field intensity) and how fine its drops are
 const rainName = (rate, drops) => drops < 0.2 && rate < 0.3 ? 'drizzle' : rate < 0.3 ? 'light rain' : rate < 0.7 ? 'moderate rain'
@@ -4359,6 +5164,7 @@ class Hud {
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>N</b> rain: drizzle / light / medium / downpour   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
             '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
+            '<b>X</b> walk / fly   <b>B</b> go to the bus   <b>E</b> sit / stand (aboard)   <b>hold Z</b> bus ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
             'drop a scenario .json on the page',
         ].join('\n');
     }
@@ -4392,7 +5198,8 @@ class Hud {
             `air       ${c.temperature.toFixed(0)} °C at sea level · freezing level ${(wx.freezingLevel / 1000).toFixed(1)} km · wind ${wind.toFixed(0)} m/s from ${from}`,
             `clouds    ${w.clouds.active(c).map(([n, v]) => `${n} ${(v * 100).toFixed(0)}%`).join(' · ') || 'none'}`,
             `storms    ${storms.length} cells · ${raining} raining · ${w.flashCount} flashes`,
-            `here      ${here}${app.sheltered ? ' <span class="w">sheltered</span>' : ''} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
+            `here      ${here}${app.sheltered ? ` <span class="w">${app.inBus ? 'in the bus' : 'sheltered'}</span>` : ''} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
+            ...(w.bus ? [`bus       ${w.bus.label} ${w.bus.describe()}${app.walker.active ? ` · <span class="w">${app.walker.seat ? 'seated' : app.walker.bus ? 'aboard' : 'on foot'}</span>` : ''}${w.busBoost > 1 ? ' <span class="w">×10</span>' : ''}`] : []),
             `render    ${RENDER_MODES[app.mode]} · ${q.name} ${cw.w}×${cw.h}${q.interleave > 1 ? ` 1/${q.interleave} px` : ''}${q.blur ? ' blur' : ''}${app.tiles ? ' tiles' : ''} ${q.steps} steps · froxels ${app.froxels ? FROXEL.join('×') : 'off'} · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
             app.renderer.profiler.enabled
                 ? `gpu       ${app.renderer.profiler.total.toFixed(1)} ms · ${Object.entries(app.renderer.profiler.ms).map(([n, v]) => `${n} ${v.toFixed(1)}`).join(' · ')}`
@@ -4408,11 +5215,28 @@ class Hud {
         if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
         const g = this.lctx;
         g.clearRect(0, 0, W, H);
+        // on foot: a dot in the middle, and what E would do
+        const wk = app.walker;
+        if (wk.active) {
+            g.fillStyle = wk.aim ? 'rgba(255,201,74,0.95)' : 'rgba(255,255,255,0.7)';
+            g.beginPath(); g.arc(W / 2, H / 2, (wk.aim ? 3 : 2) * dpr, 0, 2 * Math.PI); g.fill();
+            if (wk.prompt) {
+                g.font = `${13 * dpr}px 'Share Tech Mono', monospace`;
+                g.textAlign = 'center';
+                g.textBaseline = 'top';
+                g.fillStyle = 'rgba(0,0,0,0.55)';
+                const tw = g.measureText(wk.prompt).width;
+                g.fillRect(W / 2 - tw / 2 - 6 * dpr, H / 2 + 14 * dpr, tw + 12 * dpr, 20 * dpr);
+                g.fillStyle = 'rgba(255,201,74,0.95)';
+                g.fillText(wk.prompt, W / 2, H / 2 + 17 * dpr);
+                g.textAlign = 'left';
+            }
+        }
         if (!this.showLabels) return;
         g.font = `${11 * dpr}px 'Share Tech Mono', monospace`;
         g.textBaseline = 'middle';
         for (const e of app.world.entities) {
-            if (!e.label) continue;
+            if (!e.label || (e === app.world.bus && app.inBus)) continue;
             const storm = e instanceof StormCell;
             if (storm && e.state.coverage < 0.1) continue;
             const p = e.anchor;
@@ -4441,6 +5265,7 @@ class App {
         this.input = new Input(canvas);
         this.hud = new Hud();
         this.camera = new FlyCamera();
+        this.walker = new Walker();
         this.time = 0;
         this.weatherTime = 0;
         this.paused = false;
@@ -4476,6 +5301,7 @@ class App {
         this.setLight(this.lightPresets[L.start] ? L.start : this.lightNames[0]);
         this.views = scenario.views || [];
         this.viewIndex = 0;
+        this.walker = new Walker();
         if (this.views[0]) this.jump(this.views[0]);
         this.reset = true;
         if (!this.running) { this.running = true; this.last = performance.now(); requestAnimationFrame(t => this.frame(t)); }
@@ -4489,7 +5315,12 @@ class App {
 
     jump(v) {
         const e = v.follow && this.world.get(v.follow);
-        if (v.spot && e?.spots?.[v.spot]) {
+        this.walker.active = false;
+        if (v.spot === 'seat' && e instanceof BusLine) {
+            // aboard the bus, in a seat
+            this.walker.sit(this, e);
+            this.walker.eye(this);
+        } else if (v.spot && e?.spots?.[v.spot]) {
             // a viewpoint the entity laid out (a village's bus stop)
             this.camera.pos = [...e.spots[v.spot].pos];
             this.camera.lookAt(e.spots[v.spot].look);
@@ -4503,6 +5334,8 @@ class App {
             this.camera.pos = [...v.pos];
             if (v.look) this.camera.lookAt(v.look);
         }
+        // on foot from there (`walk`)
+        if (v.walk && !this.walker.active) { this.walker.place(this, this.camera.pos[0], this.camera.pos[2], this.camera.pos[1] - WALK.eye); this.walker.eye(this); }
         if (v.lighting && this.lightPresets[v.lighting]) this.setLight(v.lighting);
         if (v.weather) { this.world.weather.set(v.weather); this.hud.setStates(this.world.weather); }
         this.reset = true;
@@ -4548,6 +5381,33 @@ class App {
                     wx.set(names[(names.indexOf(wx.target) + 1) % names.length]);
                     this.hud.toast(`Rain: ${wx.target}`);
                     this.hud.setStates(wx);
+                    break;
+                }
+                case 'KeyX': {
+                    // walk from here (down on the ground below the camera), or fly again
+                    if (this.walker.active) { this.walker.active = false; this.walker.bus = null; this.hud.toast('Flying'); }
+                    else { const c = this.camera.pos, y = c[1] - WALK.eye; this.walker.place(this, c[0], c[2], y - w.field.surface(c[0], c[2]) < 3 ? y : undefined); this.camera.pitch = 0; this.hud.toast('Walking'); }
+                    this.reset = true;
+                    break;
+                }
+                case 'KeyB': {
+                    // to the bus: outside its front door while it stands at a stop, else aboard in the aisle
+                    const bus = w.bus;
+                    if (!bus) { this.hud.toast('No bus in this scenario'); break; }
+                    const doorX = BUS.bay0 + (BUS.doorBays[0] + 0.5) * BUS.bay;
+                    if (bus.mode === 'dwell') {
+                        const p = bus.toWorld([doorX, 0, BUS.hw + 1.2]);
+                        this.walker.place(this, p[0], p[2], p[1]);
+                        this.walker.eye(this);
+                        this.camera.lookAt(bus.toWorld([doorX, 1.5, 0]));
+                    } else {
+                        this.walker.place(this, bus.pose.x, bus.pose.z);
+                        Object.assign(this.walker, { bus, seat: null, feet: [-1.0, BUS.floor, 0], busYaw: bus.yaw });
+                        this.camera.yaw = bus.yaw;
+                    }
+                    this.camera.pitch = 0;
+                    this.reset = true;
+                    this.hud.toast(`${bus.label}: ${bus.describe()}`);
                     break;
                 }
                 case 'KeyR': this.radar = !this.radar; break;
@@ -4601,7 +5461,31 @@ class App {
         const sky = Sky.compute(this.sun.azimuth, this.sun.elevation, this.sun.intensity, c);
         const aspect = r.width / r.height, tanY = Math.tan(cam.fov / 2), tanX = tanY * aspect;
         const { fwd, right, up } = cam.basis();
-        this.viewProj = m4.mul(m4.reversedInfinite(cam.fov, aspect, NEAR), m4.view(cam.pos, right, up, fwd));
+        // on foot the near plane comes in to 5 cm (seat backs and bus walls are within a metre); reversed-Z keeps the far depth precise
+        const near = this.walker.active ? 0.05 : NEAR, proj = m4.reversedInfinite(cam.fov, aspect, near);
+        this.viewProj = m4.mul(proj, m4.view(cam.pos, right, up, fwd));
+        const bus = w.bus;
+        if (bus) {
+            // the bus's model-view built in doubles about the camera (its interior a metre away would jitter in f32 world space)
+            const m = bus.model, b = [-fwd[0], -fwd[1], -fwd[2]], rows = [right, up, b], mv = new Array(16).fill(0);
+            for (let c = 0; c < 4; c++) for (let r2 = 0; r2 < 3; r2++) {
+                const col = c < 3 ? [m[c * 4], m[c * 4 + 1], m[c * 4 + 2]] : [m[12] - cam.pos[0], m[13] - cam.pos[1], m[14] - cam.pos[2]];
+                mv[c * 4 + r2] = v3.dot(rows[r2], col);
+            }
+            mv[15] = 1;
+            const inv = new Array(16).fill(0), t = [m[12], m[13], m[14]];
+            for (let r2 = 0; r2 < 3; r2++) {
+                for (let c = 0; c < 3; c++) inv[c * 4 + r2] = m[r2 * 4 + c];
+                inv[12 + r2] = -(m[r2 * 4] * t[0] + m[r2 * 4 + 1] * t[1] + m[r2 * 4 + 2] * t[2]);
+            }
+            inv[15] = 1;
+            F.set('busMVP', m4.mul(proj, mv));
+            F.set('busModel', m);
+            F.set('busInv', inv);
+            F.set('cabinLo', [-BUS.hl, BUS.skirt, -BUS.hw, 1]);
+            F.set('cabinHi', [BUS.hl, BUS.roof, BUS.hw, 0]);
+            F.set('busInfo', [bus.v, bus.doors, 0, 0]);
+        } else F.set('cabinLo', [0, 0, 0, 0]);
         // weather map follows the camera, snapped to its texels so it does not swim
         const ws = cfg.weatherSize, texel = ws / WEATHER_RES;
         const wo = [Math.floor((cam.pos[0] - ws / 2) / texel) * texel, Math.floor((cam.pos[2] - ws / 2) / texel) * texel];
@@ -4609,7 +5493,7 @@ class App {
         F.set('viewProj', this.viewProj);
         F.set('prevViewProj', this.prevViewProj || this.viewProj);
         F.set('cam', [...cam.pos, this.time % 3600]);
-        F.set('fwd', [...fwd, NEAR]);
+        F.set('fwd', [...fwd, near]);
         F.set('right', [...v3.mul(right, tanX), this.frameNo % 1024]);
         F.set('up', [...v3.mul(up, tanY), this.weatherTime]);
         F.set('sunDir', [...sky.dir, 0]);
@@ -4677,18 +5561,22 @@ class App {
         const r = this.renderer, w = this.world;
         if (r.resize(QUALITY[this.quality].scale)) this.reset = true;
         const before = [...this.camera.pos];
-        this.camera.update(dt, io, this.input, w.field);
-        if (v3.len(v3.sub(before, this.camera.pos)) > 3000) this.reset = true;
+        if (!this.walker.active) this.camera.update(dt, io, this.input, w.field);
         this.updateSun(dt);
 
         const wdt = this.paused ? 0 : dt * this.timeScale;
         if (!this.paused) { this.time += dt; this.weatherTime += wdt; }
+        w.busBoost = this.input.keys.has('KeyZ') ? 10 : 1;          // hold Z: the bus runs ten times as fast
         w.update(this.paused ? 0 : dt, wdt, this.time);
+        // on foot after the bus has moved, so a rider's eye is where the bus is this frame
+        if (this.walker.active) this.walker.update(dt, io, this.input, this);
+        if (v3.len(v3.sub(before, this.camera.pos)) > 3000) this.reset = true;
         this.probe = r.weatherPass.probe;
         this.near = this.nearPrecip();
-        // under a roof or a deck: the way the drops come (as rainBack in WGSL) is blocked
+        // under a roof or a deck: the way the drops come (as rainBack in WGSL) is blocked; or in the bus
         const c = w.weather.cur, fall = this.near.snow > this.near.rain ? 1.35 : rainFall(c.drops);
-        this.sheltered = this.near.rain + this.near.snow > 0.01 && w.structures.shelters(this.camera.pos, v3.norm([-c.wind[0] * 0.8, fall, -c.wind[1] * 0.8]));
+        this.inBus = !!w.bus && (() => { const q = w.bus.toLocal(this.camera.pos); return Math.abs(q[0]) < BUS.hl && Math.abs(q[2]) < BUS.hw && q[1] > BUS.skirt && q[1] < BUS.roof; })();
+        this.sheltered = this.near.rain + this.near.snow > 0.01 && (this.inBus || w.structures.shelters(this.camera.pos, v3.norm([-c.wind[0] * 0.8, fall, -c.wind[1] * 0.8])));
 
         this.writeFrame(dt, wdt);
         const enc = r.device.createCommandEncoder();

@@ -226,6 +226,12 @@ and from 25–28 ms to 10–12 ms at high.
 | M | render mode: shaded, no volumetrics (skips the volumetric passes), clouds only, precipitation only |
 | Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, interleave, detail distance, cloud blur) |
 | V, L, P, H | next view, labels, pause weather, help |
+| X | walk (from the ground below the camera) / fly |
+| B | go to the bus: outside its front door while it stands at a stop, else aboard in the aisle |
+| E | aboard: sit in the seat you look at, or stand up |
+| hold Z | the bus runs ten times as fast |
+
+On foot, WASD walks (Shift runs, Alt creeps) and dragging looks around; Space and C do nothing.
 
 ### Rain variants
 
@@ -267,7 +273,7 @@ curved deck, and the bus station about 27 (canopy, clerestory, pillars, kiosk, b
   - Terrain and structures: no wetness and no settled snow there.
   - Near-field drops and flakes: none inside the dry volume (`vsPrecip` tests each particle along its own fall).
   - Rain and snow shafts: rays through the boxes' bounds take the shaft density out wherever it is sheltered.
-  - The HUD says `sheltered` when the camera is.
+  - The HUD says `sheltered` when the camera is, and `in the bus` when it is in the bus's cabin.
 - **Sun shadows**: the ray toward the sun, so houses shade the street and each other, and decks the river bank.
 - **Sky occlusion**: under roofs and decks (a box's `ao`), less sky light reaches the ground.
 
@@ -276,6 +282,58 @@ go into the frame (the village and the bus station lie 9 km apart). Each frame a
 boxes' bounds lists, per cell, the boxes that can shade it: a capsule from each box toward where its sun shadow and its
 rain shadow fall, as far as a ray from the ground under it to its top runs sideways. A point tests only its cell's
 boxes, which keeps the structures at about 0.2 ms of scene time at street level.
+
+### Walking and the bus
+
+`X` puts you on foot (`Walker`). You walk on the terrain as drawn and on everything `Structures` built: every box
+(`Structures.box` records it as a solid, see `solid`), and the bridges' decks and parapets. Each frame the walker tests
+the solids within 2 m, from a 16 m grid over them. A top within 0.5 m of your feet is a floor you step up onto. A box
+that reaches higher is a wall that pushes you out, unless all of it is above your head. You cannot wade into open water,
+but you can cross it on a bridge. On foot the near plane comes in from 1 m to 5 cm, so the seat backs in front of you are
+not clipped.
+
+A `bus` entity (`BusLine`) runs one bus between the bus station and the village:
+
+- **Route**: from the station's platform it leaves past the east end of the canopy and runs along the south side of the
+  town blocks. A two-lane road with a dashed centre line, built by the entity, takes it to the village road's nearer end.
+  It drives through the village, crossing the stone bridge on its deck, round a balloon loop past the far end, back
+  through the village, and in through a gap in the forecourt railing to the platform again. The station leaves its
+  drive-through lane to the bus line. The path is rounded at the corners with arcs and resampled every metre, so the
+  bus's position is an O(1) lookup. The bus follows it by its axles: the heading runs from the rear axle to the front
+  one, and their heights pitch it.
+- **Driving**: the bus cruises at `speed` (default 22 m/s), slows to `village` (10 m/s) in the village and to 6 m/s at
+  the station and round the loop, and takes bends at 1.3 m/s² sideways. It brakes at 1 m/s² ahead of slower stretches
+  and stops, and pulls away at 1.1 m/s². It stops at the platform and by the village's shelter, on whichever pass has
+  the shelter on its right, with the front door at the shelter. At each stop it waits `dwell` seconds with the doors
+  open; they close 3 s before it leaves. A one-way trip takes about 11 minutes; hold `Z` to speed it up.
+- **The bus**: 12 m long, built in its own frame (`buildBus`; `BUS` holds its sizes). It has a low floor, eight window
+  bays a side with pillars between them, and two glazed doors on the right (front and middle) whose leaves slide apart
+  outside the body. There are 41 forward-facing seats (raised over the wheel arches), a back bench, poles and rails, a
+  driver's cab with the driver, ceiling lamps, head, tail and destination lights, a windscreen and a rear window. The
+  scene pass draws it with its own matrices: `busMVP` is built in doubles about the camera, so an interior a metre away
+  does not jitter at 12 km from the origin. Door leaves carry a flag and move in the vertex shader (`busVertex`).
+- **Glass**: the windows are drawn in the final pass after the rain particles, without depth, so the march, the haze
+  and the rain outside show through them (`fsGlass`). They have a faint tint and reflect the sky at grazing angles.
+  While it rains they carry drops, from a hash per 2 cm cell; on the side windows the wind of the bus's speed draws the
+  drops out backwards into streaks.
+- **Inside**: the cabin is lit through its windows (`shadeCabin`): sky light, less below the window line; the sun only
+  where its ray leaves the body through glass, a single box exit (`throughGlass`), so sunlight falls in window-shaped
+  patches; and the ceiling lamps. A canopy over the bus still shades it.
+- **Riding**: step in through an open door and you ride in the bus's frame. Your position is kept in bus coordinates,
+  and your view turns with the bus. Look at a seat within reach and press `E` to sit; your eye is then the seat's. Get
+  off through an open door. The bus's colliders (floor, walls with door openings, seats, wheel arches, driver's cab, and
+  the door leaves while the doors are closed) are boxes in its frame. Outside the bus they are moved into the world
+  each frame.
+
+**The cabin is a rain shelter that moves**, and it costs O(1). The frame uniform carries the bus's body as one box in
+its frame (`busInv`, `cabinLo`, `cabinHi`):
+
+- Near-field drops, flakes and roof drips: one point-in-box test per particle (`inCabin`); none fall inside.
+- Volumetric march: one ray-box test per ray (`cabinSpan`); the steps inside the cabin take no rain, snow or haze. On
+  the test machine that made the march cheaper, not dearer, from the aisle in a downpour: 0.21 ms with the cabin
+  against 0.55 ms without, with every other pass the same.
+- The body is also a moving shader box (`dyn`): it casts a sun shadow, keeps the rain off what is in its lee, and
+  occludes the sky under it. It leaves no dry patch on the wet road (`structureLight` skips moving boxes for wetness).
 
 ### Analytic storm structures
 
@@ -294,7 +352,7 @@ the same way. Their tops get more sky light than their undersides, which is what
 | `weather` | `start`, `transition` (s), `cycle` { `enabled`, `hold` }, `states` { name: state } |
 | `entities` | `{ type, id, label, ... }`, where `type` maps to a class in `ENTITY_TYPES` (below), applied in order |
 | `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure` } } |
-| `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity, or `{ name, follow (entity id), spot }` for a viewpoint the entity laid out (a village's); optional `lighting` (preset) and `weather` (state) |
+| `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity, or `{ name, follow (entity id), spot }` for a viewpoint the entity laid out (a village's; a bus's `seat` puts you in one); optional `lighting` (preset), `weather` (state) and `walk` (true: on foot from there) |
 
 Positions are metres: `[x, z]` on the map, with x east, z south, and the map centred on 0.
 
@@ -348,6 +406,7 @@ The weather map writes each genus's coverage into one channel of a layer map (`l
 | `forest` | terrain | `pos`, `radius`, `density`, `seed` |
 | `village` | structure | a village on a road, laid out from `seed` (below) |
 | `busStation` | structure | a town's central bus station (below) |
+| `bus` | vehicle | a bus line from a `busStation` (`from`) to a `village` (`to`), and the road between them: `speed`, `village` (m/s), `dwell` [station, village] (s), `livery` [r, g, b]; viewpoint `seat`. See **Walking and the bus** |
 | `storm` | weather | storm cell, below |
 | `supercell` | weather | a storm with a mothership plate stack: `stackRadius` (× radius), `stackDrop` / `stackHeight` (m below / above the cloud base), `plates`, `twist` (plates climbed per turn), `spin` (rad/s), `wallCloud` (m), `wallRadius` (× stack radius) |
 | `squall` | weather | a line of `count` storms from `from` to `to`, carried by the wind (`drift`, `velocity`); it starts over after `travel` m. Also takes `radius`, `top`, `precip`, `lightning`, `green`. Its shelf cloud runs along the gust front, `gap` × radius ahead of the cells and bowed out by `bow` m: `shelf` (strength), `lip` (m above ground), `shelfDepth`, `tiers` |
@@ -381,6 +440,7 @@ blocks stand around the forecourt. The ground is levelled under it. Parameters:
 - `level` (m, default 200): the terrain is flattened to its mean within this radius, blending out 300 m further
 - viewpoints for `views` (`{ follow: "station", spot }`): `platform` (under the canopy, looking out over the bays),
   `forecourt` (out in the rain at the canopy's corner), `overview`
+- with a `bus` line from it, the drive-through lane is the bus's and the forecourt railing has a gap for it
 
 The canopy's soffit is 5.4 m up and its fascia hangs to 4.7 m. It is one shader box from the bottom of its fascia to the top of the upstand, so the platform stays dry and the
 deep fascia keeps slanting rain off its edge; the pillars, the kiosk, the buses, the terminal and the town blocks are
@@ -437,11 +497,13 @@ WGSL_SHADOW, WGSL_GROUND                   ground state
 WGSL_FROXEL, WGSL_SKIP_SAMPLE,             compute: froxel lighting, occupancy / tile lookups, cloud tile pre-pass,
 WGSL_TILES, WGSL_MARCH, WGSL_RESOLVE       volumetric march, temporal resolve
 WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
-WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion
-Entity, ENTITY_TYPES                       terrain features, GroundFrame / Structures / Village / BusStation, StormCell, Supercell,
+WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion; the bus cabin
+Entity, ENTITY_TYPES                       terrain features, GroundFrame / Structures / Village / BusStation, BusLine (+ buildBus,
+                                           roundPath, offsetLine), StormCell, Supercell,
                                            SquallLine, Spawner
 WeatherSystem, CloudLayers, Sky,           data-driven weather (states blend every value, including genus
 Lightning, World                           coverage), cloud genus layers, sky colours, lightning, world
 NoiseVolumes, WeatherPass, GroundPass, FroxelPass, CloudPass, GpuProfiler, Renderer
-Input, FlyCamera, Hud, App, main
+Input, FlyCamera, collideWalker, Walker,    input, flying, walking and riding,
+Hud, App, main                             HUD, app
 ```
