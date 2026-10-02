@@ -3565,9 +3565,12 @@ class BusStation extends Entity {
             S.blocker(f, bx, bz, bhx, bhz, gLo, top + 0.5, 0);
         }
 
-        // shader boxes: the canopy slab with its fascia (dry under it; the deep fascia keeps slanting rain off its
-        // edges), the clerestory, the pillars (sun shadows); rain runs off the fascia's edges
-        S.blocker(f, 0, 0, L, hz, yf, yt + 0.2, 0.55, 0, gLo);
+        // shader boxes: the canopy slab (dry under it: its box starts at the slab, since a point inside a box is not
+        // sheltered by it), the fascia as thin boxes round its edges (they keep slanting rain off), the clerestory, the
+        // pillars (sun shadows); rain runs off the fascia's edges
+        S.blocker(f, 0, 0, L, hz, slab, yt + 0.2, 0.55, 0, gLo);
+        for (const sz of [-1, 1]) S.blocker(f, 0, sz * (hz - 0.15), L, 0.15, yf, slab, 0);
+        for (const sx of [-1, 1]) S.blocker(f, sx * (L - 0.15), 0, 0.15, hz - 0.3, yf, slab, 0);
         S.blocker(f, 0, 0, L - 7.4, 4.1, yt, yt + 2.5, 0.2, 0, gLo);
         for (const x of pillars) S.blocker(f, x, 0, 0.45, 0.45, plat, slab - 1.4, 0);
         S.drip(f, 0, 0, L, hz, yf, yf - plat + 0.18);

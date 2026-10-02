@@ -264,7 +264,7 @@ the scenario's bus station views start in medium rain, a downpour and light rain
 Structures stand in the shaders as up to 128 boxes (`blockers` in the frame uniform), each turned by its yaw and
 sheared along its length by a slope, so bridge decks follow their ramps and arch. A house is two boxes (walls; roof
 with its eaves), the bus shelter four (roof, back and side panels), a deck one per 8 m piece, fitted inside the
-curved deck, and the bus station about 27 (canopy, clerestory, pillars, kiosk, buses, terminal, town blocks). `WGSL_SHELTER` tests rays against them:
+curved deck, and the bus station about 31 (canopy, fascia, clerestory, pillars, kiosk, buses, terminal, town blocks). `WGSL_SHELTER` tests rays against them:
 
 - **Rain shadow**: a point is dry where the path its drops came along, straight back up against their fall and slanted
   by the wind (0.8 of the wind, rain at the state's fall speed, snow at 1.35 m/s, as the near-field particles), enters a box. So the
