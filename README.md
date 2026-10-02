@@ -227,9 +227,9 @@ and from 25–28 ms to 10–12 ms at high.
 | Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, interleave, detail distance, cloud blur) |
 | V, L, P, H | next view, labels, pause weather, help |
 | X | walk (from the ground below the camera) / fly |
-| B | go to the bus: outside its front door while it stands at a stop, else aboard in the aisle |
+| B | go to the next bus of the line (each press another): outside its front door while it stands at a stop, else aboard in the aisle |
 | E | aboard: sit in the seat you look at, or stand up |
-| hold Z | the bus runs ten times as fast |
+| hold Z | the buses run ten times as fast |
 
 On foot, WASD walks (Shift runs, Alt creeps) and dragging looks around; Space and C do nothing.
 
@@ -292,7 +292,15 @@ that reaches higher is a wall that pushes you out, unless all of it is above you
 but you can cross it on a bridge. On foot the near plane comes in from 1 m to 5 cm, so the seat backs in front of you are
 not clipped.
 
-A `bus` entity (`BusLine`) runs one bus between the bus station and the village:
+A `bus` entity (`BusLine`) runs a fleet of buses (`Bus`) between the bus station and the village:
+
+- **Fleet**: `fleet` buses, by default the station's `buses` (5), so every bus of the station runs the line and none is
+  left parked at the bays. The first is the entity's `label` in its `livery`; the others are numbered after it
+  (`Bus 7 #2` ...) in the station's liveries. They leave the station at even intervals: one trip round (both dwells
+  included, about 21 minutes in the default scenario) over the fleet, about 4 minutes apart with 5 buses. At load the
+  trip is timed with a lone bus, and each bus is run on to its place in the timetable, so they are spread along the
+  route from the first frame and pass each other on the road. A bus never closes up to within 6 m of the one ahead:
+  it brakes for it as for a stop and waits there if it must.
 
 - **Route**: from the station's platform it leaves past the east end of the canopy and runs along the south side of the
   town blocks. A two-lane road with a dashed centre line, built by the entity, takes it to the village road's nearer end.
@@ -310,8 +318,9 @@ A `bus` entity (`BusLine`) runs one bus between the bus station and the village:
   bays a side with pillars between them, and two glazed doors on the right (front and middle) whose leaves slide apart
   outside the body. There are 41 forward-facing seats (raised over the wheel arches), a back bench, poles and rails, a
   driver's cab with the driver, ceiling lamps, head, tail and destination lights, a windscreen and a rear window. The
-  scene pass draws it with its own matrices: `busMVP` is built in doubles about the camera, so an interior a metre away
-  does not jitter at 12 km from the origin. Door leaves carry a flag and move in the vertex shader (`busVertex`).
+  scene pass draws each bus within 5 km with its own uniforms (`wgslBus`: one 256-byte slot per bus, bound at a dynamic
+  offset). Its clip matrix is built in doubles about the camera, so an interior a metre away does not jitter at 12 km
+  from the origin. Door leaves carry a flag and move in the vertex shader (`busVertex`).
 - **Glass**: the windows are drawn in the final pass after the rain particles, without depth, so the march, the haze
   and the rain outside show through them (`fsGlass`). They have a faint tint and reflect the sky at grazing angles.
   While it rains they carry drops, from a hash per 2 cm cell; on the side windows the wind of the bus's speed draws the
@@ -325,14 +334,14 @@ A `bus` entity (`BusLine`) runs one bus between the bus station and the village:
   the door leaves while the doors are closed) are boxes in its frame. Outside the bus they are moved into the world
   each frame.
 
-**The cabin is a rain shelter that moves**, and it costs O(1). The frame uniform carries the bus's body as one box in
-its frame (`busInv`, `cabinLo`, `cabinHi`):
+**The cabin is a rain shelter that moves**, and it costs O(1). The frame uniform carries the body of one bus, the one you
+ride or else the nearest, as one box in its frame (`busInv`, `cabinLo`, `cabinHi`):
 
 - Near-field drops, flakes and roof drips: one point-in-box test per particle (`inCabin`); none fall inside.
 - Volumetric march: one ray-box test per ray (`cabinSpan`); the steps inside the cabin take no rain, snow or haze. On
   the test machine that made the march cheaper, not dearer, from the aisle in a downpour: 0.21 ms with the cabin
   against 0.55 ms without, with every other pass the same.
-- The body is also a moving shader box (`dyn`): it casts a sun shadow, keeps the rain off what is in its lee, and
+- Every bus's body is also a moving shader box (`dyn`): it casts a sun shadow, keeps the rain off what is in its lee, and
   occludes the sky under it. It leaves no dry patch on the wet road (`structureLight` skips moving boxes for wetness).
 
 ### Analytic storm structures
@@ -406,7 +415,7 @@ The weather map writes each genus's coverage into one channel of a layer map (`l
 | `forest` | terrain | `pos`, `radius`, `density`, `seed` |
 | `village` | structure | a village on a road, laid out from `seed` (below) |
 | `busStation` | structure | a town's central bus station (below) |
-| `bus` | vehicle | a bus line from a `busStation` (`from`) to a `village` (`to`), and the road between them: `speed`, `village` (m/s), `dwell` [station, village] (s), `livery` [r, g, b]; viewpoint `seat`. See **Walking and the bus** |
+| `bus` | vehicle | a bus line from a `busStation` (`from`) to a `village` (`to`), and the road between them: `speed`, `village` (m/s), `dwell` [station, village] (s), `livery` [r, g, b], `fleet` (default: the station's `buses`); viewpoint `seat` (the first bus). See **Walking and the bus** |
 | `storm` | weather | storm cell, below |
 | `supercell` | weather | a storm with a mothership plate stack: `stackRadius` (× radius), `stackDrop` / `stackHeight` (m below / above the cloud base), `plates`, `twist` (plates climbed per turn), `spin` (rad/s), `wallCloud` (m), `wallRadius` (× stack radius) |
 | `squall` | weather | a line of `count` storms from `from` to `to`, carried by the wind (`drift`, `velocity`); it starts over after `travel` m. Also takes `radius`, `top`, `precip`, `lightning`, `green`. Its shelf cloud runs along the gust front, `gap` × radius ahead of the cells and bowed out by `bow` m: `shelf` (strength), `lip` (m above ground), `shelfDepth`, `tiers` |
@@ -436,7 +445,7 @@ blocks stand around the forecourt. The ground is levelled under it. Parameters:
 
 - `pos`, `yaw` (degrees; the canopy runs along it), `length` and `width` (m of canopy, default 96 × 30: it overhangs
   the 15 m platform by 7.5 m each side, so wind-blown rain does not reach it)
-- `bays` (default 20), `buses` (default 5: nose-in at random bays, one in the lane), `seed`
+- `bays` (default 20), `buses` (default 5: nose-in at random bays, one in the lane; when a `bus` line runs from the station they all run it instead), `seed`
 - `level` (m, default 200): the terrain is flattened to its mean within this radius, blending out 300 m further
 - viewpoints for `views` (`{ follow: "station", spot }`): `platform` (under the canopy, looking out over the bays),
   `forecourt` (out in the rain at the canopy's corner), `overview`
