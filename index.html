@@ -93,7 +93,10 @@
     weather   start, transition (s), cycle { enabled, hold (s) }, states { name: { coverage (cumulus), base, top, density, cirrus,
               layers { genus: coverage }, wind [x, z] m/s, temperature (C at sea level), haze, drizzle, storms (spawn rate x),
               power (storm precipitation x), lightning (x), rain (genus layer precipitation x; past 1 a deck pours),
-              drops (0 drizzle .. 1 downpour: drop size, fall speed, how the near-field rain looks) } }
+              drops (0 drizzle .. 1 downpour: drop size, fall speed, how the near-field rain looks) }
+              zones { along (bus entity id), variants [state names], length (m of route each), hold [min, max] s,
+              dry { state, count } }: those states' rain at once, in stretches along the bus route, with `count` dry
+              stretches under the `dry` state's sky (the deck opens there), reshuffled after a random hold } }
     entities  { type, id, label, ... }, type in ENTITY_TYPES, applied in order:
               terrain  tilt { dir, drop } | hills { amplitude, scale, octaves, seed, ridged } | mountain { pos, radius, height, roughness }
                        range { path, width, height, roughness, seed } | river { path, width, depth, bank } | lake { pos, radius, level }
@@ -184,7 +187,12 @@
                                "temperature": 15, "haze": 1.7, "drizzle": 0, "storms": 0.2, "power": 0.7, "lightning": 0, "rain": 1.0, "drops": 0.6 },
             "downpour":      { "coverage": 0.3, "base": 2300, "top": 4600, "density": 0.07, "cirrus": 0, "wind": [6, -4],
                                "layers": { "nimbostratus": 1.0, "stratus": 0.6 },
-                               "temperature": 18, "haze": 2.0, "drizzle": 0, "storms": 0.4, "power": 1.2, "lightning": 0.2, "rain": 2.6, "drops": 1 }
+                               "temperature": 18, "haze": 2.0, "drizzle": 0, "storms": 0.4, "power": 1.2, "lightning": 0.2, "rain": 2.6, "drops": 1 },
+            "mixed rain":    { "coverage": 0.12, "base": 2500, "top": 4000, "density": 0.06, "cirrus": 0, "wind": [5, -3],
+                               "layers": { "nimbostratus": 0.95, "stratus": 0.45 },
+                               "temperature": 15, "haze": 1.7, "drizzle": 0, "storms": 0, "power": 0.7, "lightning": 0, "rain": 0.38, "drops": 0.35,
+                               "zones": { "along": "bus", "variants": ["drizzle", "light rain", "medium rain", "downpour"],
+                                          "length": 1200, "hold": [40, 100], "dry": { "state": "clear", "count": 2 } } }
         }
     },
 
@@ -245,14 +253,14 @@
         { "name": "Above the anvils",      "pos": [12000, 13800, 18000], "look": [0, 7000, -4000] },
         { "name": "Front Range",           "pos": [-12000, 3600, 9000], "look": [-28000, 3200, -6000] },
         { "name": "Town street level",     "pos": [-4200, 1640, 10500], "look": [0, 2600, -2000] },
-        { "name": "Village bus stop",      "follow": "village", "spot": "bus stop", "weather": "overcast rain" },
+        { "name": "Village bus stop",      "follow": "village", "spot": "bus stop", "weather": "mixed rain" },
         { "name": "Village bridges",       "follow": "village", "spot": "bridges", "weather": "overcast rain" },
         { "name": "Under the bridge",      "follow": "village", "spot": "under the bridge", "weather": "overcast rain" },
         { "name": "Bus station platform",  "follow": "station", "spot": "platform", "weather": "medium rain" },
         { "name": "Bus station forecourt", "follow": "station", "spot": "forecourt", "weather": "downpour" },
         { "name": "Bus station overview",  "follow": "station", "spot": "overview", "weather": "light rain" },
-        { "name": "On foot at the bus station", "follow": "station", "spot": "platform", "weather": "medium rain", "walk": true },
-        { "name": "Riding the bus",        "follow": "bus", "spot": "seat", "weather": "medium rain", "walk": true },
+        { "name": "On foot at the bus station", "follow": "station", "spot": "platform", "weather": "mixed rain", "walk": true },
+        { "name": "Riding the bus",        "follow": "bus", "spot": "seat", "weather": "mixed rain", "walk": true },
         { "name": "Shelf cloud",   "follow": "squall", "offset": [7000, 25, 1500], "lookOffset": [-4000, 2100, -2500],
           "lighting": "storm dusk", "weather": "severe storms" },
         { "name": "Mothership",    "follow": "hero", "offset": [-5500, 25, 8000], "lookOffset": [0, 3000, 0],
@@ -304,6 +312,9 @@ const MAX_BOLT_SEGS = 256;
 const MAX_BLOCKERS = 128;            // structure boxes in the frame uniform (sun and rain shadows, see WGSL_SHELTER)
 const BLOCK_GRID = 32;               // cells per side over their bounds, each listing the boxes that can shade it (4 x 32 bits)
 const BLOCK_RANGE = 2500;            // only boxes this close to the camera (m) go into the frame, so the grid stays fine
+const MAX_RAIN_ZONES = 64;           // points along the bus route with their own rain rate (RainZones, mixed rain)
+const ZONE_STEP = 300, ZONE_RADIUS = 380;  // m between them, how far each one's rain reaches
+const CLEAR_RADIUS = 450, CLEAR_WIDE = 3;   // a clear stretch's opening: m past its ends along the route, x that across it
 const MAX_DRIPS = 8;                 // roof edges near the camera that rain runs off (see vsPrecip)
 const DRIP_DENSITY = 100;           // at most this many of them per metre of edge
 const DRIP_PARTICLES = 40000;        // near-field drops falling off those edges, drawn after the rain
@@ -346,8 +357,8 @@ const WEATHER_DEFAULTS = {
 };
 // how fast rain falls (m/s) for a drop size between 0 (drizzle, fine droplets) and 1 (downpour, big drops)
 const rainFall = drops => 2.5 + 7.5 * Math.pow(clamp(drops, 0, 1), 0.7);
-// the rain variants N steps through (weather states of these names)
-const RAIN_VARIANTS = ['drizzle', 'light rain', 'medium rain', 'downpour'];
+// the rain variants N steps through (weather states of these names); "mixed rain" has them all at once along the bus route
+const RAIN_VARIANTS = ['drizzle', 'light rain', 'medium rain', 'downpour', 'mixed rain'];
 // cloud genus layers (scenario `clouds`): kind heap | sheet | cellular
 const LAYER_DEFAULTS = {
     name: 'layer', kind: 'sheet', base: 2000, top: 2600, mapScale: 25000, shapeScale: 9000, stretch: 2, erosion: 0.2,
@@ -657,6 +668,9 @@ const FRAME_LAYOUT = [
     ['blocks', 'vec4f'],    // structure boxes: count, lowest bottom, highest top (m), -
     ['blockBox', 'vec4f'],  // their bounds x0, z0, x1, z1, padded for the shadows and rain shadows they cast
     ['rain', 'vec4f'],      // drop size (0 drizzle .. 1 downpour), rain fall speed (m/s), genus layer precipitation scale, rain particles
+    ['zoneInfo', 'vec4f'],  // rain zones in rainZones, their fade (0 .. 1), their radius (m), a clear stretch's opening along the route (m)
+    ['rainZones', `array<vec4f, ${MAX_RAIN_ZONES}>`], // points along the bus route (mixed rain): x, z, genus layer cover scale, precipitation scale
+    ['zoneDirs', `array<vec4f, ${MAX_RAIN_ZONES / 2}>`], // the route's direction at them, two per vec4: x, z
     ['drips', 'vec4f'],     // roof edges in dripEdges, -, -, -
     ['dripEdges', `array<vec4f, ${MAX_DRIPS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, edge height, drop to the ground] [share of drops up to this edge, edges (0 all four, 1 along local x), share of its drops kept, -]
     ['blockers', `array<vec4f, ${MAX_BLOCKERS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, bottom, top] [sky occlusion, slope, -, -]
@@ -1582,6 +1596,33 @@ fn genDetail(@builtin(global_invocation_id) gid: vec3u) {
 // ------------------------------------------------------------------------------------- WGSL weather maps
 // weather map: layer coverage from large-scale noise advected by the wind, plus every storm cell
 const WGSL_WEATHER = /* wgsl */`
+// the genus layers' precipitation scale (x) and cover scale (y) at xz: the state's (F.rain.z, 1), or along the bus route
+// in mixed rain the zones' (RainZones): a Gaussian-weighted mean of the route points near xz, faded in by their summed
+// weight. A clear stretch (cover 0) opens the decks: a flat-topped hole around each of its points, F.zoneInfo.w along
+// the route (short of the next stretch's rain) and CLEAR_WIDE times that across it, so the sky over it is open.
+fn zoneAt(xz: vec2f) -> vec2f {
+    let n = u32(F.zoneInfo.x);
+    if (n == 0u) { return vec2f(F.rain.z, 1.0); }
+    var w = 0.0;
+    var v = 0.0;
+    var hole = 0.0;
+    for (var i = 0u; i < n; i++) {
+        let z = F.rainZones[i];
+        let dist = length(xz - z.xy);
+        let d = dist / F.zoneInfo.z;
+        if (d < 3.0) { let g = exp(-d * d); w += g; v += g * z.w; }
+        if (z.z < 1.0 && dist < F.zoneInfo.w * ${CLEAR_WIDE * 2}.0) {
+            let dv = F.zoneDirs[i / 2u];
+            let t = select(dv.xy, dv.zw, (i & 1u) == 1u);
+            let off = xz - z.xy;
+            let h = length(vec2f(dot(off, t), dot(off, vec2f(-t.y, t.x)) / ${CLEAR_WIDE}.0)) / F.zoneInfo.w;
+            let h3 = h * h * h;
+            hole = max(hole, (1.0 - z.z) * exp(-h3 * h3));
+        }
+    }
+    return vec2f(mix(F.rain.z, v / max(w, 1e-4), sat(w) * F.zoneInfo.y), 1.0 - hole * F.zoneInfo.y);
+}
+
 @group(1) @binding(0) var weatherOut: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(1) var anvilOut: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var layerOut: texture_storage_2d<rgba16float, write>;
@@ -1594,7 +1635,8 @@ fn weather(@builtin(global_invocation_id) gid: vec3u) {
     let xz = F.wdomain.xy + (vec2f(gid.xy) + 0.5) / f32(n) * F.wdomain.z;
     let lf = fbm2((xz - F.wind.zw) / 16000.0, 5);
     let covParam = F.cloud.w;
-    var cov = sat(covParam * (0.5 + 2.0 * (lf - 0.5)) + covParam * covParam * 0.35);
+    let zone = zoneAt(xz);
+    var cov = sat(covParam * (0.5 + 2.0 * (lf - 0.5)) + covParam * covParam * 0.35) * mix(0.35, 1.0, zone.y);
     var top = F.cloud.y;
     var pr = F.cirrus.w * smoothstep(0.5, 0.9, cov) * (0.4 + lf);      // drizzle / snow from the layer itself
     var vw = 0.0;
@@ -1614,9 +1656,9 @@ fn weather(@builtin(global_invocation_id) gid: vec3u) {
         let C = F.layers[k * 3 + 2];
         if (A.z <= 0.0) { continue; }
         let ln = fbm2((xz - F.wind.zw * 0.8) / B.x + C.w * 17.0, 4);
-        let lc = sat(A.z * (0.45 + 2.2 * (ln - 0.5)) + A.z * A.z * 0.6);
+        let lc = sat(A.z * (0.45 + 2.2 * (ln - 0.5)) + A.z * A.z * 0.6) * zone.y;
         lcov[k] = lc;
-        let lp = C.z * smoothstep(0.35, 0.85, lc) * F.rain.z;
+        let lp = C.z * smoothstep(0.35, 0.85, lc) * zone.x;
         pr = 1.0 - (1.0 - pr) * (1.0 - sat(lp));
         pour = max(pour, lp - 1.0);
     }
@@ -4237,11 +4279,12 @@ const ENTITY_TYPES = {
 // =====================================================================================================
 // Weather, sky, lightning
 // =====================================================================================================
-// Named weather states; the current state blends towards the target over `transition` seconds.
+// Named weather states; the current state blends towards the target over `transition` seconds. A state's `zones` (rain
+// that differs along the bus route, RainZones) is not blended: the zones fade in and out on their own.
 class WeatherSystem {
     constructor(def) {
         this.def = def || {};
-        this.states = Object.fromEntries(Object.entries(this.def.states || { default: {} }).map(([k, v]) => [k, { ...WEATHER_DEFAULTS, ...v }]));
+        this.states = Object.fromEntries(Object.entries(this.def.states || { default: {} }).map(([k, v]) => [k, { zones: null, ...WEATHER_DEFAULTS, ...v }]));
         this.names = Object.keys(this.states);
         const start = this.states[this.def.start] ? this.def.start : this.names[0];
         this.cur = structuredClone(this.states[start]);
@@ -4258,6 +4301,7 @@ class WeatherSystem {
         if (!this.states[name]) return;
         this.from = structuredClone(this.cur);
         this.target = name;
+        this.cur.zones = this.states[name].zones;
         this.blend = 0;
         this.cycleClock = this.cycle.hold;
     }
@@ -4277,6 +4321,7 @@ class WeatherSystem {
             this.blend = Math.min(1, this.blend + dt / Math.max(this.transition, 1e-3));
             const k = smoothstep(0, 1, this.blend), to = this.states[this.target];
             for (const key of Object.keys(to)) {
+                if (key === 'zones') continue;
                 const a = this.from[key], b = to[key];
                 if (Array.isArray(b)) this.cur[key] = b.map((v, i) => lerp(a[i], v, k));
                 else if (typeof b === 'object') {
@@ -4288,6 +4333,142 @@ class WeatherSystem {
         if (this.cycle.enabled && (this.cycleClock -= dt) <= 0) this.next();
         this.offset[0] += this.cur.wind[0] * wdt;
         this.offset[1] += this.cur.wind[1] * wdt;
+    }
+}
+
+// Mixed rain: a state's `zones` puts its `variants` (other weather states: drizzle, light rain, ...) along a bus route
+// at once, in stretches of `length` m from the station out to the turn, each variant at least once, and reshuffles them
+// after a random `hold` [min, max] s (blending over the weather transition). `dry` { state, count } adds `count`
+// stretches of a state without a deck (clear), twice as long: no rain, and the genus layers open up over them to its
+// sky. The route is sampled every ZONE_STEP m; each sample carries a rain scale for the genus layers (F.rain.z there,
+// see zoneAt in WGSL), a cover scale for them (0 a clear stretch), the route's direction there and a drop size (the
+// near-field rain at the camera). A variant's rain scale is the one that gives this state's deck the precipitation the
+// variant's own deck has (deckRain), so a drizzle stretch rains like drizzle under the mixed state's nimbostratus.
+// A clear stretch's opening reaches CLEAR_RADIUS m past its ends along the route (short of the next stretch's rain:
+// rain needs cloud above it) and CLEAR_WIDE times that to the sides, so the sky over it is open, not a gap overhead.
+class RainZones {
+    constructor(world) {
+        this.world = world;
+        this.pts = [];          // { x, z, s (m from the station), dir [x, z], scale, cover, drops, from, to }
+        this.ends = [];         // where each stretch of `order` ends (m from the station)
+        this.fade = 0;          // 0 no zones .. 1 the zones rule along the route
+        this.spec = null;
+        this.order = [];
+        this.clock = 0;
+        this.blend = 1;
+    }
+
+    // precipitation of a state's genus decks at a rain scale, as the weather map has it where the decks are typical
+    static deckRain(state, defs, scale) {
+        let pr = 0, pour = 0;
+        for (const d of defs) {
+            const c = state.layers?.[d.name] ?? 0, lc = sat01(c * 0.45 + c * c * 0.6);
+            const lp = d.precip * smoothstep(0.35, 0.85, lc) * scale;
+            pr = 1 - (1 - pr) * (1 - sat01(lp));
+            pour = Math.max(pour, lp - 1);
+        }
+        return pr + pour;
+    }
+
+    // the route of `along` (a bus line): its path from the station out to the turn
+    build(spec) {
+        const line = this.world.get(spec.along);
+        this.pts = [];
+        if (!line?.path) return;
+        const half = line.len / 2;
+        for (let s = 0; s <= half && this.pts.length < MAX_RAIN_ZONES; s += ZONE_STEP) {
+            const p = line.at(s), a = line.at(s - 20), b = line.at(s + 20), l = Math.hypot(b[0] - a[0], b[2] - a[2]) || 1;
+            this.pts.push({ x: p[0], z: p[2], s, dir: [(b[0] - a[0]) / l, (b[2] - a[2]) / l], scale: 1, cover: 1, drops: 0.5, from: [1, 1, 0.5], to: [1, 1, 0.5] });
+        }
+        this.half = half;
+    }
+
+    // a new random order of the variants along the route: every one at least once, the dry stretches (two units of
+    // `length` each) added, no two stretches alike side by side
+    shuffle(spec) {
+        const W = this.world.weather, defs = this.world.clouds.defs, deck = W.states[W.target];
+        const vars = (spec.variants || []).filter(n => W.states[n]);
+        const dry = W.states[spec.dry?.state] ? spec.dry.state : null, dryCount = dry ? Math.max(0, spec.dry.count ?? 2) : 0;
+        if (!vars.length || !this.pts.length) return;
+        const wet = Math.max(vars.length, Math.round(this.half / (spec.length || 1200)) - 2 * dryCount);
+        const bag = [...vars, ...new Array(dryCount).fill(dry)];
+        while (bag.length < wet + dryCount) bag.push(vars[Math.floor(Math.random() * vars.length)]);
+        let order = bag;
+        for (let t = 0; t < 200; t++) {
+            order = [...bag].sort(() => Math.random() - 0.5);
+            if (order.every((v, i) => i === 0 || v !== order[i - 1])) break;
+        }
+        this.order = order;
+        // a variant's rain scale: what gives this state's deck the variant's own precipitation; its cover: 0 for a
+        // state without a deck (clear)
+        const want = name => {
+            const v = W.states[name], target = RainZones.deckRain(v, defs, v.rain);
+            let lo = 0, hi = 8;
+            for (let k = 0; k < 30; k++) { const m = (lo + hi) / 2; if (RainZones.deckRain(deck, defs, m) < target) lo = m; else hi = m; }
+            const cover = smoothstep(0, 0.5, Math.max(0, ...Object.values(v.layers || {})));
+            return [(lo + hi) / 2, cover, v.drops];
+        };
+        const params = Object.fromEntries([...new Set(order)].map(n => [n, want(n)]));
+        const unit = this.half / order.reduce((a, v) => a + (v === dry ? 2 : 1), 0);
+        let end = 0;
+        this.ends = order.map(v => (end += (v === dry ? 2 : 1) * unit));
+        for (const p of this.pts) {
+            p.from = [p.scale, p.cover, p.drops];
+            p.to = params[this.order[this.stretch(p.s)]];
+        }
+        this.blend = 0;
+        const h = spec.hold || [40, 100];
+        this.clock = lerp(h[0], h[1] ?? h[0], Math.random());
+    }
+
+    update(dt) {
+        const W = this.world.weather, spec = W.cur.zones;
+        if (spec && spec !== this.spec) {
+            if (spec.along !== this.spec?.along) this.build(spec);
+            this.spec = spec;
+            this.shuffle(spec);
+            if (this.fade === 0) { this.blend = 1; for (const p of this.pts) [p.scale, p.cover, p.drops] = p.to; }
+        }
+        this.fade = sat01(this.fade + (spec ? 1 : -1) * dt / Math.max(W.transition, 1e-3));
+        if (!this.spec) return;
+        if (spec && (this.clock -= dt) <= 0) this.shuffle(spec);
+        if (this.blend < 1) {
+            this.blend = Math.min(1, this.blend + dt / Math.max(W.transition, 1e-3));
+            const k = smoothstep(0, 1, this.blend);
+            for (const p of this.pts) [p.scale, p.cover, p.drops] = p.from.map((a, i) => lerp(a, p.to[i], k));
+        }
+        if (!spec && this.fade === 0) this.spec = null;
+    }
+
+    // weight of the route at x, z (0 off it, 1 on it) and the zones' drop size there; mirrors zoneAt in WGSL
+    at(x, z) {
+        let w = 0, v = 0;
+        for (const p of this.pts) { const d = Math.hypot(x - p.x, z - p.z) / ZONE_RADIUS; if (d < 3) { const g = Math.exp(-d * d); w += g; v += g * p.drops; } }
+        return { k: sat01(w) * this.fade, drops: w > 1e-4 ? v / w : 0 };
+    }
+
+    // drop size at the camera: the state's, or the zone's along the route
+    drops(x, z, base) { if (!this.fade) return base; const a = this.at(x, z); return lerp(base, a.drops, a.k); }
+
+    // index in `order` of the stretch at s m from the station
+    stretch(s) { const i = this.ends.findIndex(e => s < e); return i < 0 ? this.ends.length - 1 : i; }
+
+    // the variant of the stretch nearest x, z (for the HUD), or null off the route
+    variantAt(x, z) {
+        if (!this.fade || !this.order.length) return null;
+        let best = null, bd = ZONE_RADIUS * 1.5;
+        for (const p of this.pts) { const d = Math.hypot(x - p.x, z - p.z); if (d < bd) { bd = d; best = p; } }
+        return best ? this.order[this.stretch(best.s)] : null;
+    }
+
+    write(F) {
+        const n = this.fade > 0 ? this.pts.length : 0;
+        for (let i = 0; i < n; i++) {
+            const p = this.pts[i];
+            F.set('rainZones', [p.x, p.z, p.cover, p.scale], i * 4);
+            F.set('zoneDirs', p.dir, i * 2);
+        }
+        F.set('zoneInfo', [n, this.fade, ZONE_RADIUS, CLEAR_RADIUS]);
     }
 }
 
@@ -4445,6 +4626,7 @@ class World {
         this.structures = new Structures(this.field);
         for (const e of this.entities) e.build(this.structures);
         for (const e of [...this.entities]) e.spawn();
+        this.rainZones = new RainZones(this);
     }
 
     add(def, spawn = true) {
@@ -4470,6 +4652,7 @@ class World {
 
     update(dt, wdt, t) {
         this.weather.update(dt, wdt);
+        this.rainZones.update(dt);
         for (const e of [...this.entities]) e.update(dt, wdt, t);
         if (this.entities.some(e => e.dead)) {
             this.entities = this.entities.filter(e => !e.dead);
@@ -5265,7 +5448,7 @@ class Hud {
         this.help.innerHTML = [
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
-            '<b>N</b> rain: drizzle / light / medium / downpour   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
+            '<b>N</b> rain: drizzle / light / medium / downpour / mixed   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
             '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
             '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
             'drop a scenario .json on the page',
@@ -5292,11 +5475,12 @@ class Hud {
         const wind = Math.hypot(...c.wind), dirDeg = (Math.atan2(c.wind[0], -c.wind[1]) / DEG + 360) % 360;
         const from = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(((dirDeg + 180) % 360) / 45) % 8];
         const here = p.rain + p.snow < 0.01 ? (app.camera.pos[1] > c.base && app.probe.coverage > 0.5 ? '<span class="m">in cloud</span>' : '<span class="m">dry</span>')
-            : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">${rainName(p.rain, c.drops)} ${(p.rain * 100).toFixed(0)}%</span>`;
+            : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">${rainName(p.rain, app.drops ?? c.drops)} ${(p.rain * 100).toFixed(0)}%</span>`;
+        const zone = w.rainZones.variantAt(app.camera.pos[0], app.camera.pos[2]);
         const q = QUALITY[app.quality], cw = app.renderer.cloudPass;
         const lines = [
             `<span class="t">ENTITY CLOUD // ${w.scenario.name || 'scenario'}</span>`,
-            `weather   ${wx.blend < 1 ? `<span class="w">${wx.target} ${(wx.blend * 100).toFixed(0)}%</span>` : wx.target}${wx.cycle.enabled ? ' <span class="m">(auto)</span>' : ''} · ×${app.timeScale} time${app.paused ? ' <span class="w">paused</span>' : ''}`,
+            `weather   ${wx.blend < 1 ? `<span class="w">${wx.target} ${(wx.blend * 100).toFixed(0)}%</span>` : wx.target}${w.rainZones.fade > 0 && wx.cur.zones ? ` <span class="m">(${zone ? `${zone} here` : 'off the route'} · reshuffle in ${Math.max(0, w.rainZones.clock).toFixed(0)} s)</span>` : ''}${wx.cycle.enabled ? ' <span class="m">(auto)</span>' : ''} · ×${app.timeScale} time${app.paused ? ' <span class="w">paused</span>' : ''}`,
             `layer     base ${(c.base / 1000).toFixed(1)} km · top ${(c.top / 1000).toFixed(1)} km · cover ${(c.coverage * 100).toFixed(0)}% · cirrus ${(c.cirrus * 100).toFixed(0)}%`,
             `air       ${c.temperature.toFixed(0)} °C at sea level · freezing level ${(wx.freezingLevel / 1000).toFixed(1)} km · wind ${wind.toFixed(0)} m/s from ${from}`,
             `clouds    ${w.clouds.active(c).map(([n, v]) => `${n} ${(v * 100).toFixed(0)}%`).join(' · ') || 'none'}`,
@@ -5478,7 +5662,7 @@ class App {
                     break;
                 }
                 case 'KeyN': {
-                    // step through the rain variants: drizzle, light rain, medium rain, downpour
+                    // step through the rain variants: drizzle, light rain, medium rain, downpour, mixed rain
                     const names = RAIN_VARIANTS.filter(n => wx.states[n]);
                     if (!names.length) { this.hud.toast('No rain variants in this scenario'); break; }
                     wx.set(names[(names.indexOf(wx.target) + 1) % names.length]);
@@ -5621,17 +5805,19 @@ class App {
         F.set('cirrus', [cfg.maxTop + 800, c.cirrus, 9000, c.drizzle]);
         F.set('march', [q.steps, q.light, cfg.maxDistance, this.radar ? 1 : 0]);
         // the shadow map refreshes a slice of rows per frame, unless the map moved or the sun / weather jumped
-        const shadowKey = `${wo[0]},${wo[1]},${sky.dir.map(v => v.toFixed(2))},${w.weather.target},${w.weather.blend < 1}`;
-        const full = this.reset || shadowKey !== this.shadowKey || w.weather.blend < 1;
+        const shadowKey = `${wo[0]},${wo[1]},${sky.dir.map(v => v.toFixed(2))},${w.weather.target},${w.weather.blend < 1 || w.rainZones.blend < 1}`;
+        const full = this.reset || shadowKey !== this.shadowKey || w.weather.blend < 1 || w.rainZones.blend < 1;
         this.shadowKey = shadowKey;
         F.set('lod', [q.interleave, full ? 1 : SHADOW_SLICES, full ? 0 : this.frameNo % SHADOW_SLICES, q.detail]);
         this.shadowSlices = full ? 1 : SHADOW_SLICES;
         F.set('froxel', [FROXEL_NEAR, cfg.maxDistance, this.froxels ? 1 : 0, 0]);
         F.set('post', [q.blur || 0, this.tiles ? 1 : 0, 0, 0]);
         // heavy rain: up to three times the drops (big drops, past intensity 0.6)
-        this.rainParticles = Math.round(cfg.particles * (1 + 2 * sat01((this.near.rain - 0.6) / 0.8) * c.drops));
-        F.set('rain', [c.drops, rainFall(c.drops), c.rain, this.rainParticles]);
-        this.drips = w.structures.write(F, cam.pos, sky.dir, c.wind, w.weather.freezingLevel, rainFall(c.drops));
+        const drops = this.drops = w.rainZones.drops(cam.pos[0], cam.pos[2], c.drops);
+        this.rainParticles = Math.round(cfg.particles * (1 + 2 * sat01((this.near.rain - 0.6) / 0.8) * drops));
+        F.set('rain', [drops, rainFall(drops), c.rain, this.rainParticles]);
+        w.rainZones.write(F);
+        this.drips = w.structures.write(F, cam.pos, sky.dir, c.wind, w.weather.freezingLevel, rainFall(drops));
         F.set('misc', [c.temperature, this.time * cfg.fallSpeed % 52000, f.base, wdt]);
         w.lightning.write(F);
 

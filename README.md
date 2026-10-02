@@ -214,7 +214,7 @@ and from 25–28 ms to 10–12 ms at high.
 | drag / WASD / Space, C | look / move / up, down |
 | Shift, Alt, wheel | ×5, ×0.2, speed |
 | right click (or Ctrl + click) | grow a storm cell where the cursor meets the ground |
-| N | rain variants: drizzle, light rain, medium rain, downpour (see **Rain variants**) |
+| N | rain variants: drizzle, light rain, medium rain, downpour, mixed rain (see **Rain variants**) |
 | 1–9 | weather states: clear, fair cumulus, mackerel sky, warm front, stratus deck, showers, thunderstorm, snow squalls, overcast rain (they blend over `transition` seconds). A 10th, severe storms, is reached by auto-cycle and by the shelf and mothership views |
 | 0 | auto-cycle the weather states |
 | K | lightning from the nearest raining cell |
@@ -236,8 +236,27 @@ On foot, WASD walks (Shift runs, Alt creeps) and dragging looks around; Space an
 ### Rain variants
 
 Four weather states give steady rain from a stratus or nimbostratus deck at four strengths, in light winds (3–7 m/s),
-so the rain falls at no more than about 40° and a roof keeps it off what stands under it. `N` steps through them;
-the scenario's bus station views start in medium rain, a downpour and light rain.
+so the rain falls at no more than about 40° and a roof keeps it off what stands under it. `N` steps through them
+and then **mixed rain**; the scenario's bus station views start in medium rain, a downpour and light rain, and the
+bus route views (village bus stop, on foot at the bus station, riding the bus) in mixed rain.
+
+**Mixed rain** has all four at once along the bus route (`RainZones`), with two dry stretches under clear sky. Its
+`zones` are `{ "along": "bus", "variants": [...], "length": 1200, "hold": [40, 100], "dry": { "state": "clear", "count": 2 } }`.
+They split the route from the station out to the turn into rain stretches of about `length` m and `count` dry
+stretches twice that long (7 here: 5 rain, 2 clear). The order is random: every variant at least once, and no stretch
+next to one of its own kind. After a random `hold` (40–100 s) the order is reshuffled, blending over the weather
+`transition`. The route is sampled every 300 m. Each sample carries a rain scale for the genus layers (the weather
+map's `zoneAt` uses it in place of `F.rain.z`, Gaussian-weighted over about 400 m), a cover scale, the route's
+direction and a drop size (the near-field rain at the camera). A variant's rain scale is the one that gives the mixed
+state's nimbostratus deck the precipitation the variant's own deck has: drizzle 0.17, light 0.37, medium 1.0,
+downpour 2.6.
+
+A clear stretch has cover 0. It opens the decks in a flat-topped hole that reaches 450 m past the stretch's ends along
+the route and 1.35 km to each side (`CLEAR_RADIUS`, `CLEAR_WIDE`): blue sky overhead, the deck's edge on both sides.
+The hole stops short of the next stretch, because rain needs cloud above it (`rainCover`). Riding the bus you pass
+through drizzle, light rain, medium rain, a downpour and the clear breaks in turn, with the shafts visible ahead. Off
+the route the state's own rain (light) falls. The HUD names the stretch you are in (`clear here` in a break) and the
+time to the next reshuffle.
 
 | State | Deck | `rain` | `drops` | Near-field intensity | Looks like |
 |---|---|---|---|---|---|
