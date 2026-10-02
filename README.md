@@ -77,6 +77,11 @@ Each frame runs these passes. All distances are metres and heights are above sea
    - Ground shading: section-line farm fields, centre-pivot circles, towns, forests, rivers and lakes,
      and mountains with rock above the tree line.
    - It is lit with cloud shadows, snow, wet darkening and reflections, and lightning.
+   - Then the **structures** (`vsStruct` / `fsStruct`): houses, a bus shelter, bridges, roads and the river's water in a
+     village, as flat-shaded triangles built on the CPU. They stand on `Heightfield.surface`, the terrain exactly as
+     drawn (half-float heights, filtered at the mesh vertices, flat triangles between them), so they neither float
+     nor sink. They get cloud shadows, wetness, snow on what faces up, and glass, metal and wet surfaces reflect the
+     sky. See **Rain shelter** below.
 5. **Froxel lighting** (`WGSL_FROXEL`, `FroxelPass`): a 160 × 96 × 128 volume of frustum-aligned cells (froxels),
    with depth slices spaced exponentially from 40 m out to the march distance. Each froxel stores the light at its
    centre:
@@ -216,6 +221,29 @@ and from 25–28 ms to 10–12 ms at high.
 | Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, interleave, detail distance, cloud blur) |
 | V, L, P, H | next view, labels, pause weather, help |
 
+### Rain shelter
+
+Structures stand in the shaders as up to 128 boxes (`blockers` in the frame uniform), each turned by its yaw and
+sheared along its length by a slope, so bridge decks follow their ramps and arch. A house is two boxes (walls; roof
+with its eaves), the bus shelter four (roof, back and side panels), and a deck one per 8 m piece, fitted inside the
+curved deck. `WGSL_SHELTER` tests rays against them:
+
+- **Rain shadow**: a point is dry where the path its drops came along, straight back up against their fall and slanted
+  by the wind (0.8 of the wind, rain at 9.5 m/s, snow at 1.35 m/s, as the near-field particles), enters a box. So the
+  ground under a roof or a deck stays dry and the dry patch shifts downwind; a back wall keeps the rain off the bench
+  when the wind blows from behind it; snow blows in further.
+  - Terrain and structures: no wetness and no settled snow there.
+  - Near-field drops and flakes: none inside the dry volume (`vsPrecip` tests each particle along its own fall).
+  - Rain and snow shafts: rays through the boxes' bounds take the shaft density out wherever it is sheltered.
+  - The HUD says `sheltered` when the camera is.
+- **Sun shadows**: the ray toward the sun, so houses shade the street and each other, and decks the river bank.
+- **Sky occlusion**: under roofs and decks (a box's `ao`), less sky light reaches the ground.
+
+A ray starting inside a box does not count, so surfaces do not shade themselves. Each frame a 32 × 32 grid over the
+boxes' bounds lists, per cell, the boxes that can shade it: a capsule from each box toward where its sun shadow and its
+rain shadow fall, as far as a ray from the ground under it to its top runs sideways. A point tests only its cell's
+boxes, which keeps the structures at about 0.2 ms of scene time at street level.
+
 ### Analytic storm structures
 
 Shelf lines and motherships are shapes, not noise. Entities report them through a `features(out)` hook (`out.ms`,
@@ -233,7 +261,7 @@ the same way. Their tops get more sky light than their undersides, which is what
 | `weather` | `start`, `transition` (s), `cycle` { `enabled`, `hold` }, `states` { name: state } |
 | `entities` | `{ type, id, label, ... }`, where `type` maps to a class in `ENTITY_TYPES` (below), applied in order |
 | `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure` } } |
-| `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity; optional `lighting` (preset) and `weather` (state) |
+| `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity, or `{ name, follow (entity id), spot }` for a viewpoint the entity laid out (a village's); optional `lighting` (preset) and `weather` (state) |
 
 Positions are metres: `[x, z]` on the map, with x east, z south, and the map centred on 0.
 
@@ -283,10 +311,27 @@ The weather map writes each genus's coverage into one channel of a layer map (`l
 | `lake` | terrain | `pos`, `radius`, water `level` |
 | `town` | terrain | `pos`, `radius`, `density` (street blocks) |
 | `forest` | terrain | `pos`, `radius`, `density`, `seed` |
+| `village` | structure | a village on a road, laid out from `seed` (below) |
 | `storm` | weather | storm cell, below |
 | `supercell` | weather | a storm with a mothership plate stack: `stackRadius` (× radius), `stackDrop` / `stackHeight` (m below / above the cloud base), `plates`, `twist` (plates climbed per turn), `spin` (rad/s), `wallCloud` (m), `wallRadius` (× stack radius) |
 | `squall` | weather | a line of `count` storms from `from` to `to`, carried by the wind (`drift`, `velocity`); it starts over after `travel` m. Also takes `radius`, `top`, `precip`, `lightning`, `green`. Its shelf cloud runs along the gust front, `gap` × radius ahead of the cells and bowed out by `bow` m: `shelf` (strength), `lip` (m above ground), `shelfDepth`, `tiers` |
 | `spawner` | weather | spawns storm cells inside `area` [x0, z0, x1, z1]. `rate` (cells per weather hour, × the state's `storms`), `max`, `initial`, `seed`. `template` gives a `[min, max]` range per storm parameter (`radius`, `top`, `precip`, `core`, `grow`, `mature`, `decay`, `lightning`, `virga`, `drift`) |
+
+A `village` has these parameters:
+
+- `pos`, `radius` (m): the main road runs `radius` m each way through `pos`
+- `river`: the id of a `river` entity. The road crosses it square on a stone bridge with parapets, which ramps up onto
+  piers over the water; without one, the road runs at `road` degrees from +x
+- `houses` (at most): along the main road and a side street that branches off on the longer bank, along the river.
+  Each has walls, a plinth, a gable roof (along or across), a door, windows per storey, and maybe a chimney
+- `footbridge` (m): a wooden footbridge with railings this far along the river, in the direction of its `path`
+  (negative: the other way; 0: none), with paths to it
+- `busStopSide` (1 or -1): which side of the road the bus shelter stands on, its back to the street's edge. By
+  default the back faces west, where the rain comes from in most states
+- `channel` (m, default 3): the village deepens the river's channel locally and draws the water itself at the river's
+  true width, since the land-use map's cells (125 m) are wider than the river
+- viewpoints for `views` (`{ follow: "village", spot }`): `bus stop` (under the shelter), `bridges`,
+  `under the bridge`, `overview`
 
 A `storm` cell has these parameters:
 
@@ -315,6 +360,9 @@ The cell moves through its life like this:
 1. Subclass `Entity` and override the hooks it needs:
    - `stamp(field)`: shape `field.h` and paint land use with `field.paint(idx, channel, value)`, where
      the channel is 0 town, 1 forest or 2 water.
+   - `build(structures)`: after every entity has stamped, add meshes (`box`, `sweep`, `quad`, or `house`,
+     `busStop`, `bridge`, `road`, `water`) and shader boxes (`blocker`) to the `Structures`. Place them with
+     `structures.ground(x, z)`, the terrain as drawn.
    - `spawn()`: register with the world. `world.add(def)` creates more entities at runtime.
    - `update(dt, wdt, t)`: per frame. `dt` is real seconds and `wdt` is weather seconds. Set `dead` to
      remove the entity.
@@ -336,7 +384,9 @@ WGSL_SHADOW, WGSL_GROUND                   ground state
 WGSL_FROXEL, WGSL_SKIP_SAMPLE,             compute: froxel lighting, occupancy / tile lookups, cloud tile pre-pass,
 WGSL_TILES, WGSL_MARCH, WGSL_RESOLVE       volumetric march, temporal resolve
 WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
-Entity, ENTITY_TYPES                       terrain features, StormCell, Supercell, SquallLine, Spawner
+WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion
+Entity, ENTITY_TYPES                       terrain features, GroundFrame / Structures / Village, StormCell, Supercell,
+                                           SquallLine, Spawner
 WeatherSystem, CloudLayers, Sky,           data-driven weather (states blend every value, including genus
 Lightning, World                           coverage), cloud genus layers, sky colours, lightning, world
 NoiseVolumes, WeatherPass, GroundPass, FroxelPass, CloudPass, GpuProfiler, Renderer

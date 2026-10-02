@@ -97,6 +97,9 @@
               terrain  tilt { dir, drop } | hills { amplitude, scale, octaves, seed, ridged } | mountain { pos, radius, height, roughness }
                        range { path, width, height, roughness, seed } | river { path, width, depth, bank } | lake { pos, radius, level }
                        town { pos, radius, density } | forest { pos, radius, density, seed }
+              structure village { pos, radius, river (entity id; else road, degrees), houses, footbridge (m along the river),
+                                  busStopSide (1 | -1), channel (m), seed }: houses, a bus shelter, a road bridge and a
+                                  footbridge that keep the rain off what lies under them
               weather  storm { pos, radius, top, precip, core, coreOffset, life [grow, mature, decay] s, lightning (per min), virga, drift,
                                velocity, pinned, hold, shelf, laminar, green, wallCloud }
                        supercell { ...storm, mothership plate stack: stackRadius, stackDrop, stackHeight, plates, twist, spin (rad/s),
@@ -105,8 +108,8 @@
                                 shelf cloud along the gust front: shelf (strength), lip (m above ground), shelfDepth, tiers, bow, gap }
                        spawner { area [x0, z0, x1, z1], rate (cells per weather hour), max, initial, seed, template { key: [min, max] } }
     lighting  start, presets { name: { azimuth, elevation, intensity, exposure } }
-    views     { name, pos [x, y, z], look [x, y, z] } or { name, follow (entity id), offset [x, height above ground, z], lookOffset };
-              optional lighting (preset name) and weather (state name)
+    views     { name, pos [x, y, z], look [x, y, z] } or { name, follow (entity id), offset [x, height above ground, z], lookOffset }
+              or { name, follow (entity id), spot (a viewpoint it laid out) }; optional lighting (preset name) and weather (state name)
 -->
 <script type="application/json" id="scenario">
 {
@@ -183,6 +186,8 @@
         { "type": "town", "label": "Greeley Flats", "pos": [11000, -9000], "radius": 2400, "density": 0.85 },
         { "type": "town", "pos": [19000, 12000], "radius": 1500, "density": 0.7 },
         { "type": "forest", "pos": [-24000, -2000], "radius": 9000, "density": 0.9, "seed": 3 },
+        { "type": "village", "id": "village", "label": "Millbrook", "pos": [-12500, 4700], "radius": 380, "river": "platte",
+          "houses": 28, "footbridge": 170, "seed": 9 },
 
         { "type": "supercell", "id": "hero", "label": "Supercell", "pos": [1500, -2500], "radius": 6200, "top": 11800, "precip": 1.0,
           "core": 0.75, "coreOffset": [900, 800], "life": [900, 2400, 1200], "lightning": 5, "virga": 0.12, "pinned": true,
@@ -217,6 +222,9 @@
         { "name": "Above the anvils",      "pos": [12000, 13800, 18000], "look": [0, 7000, -4000] },
         { "name": "Front Range",           "pos": [-12000, 3600, 9000], "look": [-28000, 3200, -6000] },
         { "name": "Town street level",     "pos": [-4200, 1640, 10500], "look": [0, 2600, -2000] },
+        { "name": "Village bus stop",      "follow": "village", "spot": "bus stop", "weather": "overcast rain" },
+        { "name": "Village bridges",       "follow": "village", "spot": "bridges", "weather": "overcast rain" },
+        { "name": "Under the bridge",      "follow": "village", "spot": "under the bridge", "weather": "overcast rain" },
         { "name": "Shelf cloud",   "follow": "squall", "offset": [7000, 25, 1500], "lookOffset": [-4000, 2100, -2500],
           "lighting": "storm dusk", "weather": "severe storms" },
         { "name": "Mothership",    "follow": "hero", "offset": [-5500, 25, 8000], "lookOffset": [0, 3000, 0],
@@ -234,7 +242,9 @@
 //      virga, built from the layer state (large-scale noise advected by the wind) plus every live storm cell entity.
 //   2. Cloud shadow map (compute): sun transmittance through the cloud slab, and the sky occlusion of the column above.
 //   3. Ground state (compute): snow cover and wetness accumulate under precipitation and melt / dry afterwards.
-//   4. Scene (render): sky, then the terrain (farm sections, pivots, towns, mountains) with cloud shadows, snow and wet ground.
+//   4. Scene (render): sky, then the terrain (farm sections, pivots, towns, mountains) with cloud shadows, snow and wet ground,
+//      then structures (houses, bus shelter, bridges): meshes on the terrain, with boxes in the shaders that cast sun shadows
+//      and keep rain and snow off the ground, the near-field drops and the shafts under roofs and decks (WGSL_SHELTER).
 //   5. Volumetrics (compute, reduced resolution): one ray march through clouds (Perlin-Worley shape + Worley detail,
 //      light march + multiple-scattering octaves), rain and snow shafts falling from the cloud base (slanted by the wind,
 //      streaky curtains, virga evaporating before the ground, rain below the freezing level and snow above), and height
@@ -244,7 +254,8 @@
 //   6. Final (render): composite + tonemap, near-field rain streaks / snow flakes around the camera, lightning bolts, radar.
 //
 // The world is data (the scenario JSON above). Every entity is a class in ENTITY_TYPES: terrain features stamp the heightmap
-// and paint land use; storm cells live, drift with the wind, rain and flash; spawners keep the sky populated.
+// and paint land use; structures build meshes on it; storm cells live, drift with the wind, rain and flash; spawners keep
+// the sky populated.
 // =====================================================================================================
 
 // ------------------------------------------------------------------------------------------------ config
@@ -257,6 +268,9 @@ const MAX_MOTHERSHIPS = 4;           // analytic storm structures (see mothershi
 const MAX_SHELVES = 2;                // stratiform / cellular cloud genera besides the convective layer
 const MAX_FLASHES = 4;
 const MAX_BOLT_SEGS = 256;
+const MAX_BLOCKERS = 128;            // structure boxes in the frame uniform (sun and rain shadows, see WGSL_SHELTER)
+const BLOCK_GRID = 32;               // cells per side over their bounds, each listing the boxes that can shade it (4 x 32 bits)
+const STRUCT_FLOATS = 10;            // structure mesh vertex: position, normal, colour, material
 const GRID_N = 512;                 // terrain mesh vertices per side (inner part covers the heightfield, outer rings run to the horizon)
 const NOISE_SHAPE = 128;
 const NOISE_DETAIL = 32;
@@ -468,6 +482,36 @@ class Heightfield {
 
     paint(idx, channel, value) { const k = idx * 3 + channel; this.land[k] = Math.max(this.land[k], value); }
 
+    // land use channel (0 town, 1 forest, 2 water) at x, z, filtered like the GPU's landTex
+    landAt(x, z, ch) {
+        const n = this.n, fx = clamp(this.ci(x), 0, n - 1), fz = clamp(this.ci(z), 0, n - 1);
+        const i = Math.min(Math.floor(fx), n - 2), j = Math.min(Math.floor(fz), n - 2), tx = fx - i, tz = fz - j, L = this.land;
+        const at = (a, b) => L[(b * n + a) * 3 + ch];
+        return lerp(lerp(at(i, j), at(i + 1, j), tx), lerp(at(i, j + 1), at(i + 1, j + 1), tx), tz);
+    }
+
+    // after authoring: the heights as uploaded (half floats), for surface()
+    freeze() { this.hq = this.h.map(v => fromHalf(toHalf(v))); }
+
+    // the terrain exactly as drawn: half-float heights filtered bilinearly at the mesh vertices, flat triangles between
+    // them (the inner, linear part of vsTerrain's grid). Structures stand on this, so they neither float nor sink.
+    surface(x, z) {
+        const N = GRID_N, half = this.size / 2, c = this.origin + half, n = this.n, h = this.hq;
+        const texH = (px, pz) => {
+            const fx = clamp(this.ci(px), 0, n - 1), fz = clamp(this.ci(pz), 0, n - 1);
+            const i = Math.min(Math.floor(fx), n - 2), j = Math.min(Math.floor(fz), n - 2), tx = fx - i, tz = fz - j;
+            return lerp(lerp(h[j * n + i], h[j * n + i + 1], tx), lerp(h[(j + 1) * n + i], h[(j + 1) * n + i + 1], tx), tz);
+        };
+        const vx = k => c + (k / (N - 1) * 2 - 1) / 0.72 * half;
+        const g = u => ((u - c) / half * 0.72 + 1) / 2 * (N - 1);
+        const gx = g(x), gz = g(z), i = clamp(Math.floor(gx), 0, N - 2), j = clamp(Math.floor(gz), 0, N - 2), fx = gx - i, fz = gz - j;
+        const at = (a, b) => texH(vx(a), vx(b));
+        // gridIndices: triangles (a, c, b) and (b, c, d), split along b-c
+        if (fx + fz <= 1) { const ha = at(i, j); return ha + (at(i + 1, j) - ha) * fx + (at(i, j + 1) - ha) * fz; }
+        const hd = at(i + 1, j + 1);
+        return hd + (at(i, j + 1) - hd) * (1 - fx) + (at(i + 1, j) - hd) * (1 - fz);
+    }
+
     updateRange() {
         let lo = Infinity, hi = -Infinity;
         for (const v of this.h) { if (v < lo) lo = v; if (v > hi) hi = v; }
@@ -555,6 +599,10 @@ const FRAME_LAYOUT = [
     ['lod', 'vec4f'],       // march interleave (1, 2, 4), shadow map slices, slice this frame, detail distance (m)
     ['froxel', 'vec4f'],    // near, far (m), froxels on, -
     ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, -, -
+    ['blocks', 'vec4f'],    // structure boxes: count, lowest bottom, highest top (m), -
+    ['blockBox', 'vec4f'],  // their bounds x0, z0, x1, z1, padded for the shadows and rain shadows they cast
+    ['blockers', `array<vec4f, ${MAX_BLOCKERS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, bottom, top] [sky occlusion, slope, -, -]
+    ['blockGrid', `array<vec4u, ${BLOCK_GRID * BLOCK_GRID}>`], // per cell of blockBox: bit k set if box k can shade a point in it
 ];
 
 class FrameBlock {
@@ -566,6 +614,7 @@ class FrameBlock {
         this.data = new Float32Array(o);
     }
     set(name, values, at = 0) { this.data.set(values, this.offsets[name] + at); }
+    setBits(name, words) { new Uint32Array(this.data.buffer, this.offsets[name] * 4, words.length).set(words); }
     static wgsl() { return `struct Frame {\n${FRAME_LAYOUT.map(([n, t]) => `    ${n}: ${t},`).join('\n')}\n};\n`; }
 }
 
@@ -1203,6 +1252,92 @@ fn precipSourceAt(p: vec3f) -> vec4f {
 }
 `;
 
+// needs F. Structures (houses, the bus stop, bridge decks) stand in the shaders as up to MAX_BLOCKERS boxes, each turned
+// by its yaw and sheared along its local x by a slope (bridge decks follow their arch). Box k in F.blockers:
+//   [centre x, z, half size along local x, z] [cos yaw, sin yaw, bottom, top (m, at the centre)] [sky occlusion, slope, -, -]
+// A grid over their bounds (F.blockGrid, built each frame for the sun and the wind) lists the boxes each cell's rays can
+// reach, so a point tests only those.
+// Local x runs along (cos, sin) in xz, local z along (-sin, cos). The boxes cast sun shadows, and rain cannot fall
+// through them: a point is dry where the path its drops came along (back up against their fall, slanted by the wind)
+// crosses a box. So the ground, the near-field drops and the shafts stay dry under roofs and decks and in the lee of walls.
+const WGSL_SHELTER = /* wgsl */`
+// p can be shaded by a structure: inside the boxes' bounds (padded for long shadows and slanted rain), below the tallest
+fn nearStructures(p: vec3f) -> bool {
+    let b = F.blockBox;
+    return F.blocks.x > 0.5 && p.y < F.blocks.z && all(p.xz > b.xy) && all(p.xz < b.zw);
+}
+
+// the boxes that can shade p (call when nearStructures(p)): bit k of word k / 32
+fn blockCell(p: vec3f) -> vec4u {
+    let b = F.blockBox;
+    let c = min(vec2u((p.xz - b.xy) / (b.zw - b.xy) * ${BLOCK_GRID}.0), vec2u(${BLOCK_GRID - 1}u));
+    return F.blockGrid[c.y * ${BLOCK_GRID}u + c.x];
+}
+
+// the ray from o along d enters box k (a ray starting inside a box does not count, so surfaces do not shade themselves)
+fn blockerHit(k: i32, o: vec3f, d: vec3f) -> bool {
+    let A = F.blockers[k * 3];
+    let B = F.blockers[k * 3 + 1];
+    let slope = F.blockers[k * 3 + 2].y;
+    let r = o.xz - A.xy;
+    let lx = r.x * B.x + r.y * B.y;
+    let dx = d.x * B.x + d.z * B.y;
+    let lo = vec3f(lx, o.y - slope * lx, -r.x * B.y + r.y * B.x);
+    let ld = vec3f(dx, d.y - slope * dx, -d.x * B.y + d.z * B.x);
+    let inv = 1.0 / select(ld, vec3f(1e-6), abs(ld) < vec3f(1e-6));
+    let a = (vec3f(-A.z, B.z, -A.w) - lo) * inv;
+    let b = (vec3f(A.z, B.w, A.w) - lo) * inv;
+    let tn = max(max(min(a.x, b.x), min(a.y, b.y)), min(a.z, b.z));
+    let tf = min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z));
+    return tn > 0.02 && tn <= tf;
+}
+
+// the way the rain (or snow) reaching height y came: back up against its fall, slanted by the wind as the near-field
+// drops and flakes are (0.8 of the wind; rain falls at about 9.5 m/s, snow at 1.35 m/s, so snow blows in further)
+fn rainBack(y: f32) -> vec3f {
+    let snow = smoothstep(F.precip.x - 250.0, F.precip.x + 250.0, y);
+    return normalize(vec3f(-F.wind.x * 0.8, mix(9.5, 1.35, snow), -F.wind.y * 0.8));
+}
+
+// 1 where rain reaches p, 0 where a structure keeps it off
+fn rainReaches(p: vec3f) -> f32 {
+    if (!nearStructures(p)) { return 1.0; }
+    let r = rainBack(p.y);
+    let m = blockCell(p);
+    for (var w = 0u; w < 4u; w++) {
+        var bits = m[w];
+        while (bits != 0u) {
+            if (blockerHit(i32(w * 32u + countTrailingZeros(bits)), p, r)) { return 0.0; }
+            bits &= bits - 1u;
+        }
+    }
+    return 1.0;
+}
+
+// at a surface point p: x the sun reaches it, y the rain reaches it, z sky light left (less under roofs and decks).
+// sun / rain false skip those tests (sun already shadowed by cloud, or the ground is dry anyway)
+fn structureLight(p: vec3f, sun: bool, rain: bool) -> vec3f {
+    var o = vec3f(1.0);
+    if (!nearStructures(p)) { return o; }
+    let s = F.sunDir.xyz;
+    let doSun = sun && s.y > 0.0;
+    let r = rainBack(p.y);
+    let m = blockCell(p);
+    for (var w = 0u; w < 4u; w++) {
+        var bits = m[w];
+        while (bits != 0u) {
+            let k = i32(w * 32u + countTrailingZeros(bits));
+            bits &= bits - 1u;
+            if (doSun && o.x > 0.0 && blockerHit(k, p, s)) { o.x = 0.0; }
+            if (rain && o.y > 0.0 && blockerHit(k, p, r)) { o.y = 0.0; }
+            let ao = F.blockers[k * 3 + 2].x;
+            if (ao > 0.0 && blockerHit(k, p, vec3f(0.0, 1.0, 0.0))) { o.z = min(o.z, 1.0 - ao); }
+        }
+    }
+    return o;
+}
+`;
+
 // ------------------------------------------------------------------------------- WGSL empty-space skipping
 // Occupancy grid, each frame after the weather map: one thread per column, 32 height cells from the lowest cloud
 // (layerInfo.z) to the highest top (features.z). A cell's bit is set where the noise clouds can exist at that height:
@@ -1755,6 +1890,8 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
         var tm = vec2u(0xffffffffu);
         if (tiles && doClouds) { tm = tileMask(px); }
         let rainPhase = mix(hg(mu, 0.75), hg(mu, 0.0), 0.45);
+        // rays through the structures' bounds: no rain under their roofs and decks
+        let sheltered = F.blocks.x > 0.5 && rayBox(ro, dir, vec3f(F.blockBox.x, F.blocks.y, F.blockBox.y), vec3f(F.blockBox.z, F.blocks.z, F.blockBox.w), t0, t1);
         let snowPhase = mix(hg(mu, 0.45), hg(mu, 0.0), 0.6);
         for (var i = 0; i < N; i++) {
             let fa = f32(i) / f32(N);
@@ -1803,7 +1940,8 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                 if (froxels) { fx = froxelAt(p); } else { fx = vec3f(shadowAt(p), -1.0); }
                 let sh = fx.xy;
                 if (doPrecip) {
-                    let pd = precipDensity(p, precipSourceAt(p));
+                    var pd = precipDensity(p, precipSourceAt(p));
+                    if (sheltered && pd.x + pd.y > 0.0) { pd *= rainReaches(p); }
                     if (pd.x + pd.y > 0.0) {
                         // the diffuse light under the cloud: what the column lets through (sh.y), brighter looking up,
                         // and what the ground bounces up where the sun reaches it
@@ -2054,22 +2192,71 @@ fn townColor(xz: vec2f, px: f32) -> vec3f {
     let mtn = mix(vec3f(0.09, 0.12, 0.07), vec3f(0.33, 0.31, 0.29), rock);
     alb = mix(alb, mtn, wild);
     // weather on the ground
+    // structures: their sun shadows, and dry ground where they keep the rain and snow off
     let gs = groundAt(p.xz);
-    let snow = sat(gs.x * 3.0) * smoothstep(0.45, 0.75, n.y);
-    let wet = gs.y * (1.0 - snow);
+    let sh = shadowAt(p);
+    let s = F.sunDir.xyz;
+    let sl = structureLight(p + vec3f(0.0, 0.05, 0.0), sh.x * dot(n, s) > 0.002, gs.x + gs.y > 0.002);
+    let snow = sat(gs.x * 3.0) * smoothstep(0.45, 0.75, n.y) * sl.y;
+    let wet = gs.y * (1.0 - snow) * sl.y;
     alb = mix(alb * (1.0 - 0.45 * wet), vec3f(0.85, 0.88, 0.92), snow);
     let water = land.z;
 
-    let sh = shadowAt(p);
-    let s = F.sunDir.xyz;
     let v = normalize(F.cam.xyz - p);
-    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x + F.ambient.rgb * sh.y * (0.55 + 0.45 * n.y) + FLASH_COLOR * flashLit(p) * 0.03);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + FLASH_COLOR * flashLit(p) * 0.03);
     // wet ground and open water reflect the sky
     let r = reflect(-v, vec3f(0.0, 1.0, 0.0));
     let fres = 0.02 + 0.98 * pow(1.0 - max(v.y, 0.0), 5.0);
     let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 400.0) * 4.0;
     col = mix(col, vec3f(0.01, 0.02, 0.025) * F.ambient.rgb + spec * fres, water);
     col += spec * fres * wet * 0.35 * (1.0 - water);
+    return vec4f(col, 1.0);
+}
+
+// structures (houses, bus stop, bridges, roads): flat-shaded triangles, colour per vertex and a material
+// (0 matte, 1 roof, 2 glass, 3 asphalt, 4 metal, 5 window, 6 water)
+struct StructOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @location(1) n: vec3f, @location(2) col: vec4f };
+
+@vertex fn vsStruct(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec4f) -> StructOut {
+    var o: StructOut;
+    o.world = p;
+    o.n = n;
+    o.col = c;
+    o.pos = F.viewProj * vec4f(p, 1.0);
+    return o;
+}
+
+@fragment fn fsStruct(i: StructOut) -> @location(0) vec4f {
+    let p = i.world;
+    let v = normalize(F.cam.xyz - p);
+    var n = normalize(i.n);
+    if (dot(n, v) < 0.0) { n = -n; }                                  // thin panels are seen from both sides
+    let mat = i32(i.col.a + 0.5);
+    // weather on it: snow settles on what faces up, rain wets what it reaches (walls less than roofs and roads)
+    let gs = groundAt(p.xz);
+    let sh = shadowAt(p);
+    let s = F.sunDir.xyz;
+    let sl = structureLight(p + n * 0.06, sh.x * dot(n, s) > 0.002, gs.x + gs.y > 0.002 && mat != 6);
+    let snow = sat(gs.x * 3.0) * smoothstep(0.55, 0.85, n.y) * sl.y * select(1.0, 0.0, mat == 6);
+    let wet = gs.y * sl.y * (0.35 + 0.65 * sat(n.y)) * (1.0 - snow);
+    var alb = i.col.rgb * (0.9 + 0.2 * vnoise2(vec2f(p.x + p.z, p.y) * 1.7 + n.xz * 13.0));
+    let glass = mat == 2 || mat == 5;
+    if (!glass) { alb *= 1.0 - select(0.35, 0.55, mat == 3) * wet; }
+    alb = mix(alb, vec3f(0.85, 0.88, 0.92), snow);
+    // sky light from above, and light the ground bounces up into eaves, roof and deck undersides
+    let bounce = (F.ambient.rgb * sh.y * 0.25 + F.sunCol.rgb * max(s.y, 0.0) * sh.x * 0.06) * sat(-n.y);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + bounce + FLASH_COLOR * flashLit(p) * 0.03);
+    // glass, metal and wet surfaces reflect the sky
+    let r = reflect(-v, n);
+    let fres = 0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+    let spec = skyColor(r) * sh.y * sl.z + F.sunCol.rgb * sh.x * sl.x * pow(max(dot(r, s), 0.0), 300.0) * 4.0;
+    var gloss = select(select(select(0.0, 0.04, mat == 1), 0.12, mat == 4), 0.8, glass);
+    gloss = max(gloss, wet * select(0.3, 0.5, mat == 3));
+    col += spec * fres * gloss;
+    if (mat == 6) {                                                     // open water, as on the terrain
+        let fw = 0.02 + 0.98 * pow(1.0 - max(v.y, 0.0), 5.0);
+        col = vec3f(0.01, 0.02, 0.025) * F.ambient.rgb * sl.z + spec * fw;
+    }
     return vec4f(col, 1.0);
 }
 `;
@@ -2201,6 +2388,18 @@ fn lineQuad(a: vec4f, b: vec4f, widthPx: f32, corner: u32, o: ptr<function, Line
     if (isSnow) { p += vec3f(sin(t * 1.3 + seed.x * 40.0), 0.0, cos(t * 1.1 + seed.z * 40.0)) * 0.8; }
     let rel = (fract((p - F.cam.xyz) / box + 0.5) - 0.5) * box;
     let wp = F.cam.xyz + rel;
+    // none under roofs and decks or in the lee of walls: the path back up against this drop's fall meets a structure
+    if (nearStructures(wp)) {
+        let back = normalize(-vel);
+        let m = blockCell(wp);
+        for (var w = 0u; w < 4u; w++) {
+            var bits = m[w];
+            while (bits != 0u) {
+                if (blockerHit(i32(w * 32u + countTrailingZeros(bits)), wp, back)) { return o; }
+                bits &= bits - 1u;
+            }
+        }
+    }
     let dist = length(rel);
     let a = F.viewProj * vec4f(wp, 1.0);
     if (a.w < 0.5) { return o; }
@@ -2259,6 +2458,7 @@ fn lineQuad(a: vec4f, b: vec4f, widthPx: f32, corner: u32, o: ptr<function, Line
 // =====================================================================================================
 // Built from scenario definitions ({ type, id, label, ... }) in order. Hooks, all optional:
 //   stamp(field)          shape the terrain and paint land use (build time)
+//   build(structures)     add meshes and shader boxes on the finished terrain (build time, see Structures)
 //   spawn()               register with the world (spawners pre-populate the sky)
 //   update(dt, wdt, t)    per frame; dt real seconds, wdt weather seconds
 //   cell()                per frame: a storm cell for the GPU ({ x, z, radius, top, coverage, precip, seed, virga, core }) or null
@@ -2280,6 +2480,7 @@ class Entity {
     }
 
     stamp(field) {}
+    build(structures) {}
     spawn() {}
     features(out) {}
     update(dt, wdt, t) {}
@@ -2336,12 +2537,16 @@ class Range extends Entity {
 // carves a river bed along a polyline and paints it as water
 class River extends Entity {
     get anchor() { const p = this.def.path[Math.floor(this.def.path.length / 2)]; return [p[0], this.world.field.sample(p[0], p[1]) + 200, p[1]]; }
+    // distance from x, z to the centre line, which wanders off the path with a little noise
+    distance(x, z) {
+        const wig = 350 * fbm(x / 2500, z / 2500, { octaves: 3, seed: 17 });
+        return polylineNearest(this.def.path, this.lens ??= polylineLengths(this.def.path), x, z + wig).dist;
+    }
     stamp(f) {
-        const d = this.def, pts = d.path, lens = polylineLengths(pts), halfW = (d.width || 60) / 2, bank = d.bank || 600, depth = d.depth || 5;
+        const d = this.def, pts = d.path, halfW = (d.width || 60) / 2, bank = d.bank || 600, depth = d.depth || 5;
         const [x0, z0, x1, z1] = polylineBox(pts, halfW + bank + 400);
         f.each(x0, z0, x1, z1, (idx, x, z) => {
-            const wig = 350 * fbm(x / 2500, z / 2500, { octaves: 3, seed: 17 });
-            const { dist } = polylineNearest(pts, lens, x, z + wig);
+            const dist = this.distance(x, z);
             if (dist >= halfW + bank + f.cell) return;
             const k = smoothstep(halfW, halfW + bank, dist);
             f.h[idx] -= depth * (1 - k);
@@ -2379,6 +2584,450 @@ class Forest extends Entity {
             const t = Math.hypot(x - cx, z - cz) / r;
             if (t < 1) f.paint(idx, 1, dens * (1 - smoothstep(0.6, 1, t)) * smoothstep(-0.1, 0.3, fbm(x / 2500, z / 2500, { seed })));
         });
+    }
+}
+
+// --- structures
+// Buildings and bridges: triangle meshes standing on the terrain as drawn (Heightfield.surface), and the boxes that
+// stand for them in the shaders (WGSL_SHELTER), which cast sun shadows and keep the rain off what lies under them.
+
+// a frame on the ground: centre [x, z] and yaw; local x runs along (cos, sin) in xz, local z along (-sin, cos)
+class GroundFrame {
+    constructor(c, yaw) { this.c = c; this.yaw = yaw; this.cs = Math.cos(yaw); this.sn = Math.sin(yaw); }
+    static facing(c, z) { return new GroundFrame(c, Math.atan2(-z[0], z[1])); }      // local +z along z
+    at(lx, y, lz) { return [this.c[0] + lx * this.cs - lz * this.sn, y, this.c[1] + lx * this.sn + lz * this.cs]; }
+    xz(lx, lz) { const p = this.at(lx, 0, lz); return [p[0], p[2]]; }
+    turned(a) { return new GroundFrame(this.c, this.yaw + a); }
+}
+
+const STRUCT_COLORS = {
+    walls: [[0.78, 0.74, 0.66], [0.74, 0.72, 0.68], [0.70, 0.55, 0.38], [0.56, 0.32, 0.25], [0.58, 0.63, 0.64], [0.68, 0.64, 0.50]],
+    roofs: [[0.40, 0.15, 0.11], [0.22, 0.23, 0.25], [0.32, 0.23, 0.17], [0.28, 0.31, 0.28]],
+    plinth: [0.30, 0.29, 0.28], door: [0.22, 0.14, 0.09], window: [0.06, 0.08, 0.10], brick: [0.36, 0.20, 0.16],
+    asphalt: [0.12, 0.12, 0.13], paint: [0.72, 0.72, 0.66], gravel: [0.40, 0.37, 0.32], concrete: [0.50, 0.49, 0.47],
+    stone: [0.46, 0.43, 0.40], wood: [0.36, 0.25, 0.16], metal: [0.24, 0.26, 0.27], glass: [0.36, 0.42, 0.45], sign: [0.85, 0.70, 0.12],
+};
+
+class Structures {
+    constructor(field) { this.field = field; this.v = []; this.blockers = []; }
+
+    ground(x, z) { return this.field.surface(x, z); }
+
+    tri(a, b, c, col, mat = 0) {
+        const n = v3.norm(v3.cross(v3.sub(b, a), v3.sub(c, a)));          // facing either way: the shader turns it to the eye
+        for (const p of [a, b, c]) this.v.push(p[0], p[1], p[2], n[0], n[1], n[2], col[0], col[1], col[2], mat);
+    }
+    quad(a, b, c, d, col, mat = 0) { this.tri(a, b, c, col, mat); this.tri(a, c, d, col, mat); }
+
+    // box in frame f around local (ox, oz): half sizes hx, hz, from y0 up to y1
+    box(f, ox, oz, hx, hz, y0, y1, col, mat = 0) {
+        const c = [[-1, -1], [1, -1], [1, 1], [-1, 1]], p = ([sx, sz], y) => f.at(ox + sx * hx, y, oz + sz * hz);
+        for (let k = 0; k < 4; k++) this.quad(p(c[k], y0), p(c[(k + 1) % 4], y0), p(c[(k + 1) % 4], y1), p(c[k], y1), col, mat);
+        this.quad(...c.map(q => p(q, y1)), col, mat);
+        this.quad(...c.map(q => p(q, y0)), col, mat);
+    }
+
+    // a rectangular section swept along a path: at point k ([x, z]) it spans offsets o0..o1 along `side` (a horizontal
+    // unit vector) and heights lo[k]..hi[k]
+    sweep(pts, side, o0, o1, lo, hi, col, mat = 0) {
+        const ring = k => [[o0, lo[k]], [o1, lo[k]], [o1, hi[k]], [o0, hi[k]]].map(([o, y]) => [pts[k][0] + side[0] * o, y, pts[k][1] + side[1] * o]);
+        for (let k = 0; k + 1 < pts.length; k++) {
+            const a = ring(k), b = ring(k + 1);
+            for (let e = 0; e < 4; e++) this.quad(a[e], a[(e + 1) % 4], b[(e + 1) % 4], b[e], col, mat);
+        }
+        this.quad(...ring(0), col, mat);
+        this.quad(...ring(pts.length - 1), col, mat);
+    }
+
+    // a shader box (see WGSL_SHELTER): frame f around local (ox, oz), half sizes, bottom / top at its centre, sky
+    // occlusion under it, slope (m per m along local x), and the lowest ground it shades (default: its bottom)
+    blocker(f, ox, oz, hx, hz, y0, y1, ao = 0, slope = 0, base = y0) {
+        const [x, z] = f.xz(ox, oz);
+        this.blockers.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y0, y1, ao, slope, base });
+    }
+
+    // a strip on the ground from a to b ([x, z]), half width hw, lifted a little above the terrain
+    strip(a, b, hw, col, mat = 0, lift = 0.12) {
+        const L = Math.hypot(b[0] - a[0], b[1] - a[1]), u = [(b[0] - a[0]) / L, (b[1] - a[1]) / L], side = [-u[1], u[0]];
+        const n = Math.max(1, Math.ceil(L / 6)), edge = (t, o) => {
+            const x = a[0] + u[0] * L * t + side[0] * o, z = a[1] + u[1] * L * t + side[1] * o;
+            return [x, this.ground(x, z) + lift, z];
+        };
+        for (let k = 0; k < n; k++) this.quad(edge(k / n, -hw), edge(k / n, hw), edge((k + 1) / n, hw), edge((k + 1) / n, -hw), col, mat);
+    }
+
+    // a water surface along a centre line (points [x, z, half width across `side`]), level with its banks
+    water(line, side) {
+        const row = c => {
+            const hw = c[2];
+            const e0 = [c[0] - side[0] * hw, c[1] - side[1] * hw], e1 = [c[0] + side[0] * hw, c[1] + side[1] * hw];
+            const y = Math.max(this.ground(...e0), this.ground(...e1), this.ground(...c)) + 0.1;
+            return [[e0[0], y, e0[1]], [e1[0], y, e1[1]]];
+        };
+        for (let k = 0; k + 1 < line.length; k++) {
+            const a = row(line[k]), b = row(line[k + 1]);
+            this.quad(a[0], a[1], b[1], b[0], [0, 0, 0], 6);
+        }
+    }
+
+    // a road: asphalt with a dashed centre line
+    road(a, b, hw) {
+        this.strip(a, b, hw, STRUCT_COLORS.asphalt, 3);
+        const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        for (let s = 3; s + 3 < L; s += 9) {
+            const t0 = s / L, t1 = (s + 3) / L, p = t => [lerp(a[0], b[0], t), lerp(a[1], b[1], t)];
+            this.strip(p(t0), p(t1), 0.08, STRUCT_COLORS.paint, 0, 0.14);
+        }
+    }
+
+    // a house: plinth, walls, a gable roof (ridge along local x, or across with `across`), door, windows, maybe a chimney
+    house(f, w, dp, o) {
+        const C = STRUCT_COLORS, hx = w / 2, hz = dp / 2;
+        const g = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sz]) => this.ground(...f.xz(sx * hx, sz * hz)));
+        const gLo = Math.min(...g), floor = Math.max(...g) + 0.35, ye = floor + o.wallH;
+        this.box(f, 0, 0, hx + 0.08, hz + 0.08, gLo - 1, floor, C.plinth);
+        this.box(f, 0, 0, hx, hz, floor, ye, o.wall);
+        // roof: two slopes from the eaves (overhanging by e) to the ridge, with thickness; gable triangles in wall colour
+        const rf = o.across ? f.turned(Math.PI / 2) : f, rx = o.across ? hz : hx, rz = o.across ? hx : hz;
+        const k = Math.tan(o.pitch), e = o.eave, th = 0.18, yr = ye + rz * k, yE = ye - e * k, ex = rx + e;
+        for (const sg of [-1, 1]) {
+            const zE = sg * (rz + e);
+            this.quad(rf.at(-ex, yE, zE), rf.at(ex, yE, zE), rf.at(ex, yr, 0), rf.at(-ex, yr, 0), o.roof, 1);
+            this.quad(rf.at(-ex, yE - th, zE), rf.at(ex, yE - th, zE), rf.at(ex, yr - th, 0), rf.at(-ex, yr - th, 0), o.roof, 1);
+            this.quad(rf.at(-ex, yE, zE), rf.at(ex, yE, zE), rf.at(ex, yE - th, zE), rf.at(-ex, yE - th, zE), o.roof, 1);
+            for (const x of [-ex, ex]) this.quad(rf.at(x, yE, zE), rf.at(x, yr, 0), rf.at(x, yr - th, 0), rf.at(x, yE - th, zE), o.roof, 1);
+        }
+        for (const x of [-rx, rx]) this.tri(rf.at(x, ye, -rz), rf.at(x, ye, rz), rf.at(x, yr, 0), o.wall);
+        if (o.chimney) {
+            const cz = rz * 0.45, y = ye + (rz - cz) * k;
+            this.box(rf, rx * 0.5, cz, 0.35, 0.35, y - 0.3, yr + 0.8, C.brick);
+        }
+        // door on the front (local -z), windows on every side, one row per storey
+        const d = 0.025, door = o.door;
+        const face = (side, u0, u1, y0, y1, col, mat) => {
+            const P = (u, y) => side === 'front' ? f.at(u, y, -hz - d) : side === 'back' ? f.at(u, y, hz + d)
+                : side === 'left' ? f.at(-hx - d, y, u) : f.at(hx + d, y, u);
+            this.quad(P(u0, y0), P(u1, y0), P(u1, y1), P(u0, y1), col, mat);
+        };
+        face('front', door - 0.5, door + 0.5, floor, floor + 2.1, C.door);
+        const storeys = o.wallH > 5 ? 2 : 1;
+        for (let st = 0; st < storeys; st++) {
+            const y0 = floor + 0.9 + st * 2.8;
+            for (const [side, len] of [['front', w], ['back', w], ['left', dp], ['right', dp]]) {
+                const nw = Math.max(1, Math.floor(len / 3.2));
+                for (let i = 0; i < nw; i++) {
+                    const u = -len / 2 + (i + 0.5) * len / nw;
+                    if (side === 'front' && st === 0 && Math.abs(u - door) < 1.4) continue;
+                    face(side, u - 0.55, u + 0.55, y0, y0 + 1.25, C.window, 5);
+                }
+            }
+        }
+        // shader boxes: the walls, and the roof with its eaves (which keep the rain off the top of the walls)
+        this.blocker(f, 0, 0, hx, hz, gLo - 1, ye, 0);
+        this.blocker(rf, 0, 0, ex, rz + e, yE - th, lerp(ye, yr, 0.55), 0.25, 0, gLo - 1);
+    }
+
+    // bus shelter: a roof on four posts, glass back and side panels, a bench, a timetable and the stop sign by the kerb.
+    // Local -z faces the road. Returns the floor height
+    busStop(f) {
+        const C = STRUCT_COLORS;
+        const g = [[-2.6, -1.5], [2.6, -1.5], [2.6, 1.5], [-2.6, 1.5]].map(([x, z]) => this.ground(...f.xz(x, z)));
+        const floor = Math.max(...g) + 0.12, yr = floor + 2.55;
+        this.box(f, 0, -0.2, 2.6, 1.5, Math.min(...g) - 0.4, floor, C.concrete);
+        for (const sx of [-2.05, 2.05]) for (const sz of [-0.85, 0.85]) this.box(f, sx, sz, 0.05, 0.05, floor, yr, C.metal, 4);
+        this.box(f, 0, 0, 2.35, 1.2, yr, yr + 0.14, C.metal, 4);
+        this.box(f, 0, 0.85, 2.0, 0.015, floor + 0.12, yr - 0.08, C.glass, 2);
+        for (const sx of [-2.05, 2.05]) this.box(f, sx, 0.3, 0.015, 0.55, floor + 0.12, yr - 0.08, C.glass, 2);
+        this.box(f, 0, 0.55, 1.3, 0.18, floor + 0.42, floor + 0.47, C.wood);
+        for (const sx of [-1.1, 1.1]) this.box(f, sx, 0.55, 0.04, 0.15, floor, floor + 0.42, C.metal, 4);
+        this.box(f, -1.2, 0.82, 0.35, 0.012, floor + 1.1, floor + 1.8, [0.80, 0.80, 0.78]);
+        this.box(f, -2.9, -1.2, 0.035, 0.035, floor, floor + 2.75, C.metal, 4);
+        this.box(f, -2.9, -1.2, 0.02, 0.3, floor + 2.2, floor + 2.75, C.sign, 4);
+        const gLo = Math.min(...g) - 0.5;
+        this.blocker(f, 0, 0, 2.35, 1.2, yr, yr + 0.14, 0.6, 0, gLo);
+        this.blocker(f, 0, 0.85, 2.0, 0.02, floor, yr - 0.08, 0.1, 0, gLo);
+        for (const sx of [-2.05, 2.05]) this.blocker(f, sx, 0.3, 0.02, 0.55, floor, yr - 0.08, 0.05, 0, gLo);
+        return floor;
+    }
+
+    // bridge from a to b ([x, z], ends on the ground): a deck `width` wide and `thick` deep that ramps up `rise` m over
+    // the first and last `ramp` m and arches `arch` m more, parapets (`parapet`) or railings, on piers about
+    // every `pierEvery` m. Returns the deck height at t (0 at a .. 1 at b)
+    bridge(a, b, o) {
+        const C = STRUCT_COLORS, L = Math.hypot(b[0] - a[0], b[1] - a[1]), u = [(b[0] - a[0]) / L, (b[1] - a[1]) / L], side = [-u[1], u[0]];
+        const ha = this.ground(...a) + 0.15, hb = this.ground(...b) + 0.15, hw = o.width / 2;
+        const ramp = Math.min((o.ramp ?? 20) / L, 0.45), at = t => [a[0] + u[0] * L * t, a[1] + u[1] * L * t];
+        const top = t => lerp(ha, hb, t) + (o.rise ?? 0) * smoothstep(0, ramp, t) * (1 - smoothstep(1 - ramp, 1, t)) + o.arch * Math.sin(Math.PI * t);
+        const n = Math.max(8, Math.ceil(L / 3)), ts = Array.from({ length: n + 1 }, (_, k) => k / n);
+        const pts = ts.map(at), tops = ts.map(top), offs = (dy) => tops.map(y => y + dy);
+        this.sweep(pts, side, -hw, hw, offs(-o.thick), tops, o.deck, 0);
+        if (o.surface) this.sweep(pts, side, -hw + 0.4, hw - 0.4, tops, offs(0.03), C.asphalt, 3);
+        for (const sg of [-1, 1]) {
+            if (o.parapet) { this.sweep(pts, side, sg * hw - (sg > 0 ? 0.35 : 0), sg * hw + (sg < 0 ? 0.35 : 0), tops, offs(0.9), o.deck, 0); continue; }
+            const rail = sg * (hw - 0.04);
+            this.sweep(pts, side, rail - 0.03, rail + 0.03, offs(1.0), offs(1.07), o.rail, 4);
+            this.sweep(pts, side, rail - 0.02, rail + 0.02, offs(0.5), offs(0.54), o.rail, 4);
+            for (let s = 1; s < L; s += 2) {
+                const t = s / L, pf = new GroundFrame(at(t), Math.atan2(u[1], u[0]));
+                this.box(pf, 0, rail, 0.03, 0.03, top(t), top(t) + 1.07, o.rail, 4);
+            }
+        }
+        // piers down to the ground (under water, the river bed)
+        const yaw = Math.atan2(u[1], u[0]), np = Math.max(1, Math.round(L / o.pierEvery));
+        for (let i = 1; i < np; i++) {
+            const t = i / np, c = at(t), pf = new GroundFrame(c, yaw);
+            this.box(pf, 0, 0, o.pierHalf, hw * 0.8, this.ground(...c) - 2, top(t) - o.thick, o.pier);
+        }
+        // shader boxes along the deck, sheared to the chord of each piece and kept inside the curved deck (so its top
+        // stays wet and its underside dry)
+        const nb = Math.max(1, Math.ceil(L / 8)), ks = [0, 0.25, 0.5, 0.75, 1];
+        for (let i = 0; i < nb; i++) {
+            const t0 = i / nb, t1 = (i + 1) / nb, tm = (t0 + t1) / 2, len = L * (t1 - t0);
+            const slope = (top(t1) - top(t0)) / len, mid = (top(t0) + top(t1)) / 2;
+            const dev = ks.map(k => top(lerp(t0, t1, k)) - lerp(top(t0), top(t1), k));
+            const base = Math.min(...ks.map(k => this.ground(...at(lerp(t0, t1, k))))) - 1;
+            this.blocker(new GroundFrame(at(tm), yaw), 0, 0, len / 2, hw, mid + Math.max(...dev) - o.thick + 0.03, mid + Math.min(...dev) - 0.03, 0.55, slope, base);
+        }
+        return top;
+    }
+
+    // the boxes nearest `around` into the frame uniform, their bounds, and the grid of which boxes can shade each cell,
+    // for this sun (sunDir) and wind ([x, z]; snow, which blows further, when the freezing level is near the boxes)
+    write(F, around, sunDir, wind, freezing) {
+        let list = this.blockers;
+        if (list.length > MAX_BLOCKERS) {
+            const d = b => Math.hypot(b.x - around[0], b.z - around[2]);
+            list = [...list].sort((p, q) => d(p) - d(q)).slice(0, MAX_BLOCKERS);
+        }
+        if (!list.length) { F.set('blocks', [0, 0, 0, 0]); return; }
+        if (list !== this.listed) {
+            this.listed = list;
+            this.data = new Float32Array(MAX_BLOCKERS * 12);
+            list.forEach((b, i) => this.data.set([b.x, b.z, b.hx, b.hz, b.cs, b.sn, b.y0, b.y1, b.ao, b.slope, 0, 0], i * 12));
+            this.lo = Math.min(...list.map(b => Math.min(b.base, b.y0 - Math.abs(b.slope) * b.hx)));
+            this.hi = Math.max(...list.map(b => b.y1 + Math.abs(b.slope) * b.hx));
+        }
+        // a box shades what lies down-sun of it (its sun shadow) and downwind of it (its rain shadow), as far as a ray
+        // from the ground under it climbs to its top: a capsule each way from its centre, as wide as the box
+        const snow = freezing < this.hi + 250, fall = snow ? 1.35 : 9.5, wl = Math.hypot(...wind);
+        const sunL = Math.hypot(sunDir[0], sunDir[2]), sunUp = sunDir[1] > 0 && sunL > 1e-4;
+        const sunSlant = sunUp ? Math.min(sunL / Math.max(sunDir[1], 0.05), 20) : 0, rainSlant = wl * 0.8 / fall;
+        const caps = list.map(b => {
+            const h = b.y1 + Math.abs(b.slope) * b.hx - b.base, r = Math.hypot(b.hx, b.hz) + 1;
+            const ls = Math.min(h * sunSlant, 400), lr = Math.min(h * rainSlant, 400);
+            const sunEnd = sunUp ? [b.x - sunDir[0] / sunL * ls, b.z - sunDir[2] / sunL * ls] : [b.x, b.z];
+            const rainEnd = wl > 1e-4 ? [b.x + wind[0] / wl * lr, b.z + wind[1] / wl * lr] : [b.x, b.z];
+            return { r, segs: [sunEnd, rainEnd], x0: Math.min(b.x, sunEnd[0], rainEnd[0]) - r, x1: Math.max(b.x, sunEnd[0], rainEnd[0]) + r,
+                z0: Math.min(b.z, sunEnd[1], rainEnd[1]) - r, z1: Math.max(b.z, sunEnd[1], rainEnd[1]) + r };
+        });
+        const x0 = Math.min(...caps.map(c => c.x0)), x1 = Math.max(...caps.map(c => c.x1));
+        const z0 = Math.min(...caps.map(c => c.z0)), z1 = Math.max(...caps.map(c => c.z1));
+        const G = BLOCK_GRID, cw = (x1 - x0) / G, ch = (z1 - z0) / G, half = Math.hypot(cw, ch) / 2, grid = this.grid ??= new Uint32Array(G * G * 4);
+        const segDist = (px, pz, ax, az, bx, bz) => {
+            const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz, t = l2 > 0 ? clamp(((px - ax) * dx + (pz - az) * dz) / l2, 0, 1) : 0;
+            return Math.hypot(ax + dx * t - px, az + dz * t - pz);
+        };
+        grid.fill(0);
+        list.forEach((b, k) => {
+            const c = caps[k];
+            const i0 = clamp(Math.floor((c.x0 - x0) / cw), 0, G - 1), i1 = clamp(Math.floor((c.x1 - x0) / cw), 0, G - 1);
+            const j0 = clamp(Math.floor((c.z0 - z0) / ch), 0, G - 1), j1 = clamp(Math.floor((c.z1 - z0) / ch), 0, G - 1);
+            for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+                const px = x0 + (i + 0.5) * cw, pz = z0 + (j + 0.5) * ch;
+                if (c.segs.some(e => segDist(px, pz, b.x, b.z, e[0], e[1]) <= c.r + half)) grid[(j * G + i) * 4 + (k >> 5)] |= 1 << (k & 31);
+            }
+        });
+        F.set('blockers', this.data);
+        F.set('blocks', [list.length, this.lo, this.hi, 0]);
+        F.set('blockBox', [x0, z0, x1, z1]);
+        F.setBits('blockGrid', grid);
+    }
+
+    // blockerHit in WGSL: the ray from o along d enters box b
+    static hit(b, o, d) {
+        const rx = o[0] - b.x, rz = o[2] - b.z, lx = rx * b.cs + rz * b.sn, dx = d[0] * b.cs + d[2] * b.sn;
+        const slabs = [[lx, dx, -b.hx, b.hx], [o[1] - b.slope * lx, d[1] - b.slope * dx, b.y0, b.y1],
+            [-rx * b.sn + rz * b.cs, -d[0] * b.sn + d[2] * b.cs, -b.hz, b.hz]];
+        let tn = -Infinity, tf = Infinity;
+        for (const [p, v, a, c] of slabs) {
+            if (Math.abs(v) < 1e-9) { if (p < a || p > c) return false; continue; }
+            const ta = (a - p) / v, tc = (c - p) / v;
+            tn = Math.max(tn, Math.min(ta, tc));
+            tf = Math.min(tf, Math.max(ta, tc));
+        }
+        return tn > 0.02 && tn <= tf;
+    }
+
+    // a structure keeps off what falls on p along -d (d: back up against the fall)
+    shelters(p, d) { return this.blockers.some(b => Structures.hit(b, p, d)); }
+}
+
+// A small village on a road, laid out from a seed on the terrain as drawn. The road runs across the river `river` (an
+// entity id; or at `road` degrees from +x without one) on a stone bridge; a side street branches off on the longer
+// bank. Houses (`houses` at most) line both, a bus shelter stands by the main road near the junction, and a wooden
+// footbridge crosses the river `footbridge` m along it (in its path's direction; negative: the other way; 0: none).
+// Viewpoints for scenario views (`spot`): "bus stop", "bridges", "under the bridge", "overview".
+class Village extends Entity {
+    // the river through the village gets a deeper channel (`channel` m), and the village draws its water itself at the
+    // river's true width: the land-use map is far coarser than a river, so it is cleared here
+    stamp(f) {
+        const d = this.def, river = d.river && this.world.get(d.river);
+        if (!river) return;
+        const [cx, cz] = d.pos, R = d.radius ?? 380, halfW = (river.def.width || 60) / 2, depth = d.channel ?? 3, reach = R * 3;
+        f.each(cx - reach, cz - reach, cx + reach, cz + reach, (idx, x, z) => {
+            const r = Math.hypot(x - cx, z - cz), k = 1 - smoothstep(R * 1.1, R * 1.5, r);
+            if (k > 0) f.h[idx] -= depth * k * (1 - smoothstep(halfW * 0.5, halfW + 160, river.distance(x, z)));
+            f.land[idx * 3 + 2] *= smoothstep(R * 2.2, reach, r);     // where the village's water tapers off, the map's returns
+        });
+    }
+
+    get anchor() { const p = this.def.pos; return [p[0], this.world.field.sample(p[0], p[1]) + (this.def.labelHeight ?? 110), p[1]]; }
+    get focus() { const p = this.def.pos; return [p[0], this.world.field.sample(p[0], p[1]), p[1]]; }
+
+    build(S) {
+        const d = this.def, f = this.world.field, rnd = mulberry32(d.seed ?? 9), r = (a, b) => a + (b - a) * rnd();
+        const [cx, cz] = d.pos, R = d.radius ?? 380, roadHalf = 3.5, C = STRUCT_COLORS;
+        const river = d.river && this.world.get(d.river), halfW = river ? (river.def.width || 60) / 2 : 0;
+        const water = (x, z) => Math.max(f.landAt(x, z, 2), river && river.distance(x, z) < halfW + 6 ? 1 : 0);
+        // the road crosses the river where it is nearest to the village, square to it
+        let along = [Math.cos((d.road ?? 0) * DEG), Math.sin((d.road ?? 0) * DEG)];
+        let dir = [-along[1], along[0]];
+        if (river) {
+            const pts = river.def.path;
+            let best = Infinity;
+            for (let k = 0; k + 1 < pts.length; k++) {
+                const [ax, az] = pts[k], [bx, bz] = pts[k + 1], l = Math.hypot(bx - ax, bz - az);
+                const t = clamp(((cx - ax) * (bx - ax) + (cz - az) * (bz - az)) / (l * l), 0, 1);
+                const dd = Math.hypot(ax + (bx - ax) * t - cx, az + (bz - az) * t - cz);
+                if (dd < best) { best = dd; along = [(bx - ax) / l, (bz - az) / l]; }
+            }
+            dir = [-along[1], along[0]];
+            if (d.footbridge && d.footbridge < 0) along = [-along[0], -along[1]];
+        }
+        const P = s => [cx + dir[0] * s, cz + dir[1] * s];
+        // the stretch of a line that crosses water, nearest its middle: [s0, s1] or null
+        const wetSpan = (at, a, b) => {
+            let cur = null, best = null;
+            for (let s = a; s <= b; s += 2) {
+                if (water(...at(s)) > 0.15) { if (!cur) cur = [s, s]; cur[1] = s; }
+                else if (cur) { if (!best || Math.abs(cur[0] + cur[1]) < Math.abs(best[0] + best[1])) best = cur; cur = null; }
+            }
+            if (cur && (!best || Math.abs(cur[0] + cur[1]) < Math.abs(best[0] + best[1]))) best = cur;
+            return best;
+        };
+        const taken = [];            // [x, z, radius] of what stands already, and the roads as [a, b, half width]
+        const roads = [];
+        const segDist = ([a, b], x, z) => {
+            const dx = b[0] - a[0], dz = b[1] - a[1], t = clamp(((x - a[0]) * dx + (z - a[1]) * dz) / (dx * dx + dz * dz), 0, 1);
+            return Math.hypot(a[0] + dx * t - x, a[1] + dz * t - z);
+        };
+        const free = (x, z, rad) => taken.every(([ox, oz, or]) => Math.hypot(x - ox, z - oz) > rad + or + 1.5)
+            && roads.every(rd => segDist(rd, x, z) > rad + rd[2] + 1)
+            && [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]].every(([a, b]) => water(x + a * rad, z + b * rad) < 0.03);
+        const addRoad = (a, b, hw) => { S.road(a, b, hw); roads.push([a, b, hw]); };
+
+        // main road, with the bridge where it meets the river
+        const span = river ? wetSpan(P, -R, R) : null;
+        let bA = R, bB = R;
+        this.spots = {};
+        if (span) {
+            bA = span[0] - 26; bB = span[1] + 26;
+            const top = S.bridge(P(bA), P(bB), { width: 8, thick: 1.1, rise: 4, ramp: 22, arch: 1.5, parapet: true, surface: true, deck: C.stone, pier: C.stone, pierEvery: 24, pierHalf: 1.2 });
+            roads.push([P(bA), P(bB), 5]);
+            // under the deck on the bank, looking along the river past the dry ground below it
+            for (let t = 0.02; t < 0.5; t += 0.005) {
+                const c = P(lerp(bA, bB, t));
+                if (water(...c)) break;
+                const g = f.surface(...c);
+                if (top(t) - 1.1 - g < 2.5) continue;
+                const e = [c[0] - along[0] * 1.5, c[1] - along[1] * 1.5];
+                this.spots['under the bridge'] = { pos: [e[0], g + 1.6, e[1]], look: [c[0] + along[0] * 60 + dir[0] * 25, g + 1.2, c[1] + along[1] * 60 + dir[1] * 25] };
+                break;
+            }
+            if (bA > -R) addRoad(P(-R), P(bA), roadHalf);
+            if (bB < R) addRoad(P(bB), P(R), roadHalf);
+        } else addRoad(P(-R), P(R), roadHalf);
+
+        // side street on the longer bank, along the river
+        const sJ = span ? (R - bB > bA + R ? bB + (R - bB) * 0.42 : bA - (bA + R) * 0.42) : R * 0.2;
+        const J = P(sJ), Q = u => [J[0] + along[0] * u, J[1] + along[1] * u];
+        const ls = R * 0.6;
+        const sideWet = wetSpan(u => Q(u), -ls, ls);
+        let u0 = -ls, u1 = ls;
+        if (sideWet) { if (sideWet[1] < 0) u0 = sideWet[1] + 20; else u1 = sideWet[0] - 20; }
+        addRoad(Q(u0), Q(u1), 2.8);
+
+        // bus stop by the main road just past the junction, its back to the west (where the rain comes from in most states)
+        const sB = sJ + (Math.abs(sJ + 22) < R - 20 && (sJ + 22 < bA - 10 || sJ + 22 > bB + 10) ? 22 : -22);
+        const sideB = (d.busStopSide ?? (along[0] < 0 ? 1 : -1));
+        const out = [along[0] * sideB, along[1] * sideB];
+        const stopC = [P(sB)[0] + out[0] * (roadHalf + 1.8), P(sB)[1] + out[1] * (roadHalf + 1.8)];
+        const stop = GroundFrame.facing(stopC, out);
+        const floor = S.busStop(stop);
+        const across = [P(sB)[0] - out[0] * (roadHalf + 12), P(sB)[1] - out[1] * (roadHalf + 12)];
+        taken.push([...stopC, 4], [...across, 10]);      // and an open lot across the road, so the shelter looks out on the street
+        const toward = sB > sJ ? -1 : 1, aim = P(sB + toward * 35);       // out across the street, toward the junction
+        this.spots['bus stop'] = { pos: stop.at(0.4, floor + 1.65, 0.15), look: [aim[0] - out[0] * 20, floor + 2.4, aim[1] - out[1] * 20] };
+
+        // houses along both streets, facing them
+        const C2 = STRUCT_COLORS;
+        let built = 0;
+        const maxHouses = d.houses ?? 28;
+        const lineHouses = (at, from, to, side, setback, skip) => {
+            for (let s = from; s < to && built < maxHouses; s += r(17, 27)) {
+                if (skip(s)) continue;
+                for (const sg of [-1, 1]) {
+                    if (rnd() < 0.18 || built >= maxHouses) continue;
+                    const w = r(7, 11), dp = r(6.5, 9), off = setback + r(4, 9) + dp / 2, c0 = at(s);
+                    const c = [c0[0] + side[0] * sg * off, c0[1] + side[1] * sg * off], rad = Math.hypot(w, dp) / 2;
+                    if (!free(...c, rad)) continue;
+                    const hf = GroundFrame.facing(c, [side[0] * sg, side[1] * sg]);
+                    S.house(hf, w, dp, {
+                        wallH: rnd() < 0.3 ? r(5.4, 6) : r(2.9, 3.4), pitch: r(28, 42) * DEG, eave: r(0.4, 0.7), across: rnd() < 0.35,
+                        wall: C2.walls[Math.floor(rnd() * C2.walls.length)], roof: C2.roofs[Math.floor(rnd() * C2.roofs.length)],
+                        chimney: rnd() < 0.4, door: r(-w / 2 + 1.2, w / 2 - 1.2),
+                    });
+                    taken.push([...c, rad]);
+                    built++;
+                }
+            }
+        };
+        const nearJunction = s => Math.abs(s - sJ) < 16;
+        lineHouses(P, -R + 12, R - 12, along, roadHalf, s => nearJunction(s) || (s > bA - 18 && s < bB + 18));
+        lineHouses(Q, u0 + 8, u1 - 8, dir, 2.8, u => Math.abs(u) < 14);
+
+        // footbridge across the river, `footbridge` m along it from the road bridge
+        if (span && d.footbridge !== 0) {
+            const fb = Math.abs(d.footbridge ?? 160), m = P((span[0] + span[1]) / 2), M = [m[0] + along[0] * fb, m[1] + along[1] * fb];
+            const at = s => [M[0] + dir[0] * s, M[1] + dir[1] * s], fs = wetSpan(at, -260, 260);
+            if (fs) {
+                const a = at(fs[0] - 8), b = at(fs[1] + 8);
+                S.bridge(a, b, { width: 2.4, thick: 0.45, rise: 1.5, ramp: 7, arch: 2, deck: C.wood, rail: C.metal, pier: C.wood, pierEvery: 18, pierHalf: 0.2 });
+                S.strip(at(fs[0] - 30), a, 1.1, C.gravel);
+                S.strip(b, at(fs[1] + 30), 1.1, C.gravel);
+            }
+            const mid = (span[0] + span[1]) / 2, view = [m[0] - along[0] * 70 + dir[0] * (span[1] - mid) * 0.35, m[1] - along[1] * 70 + dir[1] * (span[1] - mid) * 0.35];
+            const gy = f.sample(...view);
+            this.spots.bridges = { pos: [view[0], gy + 9, view[1]], look: [M[0], gy + 3, M[1]] };
+        }
+        // the river's water, along its centre line through the village
+        if (river) {
+            const line = [];
+            let prev = 0;
+            for (let u = -R * 3, first = true; u <= R * 3; u += 8, first = false) {
+                const o = [cx + along[0] * u, cz + along[1] * u];
+                let best = Infinity, bs = prev;
+                for (let s = first ? -R * 1.5 : prev - 60; s <= (first ? R * 1.5 : prev + 60); s += 2) {
+                    const dd = river.distance(o[0] + dir[0] * s, o[1] + dir[1] * s);
+                    if (dd < best) { best = dd; bs = s; }
+                }
+                prev = bs;
+                line.push([o[0] + dir[0] * bs, o[1] + dir[1] * bs, halfW * (1 - smoothstep(R * 2.2, R * 3, Math.abs(u)))]);
+            }
+            S.water(line, dir);
+        }
+        const ov = [cx - dir[0] * R * 0.9 - along[0] * R * 0.6, cz - dir[1] * R * 0.9 - along[1] * R * 0.6];
+        this.spots.overview = { pos: [ov[0], f.sample(...ov) + 90, ov[1]], look: [cx, f.sample(cx, cz), cz] };
     }
 }
 
@@ -2608,6 +3257,7 @@ const ENTITY_TYPES = {
     lake: Lake,
     town: Town,
     forest: Forest,
+    village: Village,
     storm: StormCell,
     supercell: Supercell,
     squall: SquallLine,
@@ -2819,6 +3469,9 @@ class World {
         this.flashCount = 0;
         for (const def of scenario.entities || []) this.add(def, false);
         for (const e of this.entities) { e.stamp(this.field); this.field.updateRange(); }
+        this.field.freeze();
+        this.structures = new Structures(this.field);
+        for (const e of this.entities) e.build(this.structures);
         for (const e of [...this.entities]) e.spawn();
     }
 
@@ -3044,7 +3697,7 @@ class CloudPass {
         this.resolveIO = makeLayout(d, C, ['tex', 'tex:unfilterable-float', 'tex', 'write:rgba16float']);
         const rSet = new BindingSet(d, ['F', 'clampSamp']);
         this.pMarch = computePipeline(d, 'march', [r.worldSet.layout, this.marchOut],
-            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_SKIP_SAMPLE, WGSL_MARCH), 'march');
+            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_SKIP_SAMPLE, WGSL_SHELTER, WGSL_MARCH), 'march');
         this.tileOut = makeLayout(d, C, ['write:rg32uint']);
         this.pTiles = computePipeline(d, 'tiles', [r.worldSet.layout, this.tileOut],
             shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SKIP_SAMPLE, WGSL_TILES), 'tiles');
@@ -3190,21 +3843,26 @@ class Renderer {
     createPipelines() {
         const d = this.device;
         this.screenLayout = makeLayout(d, GPUShaderStage.FRAGMENT, ['tex', 'tex']);
-        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SCENE) });
-        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_FINAL) });
+        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_SCENE) });
+        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_FINAL) });
         const layoutA = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout] });
         const layoutB = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout, this.screenLayout] });
         const blendAlpha = { color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
         const blendAdd = { color: { srcFactor: 'src-alpha', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
-        const pipe = (layout, module, vs, fs, format, depth, blend) => d.createRenderPipeline({
+        const pipe = (layout, module, vs, fs, format, depth, blend, buffers) => d.createRenderPipeline({
             label: vs, layout,
-            vertex: { module, entryPoint: vs },
+            vertex: { module, entryPoint: vs, buffers },
             fragment: { module, entryPoint: fs, targets: [{ format, blend }] },
             primitive: { topology: 'triangle-list', cullMode: 'none' },
             depthStencil: { format: 'depth32float', depthWriteEnabled: depth.write, depthCompare: depth.compare },
         });
         this.pSky = pipe(layoutA, scene, 'vsSky', 'fsSky', 'rgba16float', { write: false, compare: 'always' });
         this.pTerrain = pipe(layoutA, scene, 'vsTerrain', 'fsTerrain', 'rgba16float', { write: true, compare: 'greater' });
+        this.pStruct = pipe(layoutA, scene, 'vsStruct', 'fsStruct', 'rgba16float', { write: true, compare: 'greater' }, undefined, [{
+            arrayStride: STRUCT_FLOATS * 4, attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x3' }, { shaderLocation: 1, offset: 12, format: 'float32x3' },
+                { shaderLocation: 2, offset: 24, format: 'float32x4' }],
+        }]);
         this.pComposite = pipe(layoutB, final, 'vsFull', 'fsComposite', this.format, { write: false, compare: 'always' });
         this.pPrecip = pipe(layoutB, final, 'vsPrecip', 'fsPrecip', this.format, { write: false, compare: 'greater' }, blendAlpha);
         this.pBolt = pipe(layoutB, final, 'vsBolt', 'fsBolt', this.format, { write: false, compare: 'greater' }, blendAdd);
@@ -3221,6 +3879,10 @@ class Renderer {
         d.queue.writeTexture({ texture: this.landMap }, f.packLand(), { bytesPerRow: f.n * 4 }, [f.n, f.n]);
         this.heightView = this.heightMap.createView();
         this.groundPass = new GroundPass(this, world);
+        this.structBuf?.destroy();
+        const sv = new Float32Array(world.structures.v);
+        this.structCount = sv.length / STRUCT_FLOATS;
+        this.structBuf = this.structCount ? makeBuffer(d, sv.byteLength, GPUBufferUsage.VERTEX, sv) : null;
         this.worldGroup = this.worldSet.group({
             F: this.frameBuf, shapeTex: this.noise.shapeView, detailTex: this.noise.detailView, weatherTex: this.weatherPass.weatherView,
             shadowTex: this.weatherPass.shadowView, heightTex: this.heightView, landTex: this.landMap.createView(), repSamp: this.repSamp,
@@ -3267,6 +3929,11 @@ class Renderer {
         a.setPipeline(this.pTerrain);
         a.setIndexBuffer(this.terrainIndex, 'uint32');
         a.drawIndexed(this.terrainCount);
+        if (this.structCount) {
+            a.setPipeline(this.pStruct);
+            a.setVertexBuffer(0, this.structBuf);
+            a.draw(this.structCount);
+        }
         a.end();
 
         if (froxels && volumetrics) this.froxelPass.encode(enc, prof);
@@ -3367,7 +4034,7 @@ class FlyCamera {
         if (k.has('KeyC')) m[1] -= 1;
         const mul = (k.has('ShiftLeft') || k.has('ShiftRight') ? 5 : 1) * (k.has('AltLeft') ? 0.2 : 1);
         this.pos = v3.add(this.pos, v3.mul(m, this.speed * mul * dt));
-        this.pos[1] = clamp(this.pos[1], field.sample(this.pos[0], this.pos[2]) + 2, 25000);
+        this.pos[1] = clamp(this.pos[1], field.sample(this.pos[0], this.pos[2]) + 1.5, 25000);
     }
 
     ray(mx, my, w, h) {
@@ -3428,7 +4095,7 @@ class Hud {
             `air       ${c.temperature.toFixed(0)} °C at sea level · freezing level ${(wx.freezingLevel / 1000).toFixed(1)} km · wind ${wind.toFixed(0)} m/s from ${from}`,
             `clouds    ${w.clouds.active(c).map(([n, v]) => `${n} ${(v * 100).toFixed(0)}%`).join(' · ') || 'none'}`,
             `storms    ${storms.length} cells · ${raining} raining · ${w.flashCount} flashes`,
-            `here      ${here} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
+            `here      ${here}${app.sheltered ? ' <span class="w">sheltered</span>' : ''} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
             `render    ${RENDER_MODES[app.mode]} · ${q.name} ${cw.w}×${cw.h}${q.interleave > 1 ? ` 1/${q.interleave} px` : ''}${q.blur ? ' blur' : ''}${app.tiles ? ' tiles' : ''} ${q.steps} steps · froxels ${app.froxels ? FROXEL.join('×') : 'off'} · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
             app.renderer.profiler.enabled
                 ? `gpu       ${app.renderer.profiler.total.toFixed(1)} ms · ${Object.entries(app.renderer.profiler.ms).map(([n, v]) => `${n} ${v.toFixed(1)}`).join(' · ')}`
@@ -3489,6 +4156,7 @@ class App {
         this.prevViewProj = null;
         this.frameNo = 0;
         this.near = { rain: 0, snow: 0 };
+        this.sheltered = false;
         this.probe = { coverage: 0, top: 0, precip: 0, virga: 0, cover: 0 };
         this.groundSnowHint = 'none';
         this.reset = true;
@@ -3524,7 +4192,11 @@ class App {
 
     jump(v) {
         const e = v.follow && this.world.get(v.follow);
-        if (e?.focus) {
+        if (v.spot && e?.spots?.[v.spot]) {
+            // a viewpoint the entity laid out (a village's bus stop)
+            this.camera.pos = [...e.spots[v.spot].pos];
+            this.camera.lookAt(e.spots[v.spot].look);
+        } else if (e?.focus) {
             // relative to a moving entity: offset from its focus point, height above the ground there
             const f = e.focus, o = v.offset || [0, 0, 0], l = v.lookOffset || [0, 2000, 0];
             const x = f[0] + o[0], z = f[2] + o[2];
@@ -3657,6 +4329,7 @@ class App {
         this.shadowSlices = full ? 1 : SHADOW_SLICES;
         F.set('froxel', [FROXEL_NEAR, cfg.maxDistance, this.froxels ? 1 : 0, 0]);
         F.set('post', [q.blur || 0, this.tiles ? 1 : 0, 0, 0]);
+        w.structures.write(F, cam.pos, sky.dir, c.wind, w.weather.freezingLevel);
         F.set('misc', [c.temperature, this.time * cfg.fallSpeed % 52000, f.base, wdt]);
         w.lightning.write(F);
 
@@ -3704,6 +4377,9 @@ class App {
         w.update(this.paused ? 0 : dt, wdt, this.time);
         this.probe = r.weatherPass.probe;
         this.near = this.nearPrecip();
+        // under a roof or a deck: the way the drops come (as rainBack in WGSL) is blocked
+        const c = w.weather.cur, fall = this.near.snow > this.near.rain ? 1.35 : 9.5;
+        this.sheltered = this.near.rain + this.near.snow > 0.01 && w.structures.shelters(this.camera.pos, v3.norm([-c.wind[0] * 0.8, fall, -c.wind[1] * 0.8]));
 
         this.writeFrame(dt, wdt);
         const enc = r.device.createCommandEncoder();
