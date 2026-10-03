@@ -361,6 +361,10 @@ const MAX_BOLT_SEGS = 768;
 const MAX_BLOCKERS = 128;            // structure boxes in the frame uniform (sun and rain shadows, see WGSL_SHELTER)
 const BLOCK_GRID = 32;               // cells per side over their bounds, each listing the boxes that can shade it (4 x 32 bits)
 const BLOCK_RANGE = 2500;            // only boxes this close to the camera (m) go into the frame, so the grid stays fine
+const MAX_LIGHTS = 64;               // point and spot lights in the frame uniform (App.writeLights), the most important first
+const LIGHT_RANGE = 700;             // m: lights further from the camera than this (less their reach) are left out
+const LIGHT_GRID = 32;               // cells per side over the lights' reach, each listing the lights that reach into it (2 x 32 bits)
+const LIGHT_CABIN = 1, LIGHT_SPOT = 2;  // light flags: a bus's cabin glow (not on the cabin's own surfaces), a spot (cone)
 const MAX_RAIN_ZONES = 64;           // points along the bus route with their own rain rate (RainZones, mixed rain)
 const ZONE_STEP = 300, ZONE_RADIUS = 380;  // m between them, how far each one's rain reaches
 const CLEAR_RADIUS = 450, CLEAR_WIDE = 3;   // a clear stretch's opening: m past its ends along the route, x that across it
@@ -449,16 +453,16 @@ const WALK = { radius: 0.2, step: 0.5, head: 1.75, eye: 1.62, speed: 1.5, run: 4
 //   of storeys lit), shelter (the interior keeps out rain and snow however the wind blows), inner / floorColor / ceiling colours
 const BUILDING_TYPES = {
     house: { storeyHeight: 2.8, plinth: 0.35, wall: 0.25, slab: 0.22, window: { width: 1.1, height: 1.25, sill: 0.9, pitch: 3.2 },
-        door: { width: 1.0, height: 2.1, color: 'door' }, stairs: { width: 0.95 }, furnish: 'home', lamps: 0.5, shelter: true,
+        door: { width: 1.0, height: 2.1, color: 'door' }, stairs: { width: 0.95 }, furnish: 'home', lamps: 0.5, porch: 0.6, shelter: true,
         inner: [0.84, 0.80, 0.72], floorColor: [0.40, 0.28, 0.18], ceiling: [0.90, 0.89, 0.86] },
     terminal: { storeyHeight: 3.6, plinth: 0.15, wall: 0.3, slab: 0.3, window: { width: 1.45, height: 2.0, sill: 0.8, pitch: 1.6 },
-        door: { width: 1.6, height: 2.4, color: 'metal' }, stairs: { width: 1.4 }, furnish: 'hall', lamps: 1, shelter: true,
+        door: { width: 1.6, height: 2.4, color: 'metal' }, stairs: { width: 1.4 }, furnish: 'hall', lamps: 1, porch: 1, shelter: true,
         inner: [0.80, 0.79, 0.75], floorColor: [0.52, 0.50, 0.46], ceiling: [0.88, 0.88, 0.86] },
     block: { storeyHeight: 3.2, plinth: 0.3, wall: 0.3, slab: 0.25, window: { width: 1.3, height: 1.5, sill: 0.9, pitch: 1.8 },
-        door: { width: 1.2, height: 2.3, color: 'metal' }, stairs: { width: 1.2 }, furnish: 'office', lamps: 0.6, shelter: true,
+        door: { width: 1.2, height: 2.3, color: 'metal' }, stairs: { width: 1.2 }, furnish: 'office', lamps: 0.6, porch: 1, shelter: true,
         inner: [0.82, 0.82, 0.80], floorColor: [0.38, 0.40, 0.42], ceiling: [0.90, 0.90, 0.88] },
     kiosk: { storeyHeight: 2.4, plinth: 0, wall: 0.08, slab: 0.1, window: { width: 1.5, height: 1.25, sill: 0.95, pitch: 1.75 },
-        door: { width: 0.9, height: 2.1, color: 'metal' }, stairs: false, furnish: 'kiosk', lamps: 1, shelter: true,
+        door: { width: 0.9, height: 2.1, color: 'metal' }, stairs: false, furnish: 'kiosk', lamps: 1, porch: 0, shelter: true,
         inner: [0.78, 0.78, 0.74], floorColor: [0.30, 0.31, 0.30], ceiling: [0.86, 0.86, 0.84] },
 };
 // what stands in a building (BUILDING_TYPES' furnish), per storey (the last entry for the storeys above): items along the
@@ -789,6 +793,12 @@ const FRAME_LAYOUT = [
     ['blockGrid', `array<vec4u, ${BLOCK_GRID * BLOCK_GRID}>`], // per cell of blockBox: bit k set if box k can shade a point in it
     // the bus nearest the camera, or the one ridden (BusLine): world to its frame (each bus is drawn with its own, wgslBus)
     ['busInv', 'mat4x4f'],
+    ['lightInfo', 'vec4f'], // lights in lights, lamps on (night), -, the air's scattering for their halos and beams (1/m)
+    // [x, y, z, range (m)] [rgb intensity (adapted to the exposure), cos of the cone's edge] [cone axis, cos of its full core]
+    ['lights', `array<vec4f, ${MAX_LIGHTS * 4}>`],    // ... [flags, size squared (m^2: softens the falloff close to it), -, -]
+    ['lightMask', `array<vec4u, ${MAX_LIGHTS}>`],
+    ['lightBox', 'vec4f'],  // bounds of the lights' reach x0, z0, x1, z1
+    ['lightGrid', `array<vec4u, ${LIGHT_GRID * LIGHT_GRID / 2}>`], // per cell of lightBox (two to a vec4u): bit k set if light k reaches into it // per light: bit k set if box k of blockers can stand between it and what it lights
     ['cabinLo', 'vec4f'],   // its body in its frame (inCabin): min corner, bus on
     ['cabinHi', 'vec4f'],   // max corner, -
 ];
@@ -948,10 +958,14 @@ fn marchedNow(q: vec2i) -> bool {
     if (n >= 2) { return ((q.x + q.y + i32(F.right.w)) & 1) == 0; }
     return true;
 }
-// by night (F.sunDir.w, the moon) the eye's rods take over: colours wash out towards a cold blue grey
+// by night (F.sunDir.w, the moon) the eye's rods take over: colours wash out towards a cold blue grey, less where a lamp
+// lights the scene brightly enough for the cones (a lamp's colour shows in its pool)
 fn tonemap(c: vec3f) -> vec3f {
     var x = c;
-    if (F.sunDir.w > 0.0) { x = mix(x, dot(x, vec3f(0.25, 0.6, 0.15)) * vec3f(0.72, 0.86, 1.2), 0.65); }
+    if (F.sunDir.w > 0.0) {
+        let y = dot(x, vec3f(0.25, 0.6, 0.15)) * F.sunCol.w;
+        x = mix(x, dot(x, vec3f(0.25, 0.6, 0.15)) * vec3f(0.72, 0.86, 1.2), 0.65 * (1.0 - smoothstep(0.03, 0.3, y)));
+    }
     return pow(aces(x * F.sunCol.w), vec3f(1.0 / 2.2));
 }
 
@@ -1597,6 +1611,188 @@ fn cabinSpan(o: vec3f, d: vec3f) -> vec2f {
     let tn = max(max(min(a.x, b.x), min(a.y, b.y)), min(a.z, b.z));
     let tf = min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z));
     return vec2f(max(tn, 0.0), tf);
+}
+
+// The lights (App.writeLights): street lamps, porch lights and the bus station's canopy by night, the buses' headlights,
+// tail lights and cabin glow, and the flashlight. Light k at p: its intensity over the distance squared, windowed to 0 at
+// its range, inside its cone for a spot; *l is the unit direction to it. No shadows (lightSeen)
+fn lightAt(k: i32, p: vec3f, l: ptr<function, vec3f>) -> vec3f {
+    let A = F.lights[k * 4];
+    let d = A.xyz - p;
+    let d2 = dot(d, d);
+    let r2 = A.w * A.w;
+    if (d2 >= r2) { return vec3f(0.0); }
+    let B = F.lights[k * 4 + 1];
+    *l = d * inverseSqrt(max(d2, 1e-6));
+    let x = d2 / r2;
+    let win = sat(1.0 - x * x);
+    var a = win * win / (d2 + F.lights[k * 4 + 3].y);
+    if ((u32(F.lights[k * 4 + 3].x) & ${LIGHT_SPOT}u) != 0u) {
+        let C = F.lights[k * 4 + 2];
+        let c = smoothstep(B.w, C.w, dot(-*l, C.xyz));
+        a *= c * c;
+    }
+    return B.rgb * a;
+}
+
+// no box between p and light k blocks it: the boxes it can reach (F.lightMask), entered between the two, or an enclosed
+// one (a building's shell) that holds p but not the light, so walls keep the street lamps out of the rooms and a flashlight
+// in a room in it
+fn lightSeen(k: i32, p: vec3f) -> bool {
+    let L = F.lights[k * 4].xyz - p;
+    let eps = 0.02 / max(length(L), 0.05);
+    let m = F.lightMask[k];
+    for (var w = 0u; w < 4u; w++) {
+        var bits = m[w];
+        while (bits != 0u) {
+            let b = i32(w * 32u + countTrailingZeros(bits));
+            bits &= bits - 1u;
+            let s = blockerSpan(b, p, L);
+            if (s.x > eps && s.x <= s.y && s.x < 1.0) { return false; }
+            if (F.blockers[b * 3 + 2].w > 0.5 && s.x < 0.0 && s.y > 0.0 && s.y < 1.0) { return false; }
+        }
+    }
+    return true;
+}
+
+// what the lights give a surface at p (normal n, the view reflected about it r): diffuse irradiance (d) and a normalized
+// Blinn-Phong highlight of exponent shin (s, to scale by the Fresnel and gloss as the sky's reflection is). Lights with a
+// flag in skip are left out
+struct Lamps { d: vec3f, s: vec3f };
+fn lampsAt(p: vec3f, n: vec3f, v: vec3f, shin: f32, skip: u32) -> Lamps {
+    var o = Lamps(vec3f(0.0), vec3f(0.0));
+    let m = lightCell(p);
+    for (var w = 0u; w < 2u; w++) {
+        var bits = m[w];
+        while (bits != 0u) {
+            let k = i32(w * 32u + countTrailingZeros(bits));
+            bits &= bits - 1u;
+            if ((u32(F.lights[k * 4 + 3].x) & skip) != 0u) { continue; }
+            var l = vec3f(0.0, 1.0, 0.0);
+            let c = lightAt(k, p, &l);
+            let nl = dot(n, l);
+            if (nl <= 0.0 || c.r + c.g + c.b < 1e-5) { continue; }
+            if (!lightSeen(k, p)) { continue; }
+            o.d += c * nl;
+            let h = normalize(l + v);
+            o.s += c * nl * pow(max(dot(n, h), 0.0), shin) * (shin + 8.0) / (8.0 * PI);
+        }
+    }
+    return o;
+}
+
+// the lights that can reach p: bit k of word k / 32 (F.lightGrid; none outside its bounds)
+fn lightCell(p: vec3f) -> vec2u {
+    let b = F.lightBox;
+    if (F.lightInfo.x < 0.5 || any(p.xz <= b.xy) || any(p.xz >= b.zw)) { return vec2u(0u); }
+    let c = min(vec2u((p.xz - b.xy) / (b.zw - b.xy) * ${LIGHT_GRID}.0), vec2u(${LIGHT_GRID - 1}u));
+    let i = c.y * ${LIGHT_GRID}u + c.x;
+    let g = F.lightGrid[i >> 1u];
+    return select(g.xy, g.zw, (i & 1u) != 0u);
+}
+
+// the lights on a raindrop, snowflake or splash at p (seen from the camera): rain scatters forward, so drops between the eye
+// and a lamp glow. Not shadowed (the particles under roofs are gone already); lights far from the camera are skipped
+fn lampsOnDrop(p: vec3f) -> vec3f {
+    var o = vec3f(0.0);
+    let e = normalize(F.cam.xyz - p);
+    let m = lightCell(p);
+    for (var w = 0u; w < 2u; w++) {
+        var bits = m[w];
+        while (bits != 0u) {
+            let k = i32(w * 32u + countTrailingZeros(bits));
+            bits &= bits - 1u;
+            var l = vec3f(0.0, 1.0, 0.0);
+            let c = lightAt(k, p, &l);
+            o += c * (0.06 + 1.2 * hg(dot(-l, e), 0.6));
+        }
+    }
+    return o;
+}
+
+// the stretch of [ta, tb] along the ray from ro along dir inside the cone of light k (apex A, axis D, cos of its edge ce): one
+// nappe of a cone is convex, so it is one interval; the quadratic's roots split [ta, tb] into pieces, each inside or not
+fn coneSpan(A: vec3f, D: vec3f, ce: f32, ro: vec3f, dir: vec3f, ta: f32, tb: f32) -> vec2f {
+    let co = ro - A;
+    let dd = dot(dir, D);
+    let od = dot(co, D);
+    let e2 = ce * ce;
+    let a = dd * dd - e2;
+    let b = 2.0 * (dd * od - e2 * dot(dir, co));
+    let c = od * od - e2 * dot(co, co);
+    var r = vec2f(ta, ta);
+    let disc = b * b - 4.0 * a * c;
+    if (disc >= 0.0 && abs(a) > 1e-7) {
+        let s = sqrt(disc);
+        let q0 = (-b - s) / (2.0 * a);
+        let q1 = (-b + s) / (2.0 * a);
+        r = clamp(vec2f(min(q0, q1), max(q0, q1)), vec2f(ta), vec2f(tb));
+    }
+    var cuts = array<f32, 4>(ta, r.x, r.y, tb);
+    var lo = tb;
+    var hi = ta;
+    for (var i = 0; i < 3; i++) {
+        if (cuts[i + 1] <= cuts[i]) { continue; }
+        let v = co + dir * (0.5 * (cuts[i] + cuts[i + 1]));
+        if (dot(v, D) > ce * length(v)) { lo = min(lo, cuts[i]); hi = max(hi, cuts[i + 1]); }
+    }
+    return vec2f(lo, hi);
+}
+
+// the light the air scatters toward the eye from the lights along the view ray from ro along dir, up to tEnd: their halos in
+// rain, snow and mist, the flashlight's and the headlights' beams. Per light, over the ray's chord through its range sphere
+// (and a narrow beam's cone), the softened inverse square 1 / (d^2 + size^2) integrates in closed form: the angle the chord
+// spans seen from the light, over its softened distance from the ray. The rest (phase, cone, window) is taken where the ray
+// passes nearest the light for a wide light, and sampled equiangularly for a narrow beam (dense near the light; jit
+// staggers the samples per pixel, the march's history averages them). Not shadowed: the chord ends at the surface in the
+// pixel, so a lamp behind a wall adds only the far tail of its halo, which is faint (and in rain the drops round a corner
+// do glow)
+fn lampScatter(ro: vec3f, dir: vec3f, tEnd: f32, jit: f32) -> vec3f {
+    let sigma = F.lightInfo.w;
+    if (sigma <= 0.0) { return vec3f(0.0); }
+    var o = vec3f(0.0);
+    let cnt = i32(F.lightInfo.x);
+    for (var k = 0; k < cnt; k++) {
+        let A = F.lights[k * 4];
+        let oc = A.xyz - ro;
+        let tc = dot(oc, dir);
+        let h2 = max(dot(oc, oc) - tc * tc, 0.0);
+        let r2 = A.w * A.w;
+        if (h2 >= r2) { continue; }
+        let hc = sqrt(r2 - h2);
+        var ta = max(tc - hc, 0.0);
+        var tb = min(tc + hc, tEnd);
+        if (tb <= ta) { continue; }
+        let B = F.lights[k * 4 + 1];
+        let C = F.lights[k * 4 + 2];
+        let spot = (u32(F.lights[k * 4 + 3].x) & ${LIGHT_SPOT}u) != 0u;
+        let narrow = spot && B.w >= 0.5;
+        if (narrow) {
+            let cs = coneSpan(A.xyz, C.xyz, B.w, ro, dir, ta, tb);
+            ta = cs.x;
+            tb = cs.y;
+            if (tb <= ta) { continue; }
+        }
+        let hs = sqrt(h2 + F.lights[k * 4 + 3].y);
+        let a0 = atan2(ta - tc, hs);
+        let a1 = atan2(tb - tc, hs);
+        let n = select(1, 4, narrow);
+        var acc = 0.0;
+        for (var j = 0; j < n; j++) {
+            var t = clamp(tc, ta, tb);
+            if (narrow) { t = tc + hs * tan(mix(a0, a1, (f32(j) + jit) / 4.0)); }
+            let d = A.xyz - (ro + dir * t);
+            let d2 = dot(d, d);
+            let l = d * inverseSqrt(max(d2, 1e-6));
+            let x = d2 / r2;
+            let win = sat(1.0 - x * x);
+            var c = win * win * exp(-sigma * t) * (0.04 + hg(dot(dir, l), 0.7));
+            if (spot) { let q = smoothstep(B.w, C.w, dot(-l, C.xyz)); c *= q * q; }
+            acc += c;
+        }
+        o += B.rgb * acc / f32(n) * (a1 - a0) / hs;
+    }
+    return o * sigma;
 }
 `;
 
@@ -2426,6 +2622,8 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
     var T = 1.0;
     var depthAcc = 0.0;
     var wsum = 0.0;
+    // the lights' halos and beams in the air, up to the surface (they lie near the camera, in front of the rest)
+    if (F.lightInfo.x > 0.5 && mode == 0) { col = lampScatter(ro, dir, sceneT, rnd(px.x * 4099u + px.y * 6151u + u32(frame) * 997u)); }
     // the tornado, marched on its own; laid in where the ray passes it (tornT)
     var torn = vec4f(0.0, 0.0, 0.0, 1.0);
     var tornT = 1e9;
@@ -2917,11 +3115,13 @@ fn townColor(xz: vec2f, px: f32) -> vec3f {
     alb *= 1.0 - 0.4 * puddle;
 
     let v = normalize(F.cam.xyz - p);
-    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + FLASH_COLOR * flashLit(p) * 0.03);
+    // the lights: a sharp highlight on puddles and water, a broad one on the wet film (the long streaks of a wet road)
+    let lp = lampsAt(p + n * 0.05, nw, v, mix(60.0, 900.0, pool), 0u);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + FLASH_COLOR * flashLit(p) * 0.03 + lp.d);
     // wet ground and open water reflect the sky
     let r = reflect(-v, nw);
     let fres = 0.02 + 0.98 * pow(1.0 - max(dot(nw, v), 0.0), 5.0);
-    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 400.0) * 4.0;
+    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 400.0) * 4.0 + lp.s;
     col = mix(col, vec3f(0.01, 0.02, 0.025) * F.ambient.rgb + spec * fres, pool);
     col += spec * fres * wet * 0.35 * (1.0 - pool);
     col += skyColor(r) * sh.y * length(rg) * 1.5;                         // the rings catch the sky at any angle
@@ -2942,7 +3142,18 @@ struct StructOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @lo
     return o;
 }
 
-@fragment fn fsStruct(i: StructOut) -> @location(0) vec4f { return shadeStruct(i.world, i.n, i.col.rgb, i32(i.col.a + 0.5)); }
+@fragment fn fsStruct(i: StructOut) -> @location(0) vec4f {
+    let mat = i32(i.col.a + 0.5);
+    if (mat == 7) { return vec4f(lampGlow(i.world, i.n, i.col.rgb), 0.0); }
+    return shadeStruct(i.world, i.n, i.col.rgb, mat);
+}
+
+// a lamp's diffuser (material 7: street lamps, porch lights, the canopy's lights): glass lit like any by day, glowing by
+// night (F.lightInfo.y), the eye adapted to it as to the lamps indoors
+fn lampGlow(p: vec3f, n: vec3f, col: vec3f) -> vec3f {
+    if (F.lightInfo.y < 0.5) { return shadeStruct(p, n, col, 2).rgb; }
+    return col * 2.6 / max(F.sunCol.w, 0.2);
+}
 
 // a moving bus (BusLine): its mesh is in its own frame (busVertex), drawn with busU.mvp
 @vertex fn vsBus(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec4f) -> StructOut {
@@ -2995,10 +3206,12 @@ fn shadeCabin(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
     let sky = F.ambient.rgb * sh.y * out.z * (0.10 + 0.22 * low) * (0.7 + 0.3 * abs(n.y));
     let lamp = vec3f(1.0, 0.93, 0.80) * 0.16 / max(F.sunCol.w, 0.2) * (0.35 + 0.65 * sat(-n.y * 0.5 + 0.5));
     let alb = colIn * (0.92 + 0.16 * vnoise2(vec2f(q.x + q.z, q.y) * 9.0));
-    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sun * out.x + sky + lamp);
+    // the lights outside, through the windows, and a flashlight aboard (not the cabin's own glow: that is the lamps here)
+    let lp = lampsAt(p + n * 0.02, n, v, 40.0, ${LIGHT_CABIN}u);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sun * out.x + sky + lamp + lp.d);
     if (mat == 4) {
         let r = reflect(-v, n);
-        col += (skyColor(r) * sh.y * 0.25 + lamp * 0.5) * (0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0)) * 0.3;
+        col += (skyColor(r) * sh.y * 0.25 + lamp * 0.5 + lp.s) * (0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0)) * 0.3;
     }
     return col;
 }
@@ -3039,10 +3252,12 @@ fn shadeInterior(p: vec3f, nIn: vec3f, colIn: vec3f, mat: u32, id: u32) -> vec3f
     let sky = F.ambient.rgb * sh.y * (0.12 + 0.3 * near) * (0.75 + 0.25 * abs(n.y)) + F.sunCol.rgb * max(s.y, 0.0) * sh.x * (0.015 + 0.03 * near);
     let lamp = lampC * 0.13 * lit * (0.35 + 0.65 * sat(n.y * 0.5 + 0.5));
     let alb = colIn * (0.96 + 0.08 * vnoise2(vec2f(q.x + q.z, q.y) * 3.0));
-    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sun + sky + lamp + FLASH_COLOR * flashLit(p) * 0.004 * near);
+    // the lights: the shell keeps the street's out (lightSeen), a flashlight carried in lights the room
+    let lp = lampsAt(p + n * 0.02, n, v, 40.0, ${LIGHT_CABIN}u);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sun + sky + lamp + FLASH_COLOR * flashLit(p) * 0.004 * near + lp.d);
     if (mat == 4u) {
         let r = reflect(-v, n);
-        col += (skyColor(r) * sh.y * 0.1 + lamp * 0.5) * (0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0)) * 0.3;
+        col += (skyColor(r) * sh.y * 0.1 + lamp * 0.5 + lp.s) * (0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0)) * 0.3;
     }
     return col;
 }
@@ -3101,14 +3316,16 @@ fn shadeStruct(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec4f {
     alb = mix(alb, vec3f(0.85, 0.88, 0.92), snow);
     // sky light from above, and light the ground bounces up into eaves, roof and deck undersides
     let bounce = (F.ambient.rgb * sh.y * 0.25 + F.sunCol.rgb * max(s.y, 0.0) * sh.x * 0.06) * sat(-n.y);
-    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + bounce + FLASH_COLOR * flashLit(p) * 0.03);
-    // glass, metal and wet surfaces reflect the sky
-    let r = reflect(-v, nr);
-    let fres = 0.04 + 0.96 * pow(1.0 - max(dot(nr, v), 0.0), 5.0);
-    let spec = skyColor(r) * sh.y * sl.z + F.sunCol.rgb * sh.x * sl.x * pow(max(dot(r, s), 0.0), 300.0) * 4.0;
     var gloss = select(select(select(0.0, 0.04, mat == 1), 0.12, mat == 4), 0.8, glass);
     gloss = max(gloss, wet * select(0.3, 0.5, mat == 3));
     gloss = mix(gloss, 1.0, puddle);
+    // the lights, with a highlight as sharp as the surface is glossy (open water as a puddle)
+    let lp = lampsAt(p + n * 0.06, nr, v, mix(12.0, 900.0, select(gloss * gloss, 1.0, mat == 6)), 0u);
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + bounce + FLASH_COLOR * flashLit(p) * 0.03 + lp.d);
+    // glass, metal and wet surfaces reflect the sky
+    let r = reflect(-v, nr);
+    let fres = 0.04 + 0.96 * pow(1.0 - max(dot(nr, v), 0.0), 5.0);
+    let spec = skyColor(r) * sh.y * sl.z + F.sunCol.rgb * sh.x * sl.x * pow(max(dot(r, s), 0.0), 300.0) * 4.0 + lp.s;
     col += spec * fres * gloss + skyColor(r) * sh.y * sl.z * length(rg) * 1.5;   // the rings catch the sky at any angle
     if (mat == 6) {                                                     // open water, as on the terrain
         let fw = 0.02 + 0.98 * pow(1.0 - max(dot(nr, v), 0.0), 5.0);
@@ -3277,7 +3494,7 @@ fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
     if (a.w < 0.5 || b.w < 0.5) { return; }
     let focal = F.screen.y * 0.5 / length(F.up.xyz);
     lineQuad(a, b, clamp(0.005 * focal / a.w, 1.0, 4.0), vi, o);
-    let lightc = F.ambient.rgb * 0.9 + F.sunCol.rgb * 0.05;
+    let lightc = F.ambient.rgb * 0.9 + F.sunCol.rgb * 0.05 + lampsOnDrop(p);
     let fade = sat(dist / 1.5) * sat(1.0 - dist / 120.0) * smoothstep(0.0, 0.05, ph) * (1.0 - smoothstep(0.9, 1.0, ph));
     (*o).col = vec4f(lightc * 1.3, (0.25 + 0.25 * rnd(k * 7u + 16u)) * fade * sat(rain * 2.0));
     (*o).uv.x = 0.0;
@@ -3342,7 +3559,7 @@ fn splash(k: u32, vi: u32, o: ptr<function, LineOut>) {
     let soak = kind < 1.5;
     if (soak && rnd(id + 8u) > select(0.3, 0.5, mist)) { return; }
     let pool = max(rainPuddle(code), select(0.0, 1.0, kind > 3.5));
-    let lightc = sprayColor(shadowAt(sp));
+    let lightc = sprayColor(shadowAt(sp)) + lampsOnDrop(sp) * 0.5;
     if (mist) {
         // a billboard turned to the eye about the vertical (so it does not turn with the view), its foot a little
         // below the surface so it meets it softly; it swells and rises a little through its life, and fades in and out
@@ -3433,7 +3650,7 @@ fn splash(k: u32, vi: u32, o: ptr<function, LineOut>) {
     let dist = length(rel);
     let a = F.viewProj * vec4f(wp, 1.0);
     if (a.w < 0.5) { return o; }
-    let lightc = F.ambient.rgb * 0.9 + F.sunCol.rgb * 0.05;
+    let lightc = F.ambient.rgb * 0.9 + F.sunCol.rgb * 0.05 + lampsOnDrop(wp);
     let fade = sat(dist / 2.0) * sat(1.0 - dist / (box.x * 0.5));
     if (isSnow) {
         // flakes: a soft dot, smeared a little along the fall (motion blur)
@@ -3494,7 +3711,7 @@ struct GlassOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @loc
     let s = F.sunDir.xyz;
     let r = reflect(-v, n);
     let fres = 0.04 + 0.96 * pow(1.0 - abs(dot(n, v)), 5.0);
-    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 600.0) * 6.0;
+    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 600.0) * 6.0 + lampsAt(p + n * 0.02, n, v, 900.0, 0u).s;
     // drops: a hashed 2 cm cell holds one or not (more of them the harder it rains), 2-5 mm across; they come and go.
     // On the side windows the wind of the bus's speed draws them out backwards into thin streaks (cells up to 8 times
     // longer along the bus, the drop as long), and sweeps some away
@@ -3554,7 +3771,7 @@ struct PaneOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @loca
     let s = F.sunDir.xyz;
     let r = reflect(-v, n);
     let fres = 0.04 + 0.96 * pow(1.0 - abs(dot(n, v)), 5.0);
-    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 600.0) * 6.0;
+    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 600.0) * 6.0 + lampsAt(p + n * 0.02, n, v, 900.0, 0u).s;
     // drops as on the bus's windows, but still: a hashed 2 cm cell holds one or not, and they come and go slowly
     let rain = sat(F.near.x * 1.5) * sat(i.wet);
     var drop = 0.0;
@@ -3774,6 +3991,20 @@ function rectMinusHoles(u0, u1, v0, v1, holes) {
     return out;
 }
 
+// lights by night (Structures.lamp, App.writeLights): colour, intensity (adapted to the exposure: the eye adapts to
+// them), range (m), size (m: its falloff softens within about that of it), and a spot's cone (degrees off its axis: edge, core)
+const LAMPS = {
+    sodium: { color: [1.0, 0.58, 0.24], intensity: 85, range: 34, size: 0.6 },     // the village's street lamps
+    led: { color: [0.90, 0.94, 1.0], intensity: 55, range: 34, size: 0.6 },        // the bus station's forecourt
+    canopy: { color: [1.0, 0.95, 0.86], intensity: 30, range: 16, size: 1.2 },      // under the station's canopy
+    porch: { color: [1.0, 0.76, 0.48], intensity: 6, range: 10, size: 0.5 },        // over a door
+    shelter: { color: [0.92, 0.96, 1.0], intensity: 1.6, range: 8, size: 1.0 },       // under the bus shelter's roof
+    headlight: { color: [1.0, 0.95, 0.86], intensity: 600, range: 75, size: 0.3, cone: [32, 10] },
+    tail: { color: [1.0, 0.06, 0.03], intensity: 2.2, range: 7, size: 0.4 },
+    cabin: { color: [1.0, 0.93, 0.80], intensity: 6, range: 9, size: 1.2 },        // a bus's cabin, out through its windows
+    flashlight: { color: [1.0, 0.94, 0.84], intensity: 30, range: 60, size: 0.8, cone: [22, 6] },
+};
+
 const STRUCT_COLORS = {
     walls: [[0.78, 0.74, 0.66], [0.74, 0.72, 0.68], [0.70, 0.55, 0.38], [0.56, 0.32, 0.25], [0.58, 0.63, 0.64], [0.68, 0.64, 0.50]],
     roofs: [[0.40, 0.15, 0.11], [0.22, 0.23, 0.25], [0.32, 0.23, 0.17], [0.28, 0.31, 0.28]],
@@ -3786,6 +4017,7 @@ class Structures {
     // types: the scenario's `buildings`, merged over BUILDING_TYPES (each archetype key by key, window and door too)
     constructor(field, types = {}) {
         this.field = field; this.v = []; this.blockers = []; this.drips = []; this.solids = [];
+        this.lights = [];            // lamps that are on by night: { pos, color, intensity, range, dir, cone (cos edge, cos core) }
         this.cur = this.v;           // where tri() puts its triangles: the outside (v), or a building's interior (iv)
         this.iv = []; this.glass = []; this.panes = [];
         this.buildings = [];         // per building: its GPU record (WGSL_BUILDING), its interior's vertex range, its frame
@@ -4114,6 +4346,14 @@ class Structures {
             this.doors.push({ building: id, hinge: f.xz(x, z), u: wdir(fc.U), d: wdir(fc.D), w: d.w - 0.04, h: d.h - 0.02, y: floor, lt, open: 0, target: 0,
                 shut, openSolid: open, col: C[T.door.color] || C.door, mat: M(0), centre: f.at(cx, floor + 1.2, cz) });
         }
+        // a lamp over the doors of a share of them (`porch`), on by night: a small glowing box on the wall, its light out
+        // in front of it (outside the shell, so the walls keep it out of the rooms)
+        if (mulberry32(id * 31 + 7)() < (T.porch ?? 0)) for (const d of doors) {
+            const fc = FACES[d.face], y = Math.min(floor + d.h + 0.3, floor + H - 0.15);
+            this.prism(f, ...fbox(fc, d.at, -0.05, 0.1, 0.05), y - 0.12, y + 0.12, [1.0, 0.86, 0.66], 7);
+            const [lx, lz] = fc.o(d.at, -0.45);
+            this.light('porch', f.at(lx, y - 0.1, lz));
+        }
 
         // the roof: a gable over the walls (its triangles close the attic) with eaves and maybe a chimney, or a flat slab
         // that overhangs; shader boxes for it (rain shadow, sky occlusion under the eaves), and its edges drip
@@ -4199,6 +4439,25 @@ class Structures {
 
     // bus shelter: a roof on four posts, glass back and side panels, a bench, a timetable and the stop sign by the kerb.
     // Local -z faces the road. Returns the floor height
+    // a light that is on by night (LAMPS[kind], `o` overrides): at pos, shining along dir within cone [edge, core] (degrees
+    // off its axis; none: all round)
+    light(kind, pos, dir = null, o = {}) {
+        const L = { ...LAMPS[kind], ...o }, cone = L.cone && dir ? [Math.cos(L.cone[0] * DEG), Math.cos(L.cone[1] * DEG)] : null;
+        this.lights.push({ pos, color: L.color, intensity: L.intensity, range: L.range, size: L.size, dir: dir ? v3.norm(dir) : [0, -1, 0], cone });
+    }
+
+    // a street lamp standing at [x, z], its arm reaching `reach` m along `toward` ([x, z], over the road): a pole, the arm
+    // and a head whose diffuser glows by night (material 7), and its light, a wide cone down onto the road
+    lamp(x, z, toward, kind = 'sodium', o = {}) {
+        const C = STRUCT_COLORS, h = o.height ?? 6.5, reach = o.reach ?? 1.5, g = this.ground(x, z);
+        const f = new GroundFrame([x, z], Math.atan2(toward[1], toward[0]));
+        this.box(f, 0, 0, 0.08, 0.08, g - 0.3, g + h, C.metal, 4);
+        this.prism(f, reach / 2, 0, reach / 2, 0.04, g + h - 0.07, g + h, C.metal, 4);
+        this.prism(f, reach, 0, 0.34, 0.15, g + h - 0.14, g + h + 0.04, C.metal, 4);
+        this.prism(f, reach, 0, 0.29, 0.12, g + h - 0.19, g + h - 0.14, LAMPS[kind].color.map(c => 0.55 + 0.45 * c), 7);
+        this.light(kind, f.at(reach, g + h - 0.3, 0), [0, -1, 0], { cone: [78, 42], ...o.light });
+    }
+
     busStop(f) {
         const C = STRUCT_COLORS;
         const g = [[-2.6, -1.5], [2.6, -1.5], [2.6, 1.5], [-2.6, 1.5]].map(([x, z]) => this.ground(...f.xz(x, z)));
@@ -4218,6 +4477,9 @@ class Structures {
         this.blocker(f, 0, 0.85, 2.0, 0.02, floor, yr - 0.08, 0.1, 0, gLo);
         for (const sx of [-2.05, 2.05]) this.blocker(f, sx, 0.3, 0.02, 0.55, floor, yr - 0.08, 0.05, 0, gLo);
         this.drip(f, 0, 0, 2.35, 1.2, yr, yr - floor + 0.12);
+        // a light strip under the roof
+        this.box(f, 0, 0.2, 1.4, 0.06, yr - 0.03, yr, [0.95, 0.97, 1.0], 7);
+        this.light('shelter', f.at(0, yr - 0.25, 0.1));
         return floor;
     }
 
@@ -4346,8 +4608,10 @@ class Structures {
     }
 
     // as blockerRain in WGSL: p is inside the enclosed box b
-    static holds(b, p) {
-        if (!b.enclosed) return false;
+    static holds(b, p) { return !!b.enclosed && Structures.contains(b, p); }
+
+    // p is inside box b
+    static contains(b, p) {
         const rx = p[0] - b.x, rz = p[2] - b.z, lx = rx * b.cs + rz * b.sn, lz = -rx * b.sn + rz * b.cs, y = p[1] - b.slope * lx;
         return Math.abs(lx) < b.hx && Math.abs(lz) < b.hz && y > b.y0 && y < b.y1;
     }
@@ -4517,6 +4781,19 @@ class Village extends Entity {
         lineHouses(P, -R + 12, R - 12, along, roadHalf, s => nearJunction(s) || (s > bA - 18 && s < bB + 18));
         lineHouses(Q, u0 + 8, u1 - 8, dir, 2.8, u => Math.abs(u) < 14);
 
+        // street lamps (on by night) at the kerbs, on alternate sides, their arms over the road: none on the bridge, at
+        // the junction or by the bus shelter, nor in the water
+        const lamps = (at, from, to, side, half, every, skip) => {
+            let k = 0;
+            for (let s = from; s <= to; s += every, k++) {
+                const sg = k % 2 ? 1 : -1, c = at(s), x = c[0] + side[0] * sg * (half + 0.9), z = c[1] + side[1] * sg * (half + 0.9);
+                if (skip(s, sg) || water(x, z) > 0.03) continue;
+                S.lamp(x, z, [-side[0] * sg, -side[1] * sg], 'sodium');
+            }
+        };
+        lamps(P, -R + 10, R - 10, along, roadHalf, 34, (s, sg) => (s > bA - 4 && s < bB + 4) || Math.abs(s - sJ) < 9 || (sg === sideB && Math.abs(s - sB) < 6));
+        lamps(Q, u0 + 10, u1 - 10, dir, 2.8, 36, u => Math.abs(u) < 10);
+
         // footbridge across the river, `footbridge` m along it from the road bridge
         if (span && d.footbridge !== 0) {
             const fb = Math.abs(d.footbridge ?? 160), m = P((span[0] + span[1]) / 2), M = [m[0] + along[0] * fb, m[1] + along[1] * fb];
@@ -4615,7 +4892,9 @@ class BusStation extends Entity {
             S.box(f, x, hz - 0.45, 0.32, 0.03, yf - 0.55, yf - 0.05, red, 4);
             S.box(f, x, hz - 0.49, 0.18, 0.012, yf - 0.47, yf - 0.13, [0.92, 0.92, 0.88]);
         }
-        for (let x = -L + 2; x < L - 1; x += 4) for (const sz of [-hz * 0.75, -hz * 0.3, hz * 0.3, hz * 0.75]) S.box(f, x, sz, 0.6, 0.08, slab - 0.06, slab, [0.95, 0.93, 0.85], 2);
+        for (let x = -L + 2; x < L - 1; x += 4) for (const sz of [-hz * 0.75, -hz * 0.3, hz * 0.3, hz * 0.75]) S.box(f, x, sz, 0.6, 0.08, slab - 0.06, slab, [0.95, 0.93, 0.85], 7);
+        // by night they light the platform and the lanes: a light for each stretch of them
+        for (let x = -L + 8; x < L - 4; x += 14) for (const sz of [-hz * 0.55, hz * 0.55]) S.light('canopy', f.at(x, slab - 0.35, sz));
 
         // on the platform: kiosk, benches, timetables, bins
         const kx = -L * 0.3;
@@ -4650,6 +4929,11 @@ class BusStation extends Entity {
         this.busWay = served ? { lane: -9.2, road: -80, east: L + 21, gap: -L + 20, west: -L - 80, stop: 0 } : null;
         // railing along the forecourt's open side
         const gap = x => served && Math.abs(x - this.busWay.gap) < 5;
+        // lamp posts along the forecourt's edges, their arms over it (none in the buses' way)
+        for (let x = -L - 30; x <= L + 14; x += 19) {
+            if (!(served && Math.abs(x - this.busWay.gap) < 12)) S.lamp(...f.xz(x, -28.4), [-f.sn, f.cs], 'led', { height: 8, reach: 1.8 });
+            if (x > -L - 4) S.lamp(...f.xz(x, 28.6), [f.sn, -f.cs], 'led', { height: 8, reach: 1.8 });
+        }
         for (let x = -L - 33; x <= L + 15; x += 2.5) if (!gap(x)) S.box(f, x, -29.5, 0.03, 0.03, gHi + 0.12, gHi + 1.1, C.metal, 4);
         for (const [a, b] of served ? [[-L - 33, this.busWay.gap - 5], [this.busWay.gap + 5, L + 15]] : [[-L - 33, L + 15]]) {
             S.box(f, (a + b) / 2, -29.5, (b - a) / 2, 0.03, gHi + 1.05, gHi + 1.12, C.metal, 4);
@@ -4949,6 +5233,7 @@ class Bus {
             const left = (L.stops[this.stop] - this.s + L.len) % L.len, clear = Math.max(room - 6, 0);
             const i = Math.floor(this.s / L.step) % L.path.length;
             const vt = Math.min(L.vmax[i], Math.sqrt(2 * Math.max(left - 0.02, 0)), Math.sqrt(2 * clear));
+            this.braking = vt < this.v - 0.05;
             this.v = vt < this.v ? vt : Math.min(vt, this.v + 1.1 * dt);
             const ds = Math.min(this.v * dt, left, clear);
             this.s = (this.s + ds) % L.len;
@@ -4958,6 +5243,19 @@ class Bus {
         const open = this.mode === 'dwell' && this.clock > 3;
         this.doors = clamp(this.doors + (open ? dt : -dt) / 1.5, 0, 1);
         this.place();
+    }
+
+    // its lights by night, into `out` (App.writeLights): the headlights, a beam each ahead and a little down; the tail
+    // lights (one light for the two), brighter while it brakes; the cabin's lamps, out through its windows
+    lights(out) {
+        const L = LAMPS, K = BUS, on = (kind, q, d, k = 1) => {
+            const l = L[kind];
+            out.push({ pos: this.toWorld(q), dir: d ? v3.norm(this.toWorld(d, 0)) : [0, -1, 0], color: l.color, intensity: l.intensity * k, range: l.range, size: l.size,
+                cone: l.cone ? [Math.cos(l.cone[0] * DEG), Math.cos(l.cone[1] * DEG)] : null, cabin: kind === 'cabin' });
+        };
+        for (const sz of [-1, 1]) on('headlight', [K.hl + 0.15, 0.64, sz * 0.91], [1, -0.09, sz * 0.03]);
+        on('tail', [-K.hl - 0.15, 0.8, 0], null, this.mode === 'drive' && this.braking ? 3 : 1);
+        on('cabin', [0, K.ceil - 0.3, 0]);
     }
 
     // where it is, for the HUD
@@ -6921,7 +7219,7 @@ class Hud {
         this.help.innerHTML = [
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>1-9</b> weather   <b>0</b> auto   <b>N</b> rain   <b>J</b> cloud   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>Q</b> quality   <b>M</b> render   <b>F</b> froxels   <b>G</b> tiles   <b>V</b> view   <b>B</b> bus   <b>hold Z</b> buses ×10   <b>R</b> radar   <b>L</b> labels   <b>U</b> sound   <b>P</b> pause   <b>H</b> help',
+            '<b>Q</b> quality   <b>M</b> render   <b>F</b> froxels   <b>G</b> tiles   <b>V</b> view   <b>B</b> bus   <b>hold Z</b> buses ×10   <b>R</b> radar   <b>L</b> flashlight   <b>I</b> labels   <b>U</b> sound   <b>P</b> pause   <b>H</b> help',
             '<b>X</b> walk / fly   <b>E</b> open / shut a door, sit / stand (aboard)   on foot: <b>WASD</b> walk, <b>Shift</b> run   ·   drop a scenario .json on the page',
         ].join('\n');
     }
@@ -7023,6 +7321,7 @@ class App {
         this.fps = 60;
         this.mode = 0;
         this.radar = true;
+        this.flashlight = false;     // L: a torch in hand, along the view
         this.froxels = true;
         this.tiles = true;
         this.viewProj = new Float32Array(16);
@@ -7364,7 +7663,8 @@ class App {
                 case 'KeyQ': this.setQuality((this.quality + 1) % QUALITY.length); break;
                 case 'KeyV': if (this.views.length) this.setView((this.viewIndex + 1) % this.views.length); break;
                 case 'KeyJ': this.toggleCloud(); break;
-                case 'KeyL': this.hud.showLabels = !this.hud.showLabels; break;
+                case 'KeyL': this.flashlight = !this.flashlight; this.hud.toast(`Flashlight ${this.flashlight ? 'on' : 'off'}`); break;
+                case 'KeyI': this.hud.showLabels = !this.hud.showLabels; break;
                 case 'KeyP': this.paused = !this.paused; break;
                 case 'KeyH': this.hud.help.style.display = this.hud.help.style.display === 'none' ? '' : 'none'; break;
             }
@@ -7402,6 +7702,69 @@ class App {
         const k = pr.precip * smoothstep(bottom, bottom + 300, y);
         const snow = smoothstep(this.world.weather.freezingLevel - 250, this.world.weather.freezingLevel + 250, y);
         return { rain: k * (1 - snow), snow: k * snow };
+    }
+
+    // The lights (lightAt in WGSL): the flashlight (L) first, then by night the structures' lamps and the buses' lights,
+    // nearest the camera first (by the distance to the edge of their reach), at most MAX_LIGHTS. They fade out toward the
+    // furthest one taken, so none pops in or out. Their intensities are adapted to the exposure, as the eye adapts to lamps.
+    // Each lists the frame's boxes (Structures.write) that can stand between it and what it lights: all those within its
+    // reach, but not one holding it that is not enclosed (the bus whose headlights or cabin it is, the bus the flashlight
+    // is aboard), so it shines out of it
+    writeLights(F, cam, fwd, right, up) {
+        const w = this.world, night = this.sun.moon > 0, adapt = 1 / Math.max(this.sun.exposure, 0.2), all = [];
+        if (this.flashlight) {
+            const L = LAMPS.flashlight, hand = this.walker.active ? [0.18, -0.28] : [0, -0.1];
+            all.push({ pos: v3.add(cam, v3.add(v3.mul(right, hand[0]), v3.mul(up, hand[1]))), dir: v3.norm(v3.add(fwd, v3.mul(up, 0.02))), color: L.color,
+                intensity: L.intensity, range: L.range, size: L.size, cone: [Math.cos(L.cone[0] * DEG), Math.cos(L.cone[1] * DEG)], first: true });
+        }
+        if (night) {
+            all.push(...w.structures.lights);
+            for (const b of w.buses) if (Math.hypot(b.pose.x - cam[0], b.pose.z - cam[2]) < LIGHT_RANGE + 80) b.lights(all);
+        }
+        const reach = l => l.first ? -1 : Math.max(v3.len(v3.sub(l.pos, cam)) - l.range, 0);
+        const list = all.map(l => [reach(l), l]).filter(e => e[0] < LIGHT_RANGE).sort((a, b) => a[0] - b[0]);
+        const cut = list.length > MAX_LIGHTS ? Math.max(list[MAX_LIGHTS][0], 1) : LIGHT_RANGE;
+        const data = this.lightData ??= new Float32Array(MAX_LIGHTS * 16), mask = this.lightMask ??= new Uint32Array(MAX_LIGHTS * 4);
+        data.fill(0);
+        mask.fill(0);
+        const boxes = w.structures.listed || [];
+        list.slice(0, MAX_LIGHTS).forEach(([dist, l], i) => {
+            const k = l.intensity * adapt * (1 - smoothstep(cut * 0.7, cut, dist)), c = l.cone;
+            data.set([...l.pos, l.range, ...l.color.map(x => x * k), c ? c[0] : -2, ...l.dir, c ? c[1] : 1, (l.cabin ? LIGHT_CABIN : 0) | (c ? LIGHT_SPOT : 0), (l.size ?? 0.5) ** 2], i * 16);
+            boxes.forEach((b, j) => {
+                const e = Math.hypot(b.hx, b.hz), sl = Math.abs(b.slope) * b.hx;
+                if (Math.hypot(b.x - l.pos[0], b.z - l.pos[2]) > l.range + e) return;
+                if (l.pos[1] - l.range > b.y1 + sl || l.pos[1] + l.range < b.y0 - sl) return;
+                if (!b.enclosed && Structures.contains(b, l.pos)) return;
+                mask[i * 4 + (j >> 5)] |= 1 << (j & 31);
+            });
+        });
+        // a grid over their reach, each cell listing the lights that reach into it (a light's circle against the cell)
+        const taken = list.slice(0, MAX_LIGHTS).map(e => e[1]), G = LIGHT_GRID, grid = this.lightGrid ??= new Uint32Array(G * G * 2);
+        grid.fill(0);
+        let lb = [0, 0, 0, 0];
+        if (taken.length) {
+            lb = [Math.min(...taken.map(l => l.pos[0] - l.range)), Math.min(...taken.map(l => l.pos[2] - l.range)),
+                Math.max(...taken.map(l => l.pos[0] + l.range)), Math.max(...taken.map(l => l.pos[2] + l.range))];
+            const cw = (lb[2] - lb[0]) / G, ch = (lb[3] - lb[1]) / G;
+            taken.forEach((l, k) => {
+                const [x, , z] = l.pos, r = l.range;
+                for (let j = clamp(Math.floor((z - r - lb[1]) / ch), 0, G - 1); j <= clamp(Math.floor((z + r - lb[1]) / ch), 0, G - 1); j++)
+                    for (let i = clamp(Math.floor((x - r - lb[0]) / cw), 0, G - 1); i <= clamp(Math.floor((x + r - lb[0]) / cw), 0, G - 1); i++) {
+                        const cx = clamp(x, lb[0] + i * cw, lb[0] + (i + 1) * cw), cz = clamp(z, lb[1] + j * ch, lb[1] + (j + 1) * ch);
+                        if (Math.hypot(cx - x, cz - z) <= r) grid[(j * G + i) * 2 + (k >> 5)] |= 1 << (k & 31);
+                    }
+            });
+        }
+        F.set('lightBox', lb);
+        F.setBits('lightGrid', grid);
+        // the air scatters their light: a little in clear air, much more in rain and snow (not where the camera is
+        // indoors or aboard: the rain stays outside)
+        const out = !(this.indoors || this.inBus), c = w.weather.cur;
+        const sigma = 0.0004 + 0.0005 * (c.haze ?? 1) + (out ? 0.012 * this.near.rain + 0.025 * this.near.snow : 0);
+        F.set('lights', data);
+        F.setBits('lightMask', mask);
+        F.set('lightInfo', [Math.min(list.length, MAX_LIGHTS), night ? 1 : 0, 0, sigma]);
     }
 
     writeFrame(dt, wdt) {
@@ -7486,6 +7849,7 @@ class App {
         F.set('rain', [drops, rainFall(drops), c.rain, this.rainParticles]);
         w.rainZones.write(F);
         this.drips = w.structures.write(F, cam.pos, sky.dir, c.wind, w.weather.freezingLevel, rainFall(drops));
+        this.writeLights(F, cam.pos, fwd, right, up);
         this.splashStart = this.rainParticles + (this.drips && this.near.rain > 0.02 ? DRIP_PARTICLES : 0);
         F.set('drips', [this.splashStart], 1);
         F.set('misc', [c.temperature, this.time * cfg.fallSpeed % 52000, f.base, wdt]);

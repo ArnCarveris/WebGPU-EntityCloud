@@ -230,7 +230,8 @@ and from 25–28 ms to 10–12 ms at high.
 | G | cloud tile pre-pass on / off |
 | M | render mode: shaded, no volumetrics (skips the volumetric passes), clouds only, precipitation only |
 | Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, interleave, detail distance, cloud blur) |
-| V, L, P, H | next view, labels, pause weather, help |
+| V, I, P, H | next view, labels, pause weather, help |
+| L | flashlight on / off: a torch along the view (in hand on foot), day or night (see **Lights by night**) |
 | X | walk (from the ground below the camera) / fly |
 | B | go to the next bus of the line (each press another): outside its front door while it stands at a stop, else aboard in the aisle |
 | E | open or shut the door you look at (within 2.4 m); aboard: sit in the seat you look at, or stand up |
@@ -359,6 +360,7 @@ version with solid buildings (39 buildings, 40 doors, about 140 k interior verti
 | `stairs` | `{ width }`, or `false` for none |
 | `furnish` | a `FURNITURE` key |
 | `lamps` | share of storeys lit (0–1) |
+| `porch` | share of buildings with a lamp over each door, on by night (0–1) |
 | `shelter` | interior keeps rain and snow out (default true) |
 | `inner`, `floorColor`, `ceiling` | colours `[r, g, b]` |
 
@@ -428,6 +430,45 @@ ride or else the nearest, as one box in its frame (`busInv`, `cabinLo`, `cabinHi
 - Every bus's body is also a moving shader box (`dyn`): it casts a sun shadow, keeps the rain off what is in its lee, and
   occludes the sky under it. It leaves no dry patch on the wet road (`structureLight` skips moving boxes for wetness).
 
+### Lights by night
+
+With a night lighting preset (`moon`), the street lamps come on, and the buses drive with their lights. Each is a point or
+spot light (`LAMPS` holds their colours, intensities, reach and cones):
+
+- **Village**: sodium street lamps on poles every 34 m along both streets, on alternate kerbs, their arms over the road
+  (none on the bridge, at the junction or by the shelter), and a light strip under the bus shelter's roof.
+- **Bus station**: LED lamp posts round the forecourt (clear of the buses' way in), the canopy's soffit strips glowing
+  with a light for each stretch of them, and the town blocks' and the terminal's door lamps.
+- **Houses**: a lamp over the door of a share of them (`porch`).
+- **Buses**: two headlight beams ahead and a little down, a red tail light (brighter while braking), and the cabin's
+  lamps, which shine out through the windows onto the road beside the bus.
+- **Flashlight** (`L`, day or night): a narrow beam along the view, from the hand on foot.
+
+Each frame `App.writeLights` puts the flashlight and the lights nearest the camera (by the distance to the edge of their
+reach, within 700 m) into the frame, at most 64 (`lights`). They fade out toward the furthest one taken, so none pops.
+Their intensities are divided by the exposure, as the eye adapts to lamps, so a lamp looks the same under a full moon as
+under a crescent. A 32 × 32 grid over their reach (`lightGrid`) lists, per cell, the lights that reach into it, so a pixel
+only loops over those. They light everything:
+
+- **Surfaces** (`lampsAt`): terrain, structures, the buses inside and out, building interiors and door leaves. Diffuse,
+  and a normalized Blinn-Phong highlight as sharp as the surface is glossy, so wet roads and puddles carry the lamps'
+  reflections and glass shows them as points. Lamp diffusers (material 7) glow by night.
+- **Shadows** (`lightSeen`): the structure boxes between a light and the point (`lightMask` lists, per light, the boxes
+  within its reach) shade it, so houses, decks and the buses cast shadows from the street lamps. An enclosed box (a
+  building's shell) that holds the point but not the light also blocks it, so the street stays out of the rooms while a
+  flashlight carried in lights them. A box that holds the light and is not enclosed is left out: a bus's lights and a
+  flashlight aboard shine out of it.
+- **Rain, snow and splashes** (`lampsOnDrop`): the near-field particles take the light at their place, scattered
+  forward, so drops between the eye and a lamp glow.
+- **The air** (`lampScatter`, in the march): halos round the lamps and the beams of the headlights and the flashlight.
+  Per light, over the view ray's chord through its reach (and, for a narrow beam, through its cone), the inverse square
+  integrates in closed form; the phase, cone and window are taken where the ray passes nearest the light, or sampled
+  four times equiangularly for a narrow beam (the march's history averages them). The air scatters a little in clear
+  weather and much more in rain and snow, unless the camera is indoors or aboard.
+
+At night the rods wash colours out to a cold grey (`tonemap`), less where a lamp lights the scene brightly enough, so a
+sodium pool stays orange.
+
 ### Analytic storm structures
 
 Shelf lines and motherships are shapes, not noise. Entities report them through a `features(out)` hook (`out.ms`,
@@ -445,7 +486,7 @@ the same way. Their tops get more sky light than their undersides, which is what
 | `weather` | `start`, `transition` (s), `cycle` { `enabled`, `hold` }, `states` { name: state } |
 | `entities` | `{ type, id, label, ... }`, where `type` maps to a class in `ENTITY_TYPES` (below), applied in order |
 | `buildings` | building archetypes, merged key by key over `BUILDING_TYPES` (see **Buildings**) |
-| `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure`, `moon` } }. With `moon` (the moon's lit fraction, 0-1) the preset is night: azimuth and elevation place the moon, which lights the scene (sunlight off it, bluer and paler as night vision sees it); the sky is dark with stars, the moon a disc in its phase with maria, and colours wash out towards a cold grey. Night needs a low `intensity` and its own `exposure` (the scenario's *full moon*, *moonrise*, *half moon* and *crescent*) |
+| `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure`, `moon` } }. With `moon` (the moon's lit fraction, 0-1) the preset is night: azimuth and elevation place the moon, which lights the scene (sunlight off it, bluer and paler as night vision sees it); the sky is dark with stars, the moon a disc in its phase with maria, and colours wash out towards a cold grey. The street lamps and the buses' lights come on (see **Lights by night**). Night needs a low `intensity` and its own `exposure` (the scenario's *full moon*, *moonrise*, *half moon* and *crescent*) |
 | `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity, or `{ name, follow (entity id), spot }` for a viewpoint the entity laid out (a village's; a bus's `seat` puts you in one); optional `lighting` (preset), `weather` (state) and `walk` (true: on foot from there) |
 
 Positions are metres: `[x, z]` on the map, with x east, z south, and the map centred on 0.
@@ -591,7 +632,8 @@ WGSL_SHADOW, WGSL_GROUND                   ground state
 WGSL_FROXEL, WGSL_SKIP_SAMPLE,             compute: froxel lighting, occupancy / tile lookups, cloud tile pre-pass,
 WGSL_TILES, WGSL_MARCH, WGSL_RESOLVE       volumetric march, temporal resolve
 WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
-WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion, enclosed interiors; the bus cabin
+WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion, enclosed interiors; the bus cabin;
+                                           the lights (lightAt, lightSeen, lampsAt, lampsOnDrop, lampScatter)
 WGSL_BUILDING                              building records: frames, storeys, window layout, sun through a window, lamps
 Entity, ENTITY_TYPES                       terrain features, GroundFrame / Structures / Village / BusStation, BusLine (+ buildBus,
                                            roundPath, offsetLine), StormCell, Supercell,
