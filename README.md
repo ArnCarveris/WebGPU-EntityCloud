@@ -445,7 +445,7 @@ the same way. Their tops get more sky light than their undersides, which is what
 | `weather` | `start`, `transition` (s), `cycle` { `enabled`, `hold` }, `states` { name: state } |
 | `entities` | `{ type, id, label, ... }`, where `type` maps to a class in `ENTITY_TYPES` (below), applied in order |
 | `buildings` | building archetypes, merged key by key over `BUILDING_TYPES` (see **Buildings**) |
-| `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure` } } |
+| `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure`, `moon` } }. With `moon` (the moon's lit fraction, 0-1) the preset is night: azimuth and elevation place the moon, which lights the scene (sunlight off it, bluer and paler as night vision sees it); the sky is dark with stars, the moon a disc in its phase with maria, and colours wash out towards a cold grey. Night needs a low `intensity` and its own `exposure` (the scenario's *full moon*, *moonrise*, *half moon* and *crescent*) |
 | `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity, or `{ name, follow (entity id), spot }` for a viewpoint the entity laid out (a village's; a bus's `seat` puts you in one); optional `lighting` (preset), `weather` (state) and `walk` (true: on foot from there) |
 
 Positions are metres: `[x, z]` on the map, with x east, z south, and the map centred on 0.

@@ -281,7 +281,11 @@
             "afternoon": { "azimuth": 62, "elevation": 14, "intensity": 12, "exposure": 0.44 },
             "noon":      { "azimuth": 170, "elevation": 62, "intensity": 12, "exposure": 0.36 },
             "golden":    { "azimuth": 285, "elevation": 7, "intensity": 11, "exposure": 0.55 },
-            "morning":   { "azimuth": 95, "elevation": 14, "intensity": 11, "exposure": 0.48 }
+            "morning":   { "azimuth": 95, "elevation": 14, "intensity": 11, "exposure": 0.48 },
+            "full moon": { "azimuth": 160, "elevation": 40, "intensity": 2.4, "exposure": 0.32, "moon": 1 },
+            "moonrise":  { "azimuth": 100, "elevation": 5, "intensity": 2.2, "exposure": 0.9, "moon": 0.97 },
+            "half moon": { "azimuth": 215, "elevation": 30, "intensity": 1.3, "exposure": 0.65, "moon": 0.5 },
+            "crescent":  { "azimuth": 255, "elevation": 12, "intensity": 0.6, "exposure": 1.6, "moon": 0.18 }
         }
     },
 
@@ -745,7 +749,7 @@ const FRAME_LAYOUT = [
     ['fwd', 'vec4f'],       // xyz, near
     ['right', 'vec4f'],     // right * tan(fovx / 2), frame index
     ['up', 'vec4f'],        // up * tan(fovy / 2), weather time (s)
-    ['sunDir', 'vec4f'],    // xyz, -
+    ['sunDir', 'vec4f'],    // xyz (the moon's by night), moon: 0 by day, else night and the moon's lit fraction
     ['sunCol', 'vec4f'],    // rgb irradiance, exposure
     ['zenith', 'vec4f'],    // rgb sky radiance, haze extinction at the ground (1/m)
     ['horizon', 'vec4f'],   // rgb sky radiance, haze scale height (m)
@@ -944,14 +948,20 @@ fn marchedNow(q: vec2i) -> bool {
     if (n >= 2) { return ((q.x + q.y + i32(F.right.w)) & 1) == 0; }
     return true;
 }
-fn tonemap(c: vec3f) -> vec3f { return pow(aces(c * F.sunCol.w), vec3f(1.0 / 2.2)); }
+// by night (F.sunDir.w, the moon) the eye's rods take over: colours wash out towards a cold blue grey
+fn tonemap(c: vec3f) -> vec3f {
+    var x = c;
+    if (F.sunDir.w > 0.0) { x = mix(x, dot(x, vec3f(0.25, 0.6, 0.15)) * vec3f(0.72, 0.86, 1.2), 0.65); }
+    return pow(aces(x * F.sunCol.w), vec3f(1.0 / 2.2));
+}
 
 fn skyColor(dir: vec3f) -> vec3f {
     let mu = dot(dir, F.sunDir.xyz);
     let t = pow(sat(dir.y + 0.02), 0.5);
     var c = mix(F.horizon.rgb, F.zenith.rgb, t);
     c = mix(c, F.horizon.rgb * 0.7, sat(-dir.y * 8.0));
-    return c + F.sunCol.rgb * (hg(mu, 0.78) * 0.025 + hg(mu, 0.3) * 0.02 * (1.0 - t));
+    // (the moon's glow is as faint next to it as the night sky is)
+    return c + F.sunCol.rgb * (hg(mu, 0.78) * 0.025 + hg(mu, 0.3) * 0.02 * (1.0 - t)) * select(1.0, 0.05, F.sunDir.w > 0.0);
 }
 
 const FLASH_COLOR = vec3f(0.75, 0.82, 1.0);
@@ -2748,8 +2758,46 @@ struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
 @fragment fn fsSky(i: SkyOut) -> @location(0) vec4f {
     let d = rayDir(i.ndc);
     var c = skyColor(d);
-    c += F.sunCol.rgb * 30.0 * smoothstep(0.99990, 0.99996, dot(d, F.sunDir.xyz));
+    let mu = dot(d, F.sunDir.xyz);
+    if (F.sunDir.w > 0.0) { c += moonDisc(d, mu) + stars(d); }
+    else { c += F.sunCol.rgb * 30.0 * smoothstep(0.99990, 0.99996, mu); }
     return vec4f(c, 0.0);
+}
+
+// the moon by night (at F.sunDir): a disc lit from one side by its phase (F.sunDir.w its lit fraction), with darker
+// maria, and a little earthshine on its dark side
+fn moonDisc(d: vec3f, mu: f32) -> vec3f {
+    if (mu < 0.9998) { return vec3f(0.0); }
+    let m = F.sunDir.xyz;
+    let r = normalize(cross(m, vec3f(0.0, 1.0, 0.0)));
+    let u = cross(r, m);
+    let q = vec2f(dot(d, r), dot(d, u)) / 0.0125;
+    let q2 = dot(q, q);
+    let edge = 1.0 - smoothstep(0.9, 1.0, sqrt(q2));
+    if (edge <= 0.0) { return vec3f(0.0); }
+    let n = vec3f(q, sqrt(max(1.0 - q2, 0.0)));
+    let ca = F.sunDir.w * 2.0 - 1.0;                    // cos of the phase angle: 1 full, -1 new
+    let lit = smoothstep(-0.05, 0.05, dot(n, vec3f(sqrt(max(1.0 - ca * ca, 0.0)), 0.0, ca)));
+    let maria = 1.0 - 0.4 * smoothstep(0.45, 0.7, fbm2(q * 1.7 + 3.0, 4));
+    return F.sunCol.rgb * 0.22 * edge * maria * (lit + 0.012);
+}
+
+// the stars: one in some of the cells of a grid of directions, few bright and many faint, twinkling a little; they sink
+// into the haze at the horizon and fade under a bright moon. Clouds cover them as they cover the sky
+fn stars(d: vec3f) -> vec3f {
+    if (d.y <= 0.0) { return vec3f(0.0); }
+    let p = d * 200.0;
+    let cell = floor(p);
+    let h = hash12(cell.xy + cell.z * 37.17);
+    if (h < 0.95) { return vec3f(0.0); }
+    let j = vec3f(hash12(cell.xy + 1.7 + cell.z), hash12(cell.zx + 3.1), hash12(cell.yz + 5.3)) - 0.5;
+    let o = normalize(cell + 0.5 + 0.3 * j) * 200.0;
+    let px = 2.0 * length(F.up.xyz) / F.screen.y * 200.0;     // a pixel, in grid cells
+    let rad = max(0.12, px * 0.6);
+    let x = length(p - o) / rad;
+    let b = pow((h - 0.95) / 0.05, 8.0) * 1.5 * (0.85 + 0.15 * sin(F.cam.w * 3.0 + h * 900.0));
+    let tint = mix(vec3f(1.0, 0.82, 0.66), vec3f(0.72, 0.84, 1.0), hash12(cell.xz + 9.9));
+    return tint * b * exp(-x * x) * min(1.0, 0.12 / rad) * smoothstep(0.0, 0.12, d.y) * (1.0 - 0.6 * F.sunDir.w) * 1.5 / F.sunCol.w;
 }
 
 // geometric grid: linear over the heightfield, then rings growing out to the horizon
@@ -5574,7 +5622,8 @@ class CloudLayers {
 
 // sun and sky colours from the sun elevation (Kasten-Young air mass through Rayleigh + Mie) and the weather
 class Sky {
-    static compute(az, el, intensity, weather) {
+    // moon: 0 for the sun, else the moon by night (its lit fraction)
+    static compute(az, el, intensity, weather, moon = 0) {
         const dir = [Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az)];
         const elDeg = el / DEG;
         const am = 1 / (Math.sin(Math.max(el, 0)) + 0.50572 * Math.pow(Math.max(elDeg, 0) + 6.07995, -1.6364));
@@ -5592,6 +5641,13 @@ class Sky {
         const zenith = blue.map(c => lerp(c, grey, g)).map(c => c * (1 - 0.35 * g));
         const hor = horizon.map(c => lerp(c, grey * 1.1, g * 0.8));
         const ambient = zenith.map((c, i) => (c * 0.6 + hor[i] * 0.4) * 1.1);
+        if (moon > 0) {
+            // moonlight is sunlight off the moon, seen with night vision (bluer, less saturated); the sky it lights is
+            // dark (the stars show), its horizon a little brighter (airglow, far towns)
+            const night = (v, a) => { const l = v[0] * 0.3 + v[1] * 0.55 + v[2] * 0.15; return v.map((c, i) => lerp(c, l * [0.78, 0.9, 1.25][i], a)); };
+            const k = 0.03 * (0.3 + 0.7 * moon);
+            return { dir, sun: night(sun, 0.6), zenith: night(zenith, 0.2).map(c => c * k), horizon: night(hor, 0.4).map(c => c * k * 1.3), ambient: night(ambient, 0.4).map(c => c * k * 1.3) };
+        }
         return { dir, sun, zenith, horizon: hor, ambient };
     }
 }
@@ -7226,7 +7282,8 @@ class App {
     setLight(name) {
         const p = this.lightPresets[name] || {};
         this.lightName = name || 'default';
-        this.sun = { azimuth: (p.azimuth ?? 150) * DEG, elevation: (p.elevation ?? 35) * DEG, intensity: p.intensity ?? 12, exposure: p.exposure ?? 0.45 };
+        this.sun = { azimuth: (p.azimuth ?? 150) * DEG, elevation: (p.elevation ?? 35) * DEG, intensity: p.intensity ?? 12, exposure: p.exposure ?? 0.45,
+            moon: p.moon ? clamp(p.moon, 0.02, 1) : 0 };
     }
 
     jump(v) {
@@ -7349,7 +7406,7 @@ class App {
 
     writeFrame(dt, wdt) {
         const r = this.renderer, F = r.frame, cam = this.camera, w = this.world, c = w.weather.cur, cfg = this.cfg, q = QUALITY[this.quality];
-        const sky = Sky.compute(this.sun.azimuth, this.sun.elevation, this.sun.intensity, c);
+        const sky = Sky.compute(this.sun.azimuth, this.sun.elevation, this.sun.intensity, c, this.sun.moon);
         const aspect = r.width / r.height, tanY = Math.tan(cam.fov / 2), tanX = tanY * aspect;
         const { fwd, right, up } = cam.basis();
         // on foot the near plane comes in to 5 cm (seat backs and bus walls are within a metre); reversed-Z keeps the far depth precise
@@ -7400,7 +7457,7 @@ class App {
         F.set('fwd', [...fwd, near]);
         F.set('right', [...v3.mul(right, tanX), this.frameNo % 1024]);
         F.set('up', [...v3.mul(up, tanY), this.weatherTime]);
-        F.set('sunDir', [...sky.dir, 0]);
+        F.set('sunDir', [...sky.dir, this.sun.moon]);
         F.set('sunCol', [...sky.sun, this.sun.exposure]);
         F.set('zenith', [...sky.zenith, 0.00007 * c.haze]);
         F.set('horizon', [...sky.horizon, 1400]);
