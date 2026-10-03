@@ -220,6 +220,7 @@ and from 25–28 ms to 10–12 ms at high.
 | 0 | auto-cycle the weather states |
 | K | lightning from the nearest raining cell |
 | J | hide / show the persistent cloud chosen in the **cloud** dropdown (under the radar): the scenario's supercells (motherships), squall lines and pinned or held cells. They start hidden; a view that follows one (Mothership, Shelf cloud) shows it. A hidden cloud drops out of the weather map, the analytic structures, lightning and the labels; it keeps evolving, so it comes back where it would be. The button next to the dropdown does the same |
+| tornado dropdown | next to the cloud picker: **off** (the default) or a tornado of category **F1-F5** under the wall cloud of the supercell showing (it shows the scenario's first supercell if none is). F1 is a leaning rope whose funnel only condenses part way down, over a small debris whirl; up the scale the funnel widens into a cone and, at F4-F5, a wedge with subvortices and a broad debris cloud. It touches down over a few seconds and is marched on its own, so even a rope a few tens of metres across stays solid at a distance |
 | , . | weather time scale (×1 … ×160) |
 | T, arrows | next lighting preset; move the sun (azimuth, elevation) |
 | R | radar inset |

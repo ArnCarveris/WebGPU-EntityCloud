@@ -58,6 +58,7 @@
         }
         #clouds select option { background: #0b141a; }
         #clouds button { min-width: 44px; }
+        #tornado-ui { display: flex; gap: 6px; align-items: center; margin-left: 6px; }
         #clouds button.on { color: var(--ok); border-color: var(--ok); }
         #clouds button.off { color: var(--danger); border-color: var(--danger); }
         #toast { top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--warn); font-size: 16px; display: none; text-align: center; }
@@ -77,7 +78,7 @@
     <div id="hud" class="panel"></div>
     <div id="help" class="panel"></div>
     <div id="states" class="panel"></div>
-    <div id="clouds" class="panel"><span>cloud</span><select id="cloud-pick" title="persistent cloud"></select><button id="cloud-toggle" title="show / hide it (J)">on</button></div>
+    <div id="clouds" class="panel"><span>cloud</span><select id="cloud-pick" title="persistent cloud"></select><button id="cloud-toggle" title="show / hide it (J)">on</button><span id="tornado-ui"><span>tornado</span><select id="tornado-pick" title="tornado under the supercell's wall cloud"></select></span></div>
     <div id="toast" class="panel"></div>
     <div id="fallback">
         <div class="card">
@@ -742,6 +743,7 @@ const FRAME_LAYOUT = [
     ['ms', `array<vec4f, ${MAX_MOTHERSHIPS * 3}>`],  // [x, z, radius, spin] [stack bottom, top, plates, twist] [wall drop, wall radius, strength, seed]
     ['shelves', `array<vec4f, ${MAX_SHELVES * 4}>`], // [end a, end b] [bow control, motion dir] [lip height, depth, tiers, strength] [bbox]
     ['features', 'vec4f'],  // motherships, shelf lines, highest cloud top (m), -
+    ['tornado', 'array<vec4f, 4>'], // [x, z, ground, top] [radius at the ground, at the top, condensed share, flare] [lean x, z, debris radius, height] [strength (0 off), spin (rad/s), subvortices, seed]
     ['lod', 'vec4f'],       // march interleave (1, 2, 4), shadow map slices, slice this frame, detail distance (m)
     ['froxel', 'vec4f'],    // near, far (m), froxels on, -
     ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, -, -
@@ -1301,7 +1303,12 @@ fn precipEnvelope(p: vec3f, w: vec4f) -> vec2f {
     let low = smoothstep(bottom, bottom + max(250.0, (base - bottom) * 0.7 * v + 250.0), p.y);
     let high = sat((base + 700.0 - p.y) / 900.0);                     // shafts start inside the cloud
     let snow = smoothstep(F.precip.x - 250.0, F.precip.x + 250.0, p.y);
-    let rate = w.z * (1.0 + 0.8 * sat((w.z - 0.6) / 0.8));               // heavy precipitation is disproportionately dense
+    var rate = w.z * (1.0 + 0.8 * sat((w.z - 0.6) / 0.8));               // heavy precipitation is disproportionately dense
+    // a tornado's updraft keeps a rain-free slot open round it
+    if (F.tornado[3].x > 0.001) {
+        let r0 = max(F.tornado[1].y, F.tornado[2].z) * 2.5 + 800.0;
+        rate *= 1.0 - 0.9 * F.tornado[3].x * (1.0 - smoothstep(r0, r0 * 2.5, distance(p.xz, F.tornado[0].xy)));
+    }
     return rate * low * high * vec2f((1.0 - snow) * F.precip.z, snow * F.precip.w);
 }
 `;
@@ -2152,6 +2159,119 @@ fn rayBox(ro: vec3f, rd: vec3f, lo: vec3f, hi: vec3f, t0: f32, t1: f32) -> bool 
     return max(tn, t0) <= min(tf, t1);
 }
 
+// Tornado (F.tornado, one at most) under a supercell's wall cloud: a condensation funnel hanging from the wall cloud,
+// reaching the ground or only part way (its condensed share), and the debris cloud it throws up where it touches
+// down. It turns as one (spin, rad/s), its lower end trails off the axis (lean) and snakes. It is marched on its own
+// over the stretch of the ray through its bounds (a rope a few tens of metres across falls between the cloud march's
+// steps), and laid into the cloud march where the ray passes its axis.
+fn tornadoAxis(y: f32) -> vec2f {
+    let A = F.tornado[0];
+    let h = sat((y - A.z) / (A.w - A.z));
+    let snake = sin(y / 160.0 + F.cam.w * 0.6 + F.tornado[3].w) * F.tornado[1].x * 0.8 * sat((1.0 - h) * 3.0);
+    let lean = F.tornado[2].xy;
+    let side = select(vec2f(1.0, 0.0), normalize(vec2f(-lean.y, lean.x)), dot(lean, lean) > 1.0);
+    return A.xy + lean * pow(1.0 - h, 1.5) + side * snake;
+}
+
+// bounding cylinder round the axis: centre xz, radius
+fn tornadoBound() -> vec3f {
+    let B = F.tornado[1];
+    let C = F.tornado[2];
+    return vec3f(F.tornado[0].xy + C.xy * 0.5, max(B.y, C.z) * 1.25 + length(C.xy) * 0.5 + B.x + 40.0);
+}
+
+// x funnel, y debris extinction (1/m)
+fn tornadoDensity(p: vec3f) -> vec2f {
+    let A = F.tornado[0];   // axis x, z at the top, ground height, top (in the wall cloud)
+    let B = F.tornado[1];   // radius at the ground, at the top, condensed share of the height (from the top), flare
+    let C = F.tornado[2];   // lean x, z (where the bottom trails, m), debris radius, debris height
+    let D = F.tornado[3];   // strength, spin (rad/s), subvortices, seed
+    let h = (p.y - A.z) / (A.w - A.z);
+    if (h < -0.01 || h > 1.0) { return vec2f(0.0); }
+    let rel = p.xz - tornadoAxis(p.y);
+    let r = length(rel);
+    if (r > max(B.y, C.z) * 1.25 + B.x) { return vec2f(0.0); }
+    let a = atan2(rel.y, rel.x);
+    let turn = F.cam.w * D.y;
+    // once round the funnel per noise period (seamless), helical streaks climbing it, rising as it turns
+    let u = fract(a / (2.0 * PI) - turn / (2.0 * PI));
+    let R = mix(B.x, B.y, pow(sat(h), B.w));
+    let n = textureSampleLevel(shapeTex, repSamp, vec3f(u, p.y / (B.x * 6.0 + 250.0) + u - turn * 0.25, r / (R * 3.0) + D.w), 0.0);
+    // strong ones: lobes of subvortices turning faster than the parent
+    let lobes = select(0.0, 0.16 * cos(D.z * (a - turn * 1.7)), D.z > 0.5);
+    let Rn = R * (1.0 + (n.x - 0.5) * 0.45 + lobes);
+    // the condensation reaches down to 1 - B.z, tapering to a ragged tip
+    let cone = sat((h - (1.0 - B.z) - (n.y - 0.5) * 0.1) / 0.14);
+    let Rc = Rn * sqrt(cone);
+    var fun = sat((Rc - r) / max(Rc * 0.2, 4.0)) * (0.65 + 0.7 * n.z) * sqrt(cone);
+    fun *= 1.0 - smoothstep(0.9, 1.0, h);                 // its upper end fades into the wall cloud
+    // debris: a churning skirt round the base, flaring upwards, thinning with height
+    var deb = 0.0;
+    let hd = (p.y - A.z) / C.w;
+    if (hd < 2.0 && C.z > 0.0) {
+        let Rd = C.z * (0.5 + 0.5 * sat(hd));
+        let nd = textureSampleLevel(detailTex, repSamp, vec3f(u, hd * 0.35 - F.cam.w * 0.3, r / C.z * 0.6 + D.w), 0.0);
+        let rd = Rd * (0.8 + 0.45 * nd.y);
+        deb = sat((rd - r) / (rd * 0.55)) * exp(-max(hd, 0.0) * 1.4) * smoothstep(0.25, 0.7, nd.x * 0.7 + nd.y * 0.3 + 0.1);
+        deb *= sat((p.y - A.z + 5.0) / 15.0);
+    }
+    return vec2f(fun * 0.045, deb * 0.02) * D.x;
+}
+
+// [entry, exit] of the ray's stretch through the tornado's bounds, clipped to [0, tMax]; y < x where it misses
+fn tornadoSpan(ro: vec3f, dir: vec3f, tMax: f32) -> vec2f {
+    let A = F.tornado[0];
+    let cb = tornadoBound();
+    var ta = 0.0;
+    var tb = tMax;
+    // the vertical cylinder
+    let o = ro.xz - cb.xy;
+    let qa = dot(dir.xz, dir.xz);
+    let qb = dot(o, dir.xz);
+    let qc = dot(o, o) - cb.z * cb.z;
+    if (qa > 1e-8) {
+        let disc = qb * qb - qa * qc;
+        if (disc < 0.0) { return vec2f(1.0, 0.0); }
+        let sq = sqrt(disc);
+        ta = max(ta, (-qb - sq) / qa);
+        tb = min(tb, (-qb + sq) / qa);
+    } else if (qc > 0.0) { return vec2f(1.0, 0.0); }
+    // between the ground and the top
+    if (abs(dir.y) > 1e-6) {
+        let y0 = (A.z - 10.0 - ro.y) / dir.y;
+        let y1 = (A.w - ro.y) / dir.y;
+        ta = max(ta, min(y0, y1));
+        tb = min(tb, max(y0, y1));
+    } else if (ro.y < A.z - 10.0 || ro.y > A.w) { return vec2f(1.0, 0.0); }
+    return vec2f(ta, tb);
+}
+
+// the tornado's light (rgb) and transmittance (a) over [ta, tb] of the ray
+fn tornadoMarch(ro: vec3f, dir: vec3f, ta: f32, tb: f32, mu: f32, jitter: f32) -> vec4f {
+    let n = 40;
+    let dt = (tb - ta) / f32(n);
+    var col = vec3f(0.0);
+    var T = 1.0;
+    let fl = flashLit(ro + dir * (ta + tb) * 0.5) * 0.05;
+    let phase = mix(hg(mu, 0.6), hg(mu, 0.0), 0.5);
+    for (var i = 0; i < n; i++) {
+        let p = ro + dir * (ta + (f32(i) + jitter) * dt);
+        let td = tornadoDensity(p);
+        let s = td.x + td.y;
+        if (s <= 1e-7) { continue; }
+        let sh = shadowAt(p);
+        // in the gloom under the storm: sky light from the side, little sun; the debris is soil and wreckage
+        let amb = F.ambient.rgb * (0.1 + 0.55 * sh.y);
+        let sun = F.sunCol.rgb * sh.x * phase * 0.5;
+        let L = (td.x * (amb * 0.85 + sun) + td.y * (amb + sun * 0.7) * vec3f(0.6, 0.5, 0.38)) / s + FLASH_COLOR * fl;
+        let tr = exp(-s * dt);
+        col += T * L * (1.0 - tr);
+        T *= tr;
+        if (T < 0.005) { T = 0.0; break; }
+    }
+    return vec4f(col, T);
+}
+
 // which analytic structures this ray passes near (their bounding boxes): bits 0-3 motherships, 4-5 shelf lines
 fn featureMask(ro: vec3f, rd: vec3f, t0: f32, t1: f32) -> u32 {
     var m = 0u;
@@ -2211,6 +2331,16 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
     var T = 1.0;
     var depthAcc = 0.0;
     var wsum = 0.0;
+    // the tornado, marched on its own; laid in where the ray passes it (tornT)
+    var torn = vec4f(0.0, 0.0, 0.0, 1.0);
+    var tornT = 1e9;
+    if (doClouds && F.tornado[3].x > 0.001) {
+        let ts = tornadoSpan(ro, dir, min(sceneT, F.march.z));
+        if (ts.y > ts.x) {
+            torn = tornadoMarch(ro, dir, ts.x, ts.y, mu, rnd(px.x * 7919u + px.y * 104729u + u32(frame) * 3571u));
+            if (torn.w < 0.999) { tornT = (ts.x + ts.y) * 0.5; }
+        }
+    }
     if (t1 > t0) {
         let span = t1 - t0;
         // step-count LOD: short segments (looking down at nearby ground) need fewer steps than long horizontal ones
@@ -2240,6 +2370,15 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
             let fs = (f32(i) + jitter) / f32(N);
             let ds = span * (fb * fb - fa * fa);
             let t = t0 + span * fs * fs;
+            if (t >= tornT) {
+                col += T * torn.rgb;
+                let dT = T * (1.0 - torn.w);
+                depthAcc += tornT * dT;
+                wsum += dT;
+                T *= torn.w;
+                tornT = 1e9;
+                if (T < 0.004) { T = 0.0; break; }
+            }
             let p = ro + dir * t;
             var sigma = 0.0;
             var S = vec3f(0.0);
@@ -2328,6 +2467,15 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                 if (T < 0.004) { T = 0.0; break; }
             }
         }
+    }
+
+    // the tornado beyond the cloud march (or on a ray that misses the cloud slab)
+    if (tornT < 1e8) {
+        col += T * torn.rgb;
+        let dT = T * (1.0 - torn.w);
+        depthAcc += tornT * dT;
+        wsum += dT;
+        T *= torn.w;
     }
 
     // haze beyond the march, up to the terrain
@@ -4948,7 +5096,37 @@ class Supercell extends StormCell {
             base - (d.stackDrop ?? 300), base + (d.stackHeight ?? 4500), d.plates ?? 6, d.twist ?? 0.5,
             d.wallCloud ?? 800, d.wallRadius ?? 0.3, smoothstep(0.1, 0.6, s.coverage), this.seed * 10]);
     }
+
+    // the tornado of category cat (TORNADO) under the wall cloud, for the GPU (16 floats, see tornadoDensity); grow 0..1
+    tornado(cat, grow) {
+        const k = TORNADO[cat], d = this.def, s = this.state, [ux, uz] = this.updraft;
+        // on the wall cloud's rear flank, away from the rain core
+        const off = d.coreOffset || [0, 0], ol = Math.hypot(off[0], off[1]) || 1;
+        const wr = s.radius * (d.stackRadius ?? 0.8) * (d.wallRadius ?? 0.3) * 0.35;
+        const x = ux - off[0] / ol * wr, z = uz - off[1] / ol * wr;
+        const ground = this.world.field.sample(x, z);
+        const top = Math.max(this.world.weather.cur.base - (d.stackDrop ?? 300) + 150, ground + 300), H = top - ground;   // up in the plates
+        const sz = clamp(H / 1500, 0.4, 1);                 // under a low base, a slimmer one
+        // its bottom trails off the axis, slowly swinging round; ropes lean the most
+        const a = this.seed * 6.283 + this.age * 0.004;
+        // touching down: the condensation comes down out of the wall cloud as it grows
+        return [x, z, ground, top,
+            k.ground * sz, k.top * sz, k.condensed * smoothstep(0, 0.7, grow), k.flare,
+            Math.cos(a) * k.lean * H, Math.sin(a) * k.lean * H, k.debris * sz * smoothstep(0.5, 1, grow), k.debris * sz * 0.4,
+            smoothstep(0.1, 0.6, s.coverage) * smoothstep(0, 0.25, grow), k.wind / ((k.ground + k.top) * sz) * 1.6, k.vortices, this.seed * 7];
+    }
 }
+
+// tornado categories (Fujita): funnel radius (m) at the ground and up in the wall cloud, how much of its height the
+// condensation reaches down (1: to the ground), flare (how it widens upwards), lean (x its height), debris cloud
+// radius (m), wind (m/s), subvortices
+const TORNADO = [null,
+    { name: 'F1', kmh: '117-180', ground: 40, top: 190, condensed: 0.8, flare: 2.6, lean: 0.3, debris: 150, wind: 45, vortices: 0 },
+    { name: 'F2', kmh: '181-253', ground: 70, top: 300, condensed: 0.85, flare: 2.2, lean: 0.2, debris: 220, wind: 60, vortices: 0 },
+    { name: 'F3', kmh: '254-332', ground: 130, top: 420, condensed: 0.95, flare: 1.8, lean: 0.18, debris: 340, wind: 80, vortices: 3 },
+    { name: 'F4', kmh: '333-418', ground: 280, top: 620, condensed: 1, flare: 1.4, lean: 0.08, debris: 600, wind: 100, vortices: 4 },
+    { name: 'F5', kmh: '419-512', ground: 520, top: 850, condensed: 1, flare: 1.1, lean: 0.03, debris: 950, wind: 125, vortices: 5 },
+];
 
 // a line of storms carried by the wind, each with a shelf cloud along its gust front; starts over after `travel` m
 class SquallLine extends Entity {
@@ -5683,12 +5861,22 @@ class World {
     features() {
         const out = { ms: [], shelves: [] };
         for (const e of this.entities) e.features(out);
-        return { ms: out.ms.slice(0, MAX_MOTHERSHIPS), shelves: out.shelves.slice(0, MAX_SHELVES) };
+        const host = this.tornadoHost;
+        return { ms: out.ms.slice(0, MAX_MOTHERSHIPS), shelves: out.shelves.slice(0, MAX_SHELVES),
+            tornado: host ? host.tornado(this.tornadoCat, this.tornadoGrow) : null };
+    }
+
+    // the supercell the tornado (tornadoCat, 0 off) hangs from: the first one showing
+    get tornadoHost() {
+        if (!this.tornadoCat) return null;
+        return this.entities.find(e => e instanceof Supercell && !e.off && e.state.coverage >= 0.05) || null;
     }
 
     update(dt, wdt, t) {
         this.weather.update(dt, wdt);
         this.rainZones.update(dt);
+        // a tornado touches down over some seconds, and lifts at once
+        this.tornadoGrow = this.tornadoHost ? Math.min(1, (this.tornadoGrow || 0) + dt / 8) : 0;
         for (const e of [...this.entities]) e.update(dt, wdt, t);
         if (this.entities.some(e => e.dead)) {
             this.entities = this.entities.filter(e => !e.dead);
@@ -6521,7 +6709,7 @@ class Hud {
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>N</b> rain: drizzle / light / medium / downpour / mixed   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>J</b> hide / show the cloud picked top right   <b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
+            '<b>J</b> hide / show the cloud picked top right (<b>tornado</b> next to it: off / F1-F5 under the supercell)   <b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
             '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> open / shut a door, sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
             'drop a scenario .json on the page',
         ].join('\n');
@@ -6653,6 +6841,29 @@ class App {
         this.cloudToggle = document.getElementById('cloud-toggle');
         this.cloudPick.addEventListener('change', () => { this.cloudPick.blur(); this.syncCloudPicker(); });
         this.cloudToggle.addEventListener('click', () => { this.cloudToggle.blur(); this.toggleCloud(); });
+        // the tornado picker: off or a category, under the supercell showing (off by default)
+        this.tornadoPick = document.getElementById('tornado-pick');
+        this.tornadoPick.innerHTML = TORNADO.map((k, i) => `<option value="${i}">${k ? `${k.name} · ${k.kmh} km/h` : 'off'}</option>`).join('');
+        this.tornadoPick.addEventListener('change', () => { this.tornadoPick.blur(); this.setTornado(+this.tornadoPick.value); });
+    }
+
+    setTornado(cat) {
+        const w = this.world;
+        w.tornadoCat = cat;
+        this.tornadoPick.value = cat;
+        if (!cat) { this.hud.toast('Tornado: off'); return; }
+        // no supercell showing: show the first one the scenario places
+        if (!w.tornadoHost) {
+            const e = this.persistent.find(e => e instanceof Supercell);
+            if (e) {
+                w.setOff(e, false);
+                this.cloudPick.value = this.persistent.indexOf(e);
+                this.syncCloudPicker();
+                this.reset = true;
+            }
+        }
+        const host = w.tornadoHost;
+        this.hud.toast(host ? `${TORNADO[cat].name} tornado under ${host.def.label || host.id}` : `${TORNADO[cat].name} tornado: waiting for a supercell`);
     }
 
     // fills the picker with the scenario's persistent clouds
@@ -6663,6 +6874,9 @@ class App {
         this.cloudPick.innerHTML = this.persistent.map((e, i) => `<option value="${i}">${name(e)}${name(e).toLowerCase() === kind(e) ? '' : ` · ${kind(e)}`}</option>`).join('');
         document.getElementById('clouds').style.display = this.persistent.length ? '' : 'none';
         this.syncCloudPicker();
+        this.world.tornadoCat = 0;
+        this.tornadoPick.value = 0;
+        document.getElementById('tornado-ui').style.display = this.world.entities.some(e => e instanceof Supercell) ? '' : 'none';
     }
 
     syncCloudPicker() {
@@ -6960,6 +7174,7 @@ class App {
         const feat = w.features();
         feat.ms.forEach((m, i) => F.set('ms', m, i * 12));
         feat.shelves.forEach((sl, i) => F.set('shelves', sl, i * 16));
+        F.set('tornado', feat.tornado || new Array(16).fill(0));
         // highest cloud anywhere: nothing to sample above it
         const tops = [c.top + 200, ...cells.map(cl => cl.top + 200), ...feat.ms.map(m => m[5] + 2500)];
         for (const d of w.clouds.defs) if (w.clouds.coverage(c, d) > 0.005) tops.push(d.top);
