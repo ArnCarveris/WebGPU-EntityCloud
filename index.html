@@ -58,7 +58,9 @@
         }
         #clouds select option { background: #0b141a; }
         #clouds button { min-width: 44px; }
-        #tornado-ui { display: flex; gap: 6px; align-items: center; margin-left: 6px; }
+        #cloud-ui, #tornado-ui, #hurricane-ui { display: flex; gap: 6px; align-items: center; }
+        #tornado-ui, #hurricane-ui { margin-left: 6px; }
+        #clouds { flex-wrap: wrap; justify-content: flex-end; max-width: calc(100vw - 24px); }
         #clouds button.on { color: var(--ok); border-color: var(--ok); }
         #clouds button.off { color: var(--danger); border-color: var(--danger); }
         #toast { top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--warn); font-size: 16px; display: none; text-align: center; }
@@ -78,7 +80,7 @@
     <div id="hud" class="panel"></div>
     <div id="help" class="panel"></div>
     <div id="states" class="panel"></div>
-    <div id="clouds" class="panel"><span>cloud</span><select id="cloud-pick" title="persistent cloud"></select><button id="cloud-toggle" title="show / hide it (J)">on</button><span id="tornado-ui"><span>tornado</span><select id="tornado-pick" title="tornado under the supercell's wall cloud"></select></span></div>
+    <div id="clouds" class="panel"><span id="cloud-ui"><span>cloud</span><select id="cloud-pick" title="persistent cloud"></select><button id="cloud-toggle" title="show / hide it (J)">on</button></span><span id="tornado-ui"><span>tornado</span><select id="tornado-pick" title="tornado under the supercell's wall cloud"></select></span><span id="hurricane-ui"><span>hurricane</span><select id="hurricane-pick" title="hurricane with an eye (Saffir-Simpson category)"></select></span></div>
     <div id="toast" class="panel"></div>
     <div id="fallback">
         <div class="card">
@@ -107,6 +109,7 @@
               zones { along (bus entity id), variants [state names], length (m of route each), hold [min, max] s,
               dry { state, count } }: those states' rain at once, in stretches along the bus route, with `count` dry
               stretches under the `dry` state's sky (the deck opens there), reshuffled after a random hold } }
+    hurricane { pos [x, z] }: where the eye of a hurricane picked in the hurricane dropdown sits (default [0, 0])
     entities  { type, id, label, ... }, type in ENTITY_TYPES, applied in order:
               terrain  tilt { dir, drop } | hills { amplitude, scale, octaves, seed, ridged } | mountain { pos, radius, height, roughness }
                        range { path, width, height, roughness, seed } | river { path, width, depth, bank } | lake { pos, radius, level }
@@ -266,6 +269,8 @@
         }
     },
 
+    "hurricane": { "pos": [2000, -8000] },
+
     "views": [
         { "name": "Airliner (photo view)", "pos": [9000, 7400, 22000], "look": [3200, 2500, 0] },
         { "name": "Under the shaft",       "pos": [-1500, 1560, 9500], "look": [4000, 3000, 0] },
@@ -284,7 +289,11 @@
         { "name": "Shelf cloud",   "follow": "squall", "offset": [7000, 25, 1500], "lookOffset": [-4000, 2100, -2500],
           "lighting": "storm dusk", "weather": "severe storms" },
         { "name": "Mothership",    "follow": "hero", "offset": [-5500, 25, 8000], "lookOffset": [0, 3000, 0],
-          "lighting": "afternoon", "weather": "severe storms" }
+          "lighting": "afternoon", "weather": "severe storms" },
+        { "name": "Hurricane eye", "pos": [0, 3200, -5000], "look": [10000, 8000, -14000], "hurricane": 4,
+          "lighting": "afternoon", "weather": "fair cumulus" },
+        { "name": "Hurricane from above", "pos": [-30000, 16000, 26000], "look": [2000, 4000, -8000], "hurricane": 4,
+          "lighting": "afternoon", "weather": "fair cumulus" }
     ]
 }
 </script>
@@ -743,6 +752,7 @@ const FRAME_LAYOUT = [
     ['ms', `array<vec4f, ${MAX_MOTHERSHIPS * 3}>`],  // [x, z, radius, spin] [stack bottom, top, plates, twist] [wall drop, wall radius, strength, seed]
     ['shelves', `array<vec4f, ${MAX_SHELVES * 4}>`], // [end a, end b] [bow control, motion dir] [lip height, depth, tiers, strength] [bbox]
     ['features', 'vec4f'],  // motherships, shelf lines, highest cloud top (m), -
+    ['hurricane', 'array<vec4f, 3>'], // [eye x, z, eye radius, strength (0 off)] [eyewall top, turn (rad), rain bands, outer radius] [precipitation, band top, eye floor cover, raggedness]
     ['tornado', 'array<vec4f, 4>'], // [x, z, ground, top] [radius at the ground, at the top, condensed share, flare] [lean x, z, debris radius, height] [strength (0 off), spin (rad/s), subvortices, seed]
     ['lod', 'vec4f'],       // march interleave (1, 2, 4), shadow map slices, slice this frame, detail distance (m)
     ['froxel', 'vec4f'],    // near, far (m), froxels on, -
@@ -1010,6 +1020,7 @@ fn convectiveDensity(p: vec3f, w: vec4f, an: vec4f, st: vec4f, detail: bool) -> 
             if (an.x * pa > cov * prof) { cov = min(an.x + covBoost, 1.0); prof = pa; h = max(h, 0.85); }
         }
     }
+    cov *= hurricaneKeep(p);                                                 // a hurricane's eye: billowy walls, not a cut
     if (cov <= 0.0 || prof <= 0.0) { return 0.0; }
     let wd = windDir();
     let q = vec3f(p.x - F.wind.z - wd.x * (p.y - base) * 0.25, p.y, p.z - F.wind.w - wd.y * (p.y - base) * 0.25);
@@ -1233,6 +1244,24 @@ fn cloudSample(p: vec3f, w: vec4f, lod: i32, feat: u32) -> vec3f { return cloudS
 
 // noise: false skips the noise clouds (convective layer, anvils, shelves, genus layers), where the occupancy grid
 // proves there are none; the analytic structures are still evaluated
+// how much noise cloud a hurricane's eye leaves at p: the eye widens with height (the stadium effect: the eyewall leans
+// outwards), its edge a little uneven; the eye floor's low cloud stays
+fn hurricaneKeep(p: vec3f) -> f32 {
+    let H0 = F.hurricane[0];
+    if (H0.w <= 0.001) { return 1.0; }
+    let H1 = F.hurricane[1];
+    let rel = p.xz - H0.xy;
+    let r = length(rel);
+    let hgt = sat((p.y - F.cloud.x) / max(H1.x - F.cloud.x, 1.0));
+    if (r > H0.z * 2.2) { return 1.0; }
+    let a = atan2(rel.y, rel.x);
+    let re = H0.z * (0.92 + 1.0 * hgt * hgt) * (1.0 + 0.04 * sin(5.0 * a - H1.y * 2.0 + p.y / 1500.0) * F.hurricane[2].w * 4.0);
+    // the tile pre-pass pads the eyewall inwards, as it pads every cloud's coverage
+    let clear = 1.0 - smoothstep(re * 0.8, re * 1.02, r + covBoost * re * 2.0);
+    let low = 1.0 - smoothstep(F.cloud.x + 700.0, F.cloud.x + 1500.0, p.y);
+    return 1.0 - clear * H0.w * (1.0 - low);
+}
+
 fn cloudSampleN(p: vec3f, w: vec4f, lod: i32, feat: u32, noise: bool) -> vec3f {
     var d = 0.0;
     var amb = 0.0;
@@ -1262,7 +1291,7 @@ fn cloudSampleN(p: vec3f, w: vec4f, lod: i32, feat: u32, noise: bool) -> vec3f {
         if (w.y > F.cloud.y + 30.0) { st = styleAt(p.xz); }
         let dc = convectiveDensity(p, w, an, st, lod == 0) * (1.0 - mask);
         var ds = 0.0;
-        if (an.z > 0.01) { ds = shelfDensity(p, an); }
+        if (an.z > 0.01) { ds = shelfDensity(p, an) * hurricaneKeep(p); }
         d += dc + ds;
         amb += dc + ds * 0.5;
         green = st.y * sat((base + 3500.0 - p.y) / 3000.0);
@@ -1863,6 +1892,46 @@ fn weather(@builtin(global_invocation_id) gid: vec3u) {
         vs += pv;
         pr += pv * (1.0 - sat(pr));                                   // adds up to the strongest core, past 1 in severe storms
     }
+    // hurricane: the eyewall ring, spiral rain bands wound in towards it, the central dense overcast above; the eye
+    // clears all of it but a scatter of low cloud on its floor
+    let H0 = F.hurricane[0];
+    if (H0.w > 0.001) {
+        let H1 = F.hurricane[1];
+        let H2 = F.hurricane[2];
+        let rel = xz - H0.xy;
+        let r = length(rel);
+        let a = atan2(rel.y, rel.x);
+        let re = H0.z;
+        let rag = fbm2(xz / 7000.0 - H1.y * 3.0, 3) - 0.5;
+        let rn = r * (1.0 + rag * H2.w);
+        let wall = smoothstep(re * 0.9, re * 1.1, rn) * (1.0 - smoothstep(re * 2.0, re * 3.2, rn));
+        // log spiral: inwards the bands turn the way the storm does; bands fray and break up
+        let ph = a - H1.y + log(max(r, re) / re) * 2.4;
+        let bn = fbm2(xz / 9000.0 + H1.y * 2.0, 4);
+        let band = smoothstep(0.4, 0.85, 0.5 + 0.5 * cos(H1.z * ph) + (bn - 0.5) * 0.7)
+            * smoothstep(re * 1.6, re * 2.6, r) * (1.0 - smoothstep(H1.w * 0.55, H1.w, r)) * (0.55 + 0.45 * sat(1.0 - r / H1.w));
+        let hc = max(wall, band * 0.9) * H0.w;
+        cov = max(cov, hc);
+        top = max(top, max(mix(F.cloud.y, H1.x, wall * H0.w), mix(F.cloud.y, H2.y, band * H0.w * (0.7 + 0.6 * bn))));
+        let streaks = fbm2(xz / 1500.0 - H1.y * 5.0, 3);
+        let hp = H2.x * (wall * (0.8 + 0.4 * streaks) + band * 0.65 * smoothstep(0.35, 0.7, streaks + 0.15)) * H0.w;
+        pr += hp * (1.0 - sat(pr * 0.5));
+        vs += hp;
+        // central dense overcast: the outflow sheet spreading from the eyewall top
+        let cdo = (1.0 - smoothstep(H1.w * 0.25, H1.w * 0.55, rn)) * smoothstep(re * 1.0, re * 1.6, rn) * H0.w;
+        if (cdo > anvCov) { anvCov = cdo * 0.95; anvTop = max(anvTop, H1.x); }
+        // the eye
+        let eye = (1.0 - smoothstep(re * 0.8, re * 1.0, rn)) * H0.w;
+        let eyeFloor = H2.z * smoothstep(0.45, 0.75, lf + 0.2);
+        cov = mix(cov, eyeFloor, eye);
+        top = mix(top, F.cloud.x + 900.0, eye);
+        pr *= 1.0 - eye;
+        vw *= 1.0 - eye;
+        anvCov *= 1.0 - eye;
+        lcov *= 1.0 - eye;
+        style *= 1.0 - eye;
+        shelfCov *= 1.0 - eye;
+    }
     textureStore(weatherOut, gid.xy, vec4f(cov, top, pr, vw / vs));
     textureStore(anvilOut, gid.xy, vec4f(anvCov, anvTop, shelfCov, shelfW));
     textureStore(layerOut, gid.xy, lcov);
@@ -2388,7 +2457,9 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
             // distance bins without cloud in the tile pre-pass
             if (cloudy && tiles) {
                 let b = tileBin(t);
-                if (((select(tm.x, tm.y, b >= 32u) >> (b & 31u)) & 1u) == 0u) { cloudy = false; emptyRun++; }
+                // (odd: the first sample after a skipped stretch is evaluated, or where a sharp edge such as an eyewall
+                // starts would depend on how many bins this tile row skipped, and show as bands)
+                if (((select(tm.x, tm.y, b >= 32u) >> (b & 31u)) & 1u) == 0u) { cloudy = false; emptyRun = 1; }
             }
             // empty-space skipping: where the occupancy grid rules out noise cloud, only the analytic structures
             // this ray passes near are left to evaluate
@@ -5117,6 +5188,17 @@ class Supercell extends StormCell {
     }
 }
 
+// hurricane categories (Saffir-Simpson), scaled down to the weather map: eye radius (m), eyewall top (m), spiral rain
+// bands, outer radius of the bands (m), precipitation, band top (m), low cloud on the eye floor (coverage), raggedness of
+// the eyewall, wind (m/s, how fast it turns). The stronger, the smaller, clearer and rounder the eye.
+const HURRICANE = [null,
+    { name: 'Cat 1', kmh: '119-153', eye: 15000, top: 10500, bands: 3, outer: 60000, precip: 1.0, bandTop: 7000, eyeFloor: 0.55, ragged: 0.22, wind: 38 },
+    { name: 'Cat 2', kmh: '154-177', eye: 13000, top: 11000, bands: 3, outer: 62000, precip: 1.15, bandTop: 7500, eyeFloor: 0.45, ragged: 0.16, wind: 46 },
+    { name: 'Cat 3', kmh: '178-208', eye: 11000, top: 11500, bands: 4, outer: 64000, precip: 1.3, bandTop: 8000, eyeFloor: 0.35, ragged: 0.11, wind: 54 },
+    { name: 'Cat 4', kmh: '209-251', eye: 9000, top: 12000, bands: 4, outer: 66000, precip: 1.45, bandTop: 8500, eyeFloor: 0.25, ragged: 0.07, wind: 64 },
+    { name: 'Cat 5', kmh: '252+', eye: 7500, top: 12200, bands: 5, outer: 68000, precip: 1.6, bandTop: 9000, eyeFloor: 0.15, ragged: 0.04, wind: 76 },
+];
+
 // tornado categories (Fujita): funnel radius (m) at the ground and up in the wall cloud, how much of its height the
 // condensation reaches down (1: to the ground), flare (how it widens upwards), lean (x its height), debris cloud
 // radius (m), wind (m/s), subvortices
@@ -5825,6 +5907,8 @@ class World {
         for (const e of this.entities) { e.stamp(this.field); this.field.updateRange(); }
         this.field.freeze();
         this.structures = new Structures(this.field, scenario.buildings);
+        this.hurricanePos = scenario.hurricane?.pos || [0, 0];
+        this.hurricaneCat = 0;
         for (const e of this.entities) e.build(this.structures);
         for (const e of [...this.entities]) e.spawn();
         for (const e of this.persistent) this.setOff(e, true);     // hidden until the cloud picker (or a view on it) shows them
@@ -5866,6 +5950,16 @@ class World {
             tornado: host ? host.tornado(this.tornadoCat, this.tornadoGrow) : null };
     }
 
+    // the hurricane (hurricaneCat, 0 off) for the GPU (12 floats, see the weather pass and hurricaneKeep)
+    hurricaneData(maxTop) {
+        if (!this.hurricaneCat || this.hurricaneGrow <= 0) return null;
+        const k = HURRICANE[this.hurricaneCat], g = this.hurricaneGrow, base = this.weather.cur.base;
+        const top = Math.max(Math.min(k.top, maxTop - 300), base + 3000);
+        return [...this.hurricanePos, k.eye * (1.6 - 0.6 * smoothstep(0, 1, g)), smoothstep(0, 1, g),
+            top, this.hurricaneTurn, k.bands, k.outer,
+            k.precip, Math.min(k.bandTop, top - 1000), k.eyeFloor, k.ragged];
+    }
+
     // the supercell the tornado (tornadoCat, 0 off) hangs from: the first one showing
     get tornadoHost() {
         if (!this.tornadoCat) return null;
@@ -5875,6 +5969,9 @@ class World {
     update(dt, wdt, t) {
         this.weather.update(dt, wdt);
         this.rainZones.update(dt);
+        // a hurricane organises over some seconds (its eye contracting) and turns, faster the stronger it is
+        this.hurricaneGrow = this.hurricaneCat ? Math.min(1, (this.hurricaneGrow || 0) + dt / 10) : 0;
+        if (this.hurricaneCat) this.hurricaneTurn = ((this.hurricaneTurn || 0) + wdt * HURRICANE[this.hurricaneCat].wind / (HURRICANE[this.hurricaneCat].eye * 2)) % (Math.PI * 2000);
         // a tornado touches down over some seconds, and lifts at once
         this.tornadoGrow = this.tornadoHost ? Math.min(1, (this.tornadoGrow || 0) + dt / 8) : 0;
         for (const e of [...this.entities]) e.update(dt, wdt, t);
@@ -6709,7 +6806,7 @@ class Hud {
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>N</b> rain: drizzle / light / medium / downpour / mixed   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>J</b> hide / show the cloud picked top right (<b>tornado</b> next to it: off / F1-F5 under the supercell)   <b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
+            '<b>J</b> hide / show the cloud picked top right (<b>tornado</b> next to it: off / F1-F5 under the supercell; <b>hurricane</b>: off / Cat 1-5 with an eye)   <b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
             '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> open / shut a door, sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
             'drop a scenario .json on the page',
         ].join('\n');
@@ -6845,6 +6942,17 @@ class App {
         this.tornadoPick = document.getElementById('tornado-pick');
         this.tornadoPick.innerHTML = TORNADO.map((k, i) => `<option value="${i}">${k ? `${k.name} · ${k.kmh} km/h` : 'off'}</option>`).join('');
         this.tornadoPick.addEventListener('change', () => { this.tornadoPick.blur(); this.setTornado(+this.tornadoPick.value); });
+        // the hurricane picker: off or a category (off by default)
+        this.hurricanePick = document.getElementById('hurricane-pick');
+        this.hurricanePick.innerHTML = HURRICANE.map((k, i) => `<option value="${i}">${k ? `${k.name} · ${k.kmh} km/h` : 'off'}</option>`).join('');
+        this.hurricanePick.addEventListener('change', () => { this.hurricanePick.blur(); this.setHurricane(+this.hurricanePick.value); });
+    }
+
+    setHurricane(cat) {
+        this.world.hurricaneCat = cat;
+        this.hurricanePick.value = cat;
+        this.reset = true;
+        this.hud.toast(cat ? `${HURRICANE[cat].name} hurricane, eye at ${this.world.hurricanePos.map(v => (v / 1000).toFixed(0)).join(', ')} km` : 'Hurricane: off');
     }
 
     setTornado(cat) {
@@ -6872,7 +6980,9 @@ class App {
         const kind = e => e instanceof Supercell ? 'mothership' : e instanceof SquallLine ? 'squall line' : e.def.pinned ? 'pinned cell' : 'held cell';
         const name = e => e.def.label || e.id || e.def.type;
         this.cloudPick.innerHTML = this.persistent.map((e, i) => `<option value="${i}">${name(e)}${name(e).toLowerCase() === kind(e) ? '' : ` · ${kind(e)}`}</option>`).join('');
-        document.getElementById('clouds').style.display = this.persistent.length ? '' : 'none';
+        document.getElementById('cloud-ui').style.display = this.persistent.length ? '' : 'none';
+        this.world.hurricaneCat = 0;
+        this.hurricanePick.value = 0;
         this.syncCloudPicker();
         this.world.tornadoCat = 0;
         this.tornadoPick.value = 0;
@@ -6958,6 +7068,7 @@ class App {
         if (v.walk && !this.walker.active) { this.walker.place(this, this.camera.pos[0], this.camera.pos[2], this.camera.pos[1] - WALK.eye); this.walker.eye(this); }
         if (v.lighting && this.lightPresets[v.lighting]) this.setLight(v.lighting);
         if (v.weather) { this.world.weather.set(v.weather); this.hud.setStates(this.world.weather); }
+        if (v.hurricane !== undefined && v.hurricane !== this.world.hurricaneCat) this.setHurricane(v.hurricane);
         this.reset = true;
         this.hud.toast(v.name);
     }
@@ -7175,8 +7286,10 @@ class App {
         feat.ms.forEach((m, i) => F.set('ms', m, i * 12));
         feat.shelves.forEach((sl, i) => F.set('shelves', sl, i * 16));
         F.set('tornado', feat.tornado || new Array(16).fill(0));
+        const hurricane = w.hurricaneData(cfg.maxTop);
+        F.set('hurricane', hurricane || new Array(12).fill(0));
         // highest cloud anywhere: nothing to sample above it
-        const tops = [c.top + 200, ...cells.map(cl => cl.top + 200), ...feat.ms.map(m => m[5] + 2500)];
+        const tops = [c.top + 200, ...cells.map(cl => cl.top + 200), ...feat.ms.map(m => m[5] + 2500), ...(hurricane ? [hurricane[4] + 200] : [])];
         for (const d of w.clouds.defs) if (w.clouds.coverage(c, d) > 0.005) tops.push(d.top);
         F.set('features', [feat.ms.length, feat.shelves.length, Math.min(Math.max(...tops), cfg.maxTop), 0]);
         // the march and shadow map start at the lowest cloud: wall clouds and shelf lips hang low
