@@ -116,6 +116,11 @@
                        squall { from, to, count, radius, top, precip, lightning, green, drift, velocity, travel (m),
                                 shelf cloud along the gust front: shelf (strength), lip (m above ground), shelfDepth, tiers, bow, gap }
                        spawner { area [x0, z0, x1, z1], rate (cells per weather hour), max, initial, seed, template { key: [min, max] } }
+ buildings  archetypes for Structures.building, merged key by key over BUILDING_TYPES (house, terminal, block, kiosk; or new
+              names): storeyHeight, plinth, wall, slab (m), window { width, height, sill, pitch }, door { width, height,
+              color }, stairs { width } | false, furnish (FURNITURE: home | office | hall | kiosk), lamps (share of storeys
+              lit), shelter (interior keeps rain and snow out; default true), inner / floorColor / ceiling [r, g, b].
+              A village's houses use `houseType` (default house), a bus station `terminalType`, `blockType`, `kioskType`
     lighting  start, presets { name: { azimuth, elevation, intensity, exposure } }
     views     { name, pos [x, y, z], look [x, y, z] } or { name, follow (entity id), offset [x, height above ground, z], lookOffset }
               or { name, follow (entity id), spot (a viewpoint it laid out; a bus's "seat") }; optional lighting (preset name),
@@ -234,6 +239,11 @@
                         "grow": [500, 1000], "mature": [900, 2400], "decay": [700, 1400], "lightning": [0, 4], "virga": [0, 0.6],
                         "drift": [0.8, 1.2] } }
     ],
+
+    "buildings": {
+        "house": { "lamps": 0.5, "window": { "pitch": 3.2 } },
+        "block": { "lamps": 0.6, "furnish": "office" }
+    },
 
     "lighting": {
         "start": "afternoon",
@@ -380,6 +390,58 @@ const BUS_IN = 64;           // material flag: inside the cabin (lit through its
 const BUS_LEAF = [8, 16];    // material flags: door leaves that slide toward -x / +x as the doors open (busVertex)
 // walking (Walker): body radius, highest step, eye height (m), speeds (m/s)
 const WALK = { radius: 0.2, step: 0.5, head: 1.75, eye: 1.62, speed: 1.5, run: 4.5 };
+
+// Buildings (Structures.building): every house, terminal, town block and kiosk is a shell with real openings, an interior
+// (floors, stairs, furniture, lamps), glass in its windows and doors that open. An archetype holds what is shared; the
+// scenario's `buildings` adds archetypes or overrides keys of these, and each building (Village, BusStation) gives its
+// own size, storeys, colours, roof and doors. Sizes in m:
+//   storeyHeight, plinth (floor above the highest ground under it), wall (thickness), slab (floor thickness)
+//   window { width, height, sill (above each storey's floor), pitch (m of wall per window; windows are spread evenly) }
+//   door { width, height, color (STRUCT_COLORS key) }, stairs { width } (or false), furnish (FURNITURE key), lamps (share
+//   of storeys lit), shelter (the interior keeps out rain and snow however the wind blows), inner / floorColor / ceiling colours
+const BUILDING_TYPES = {
+    house: { storeyHeight: 2.8, plinth: 0.35, wall: 0.25, slab: 0.22, window: { width: 1.1, height: 1.25, sill: 0.9, pitch: 3.2 },
+        door: { width: 1.0, height: 2.1, color: 'door' }, stairs: { width: 0.95 }, furnish: 'home', lamps: 0.5, shelter: true,
+        inner: [0.84, 0.80, 0.72], floorColor: [0.40, 0.28, 0.18], ceiling: [0.90, 0.89, 0.86] },
+    terminal: { storeyHeight: 3.6, plinth: 0.15, wall: 0.3, slab: 0.3, window: { width: 1.45, height: 2.0, sill: 0.8, pitch: 1.6 },
+        door: { width: 1.6, height: 2.4, color: 'metal' }, stairs: { width: 1.4 }, furnish: 'hall', lamps: 1, shelter: true,
+        inner: [0.80, 0.79, 0.75], floorColor: [0.52, 0.50, 0.46], ceiling: [0.88, 0.88, 0.86] },
+    block: { storeyHeight: 3.2, plinth: 0.3, wall: 0.3, slab: 0.25, window: { width: 1.3, height: 1.5, sill: 0.9, pitch: 1.8 },
+        door: { width: 1.2, height: 2.3, color: 'metal' }, stairs: { width: 1.2 }, furnish: 'office', lamps: 0.6, shelter: true,
+        inner: [0.82, 0.82, 0.80], floorColor: [0.38, 0.40, 0.42], ceiling: [0.90, 0.90, 0.88] },
+    kiosk: { storeyHeight: 2.4, plinth: 0, wall: 0.08, slab: 0.1, window: { width: 1.5, height: 1.25, sill: 0.95, pitch: 1.75 },
+        door: { width: 0.9, height: 2.1, color: 'metal' }, stairs: false, furnish: 'kiosk', lamps: 1, shelter: true,
+        inner: [0.78, 0.78, 0.74], floorColor: [0.30, 0.31, 0.30], ceiling: [0.86, 0.86, 0.84] },
+};
+// what stands in a building (BUILDING_TYPES' furnish), per storey (the last entry for the storeys above): items along the
+// walls (`wall`) and free in the room (`free`), each [name, count]. FURNITURE_ITEMS gives each item's footprint, w along the
+// wall by d out from it, and its parts, boxes [u0, u1, v0, v1, y0, y1, colour] with u across its width and v from the wall
+const FURNITURE = {
+    home: [{ wall: [['sofa', 1], ['counter', 1], ['cabinet', 1]], free: [['table', 1]] },
+        { wall: [['bed', 1], ['wardrobe', 1], ['desk', 1]], free: [] }],
+    office: [{ wall: [['counter', 1], ['cabinet', 2]], free: [['bench', 2]] }, { wall: [['cabinet', 3]], free: [['desk', 4]] }],
+    hall: [{ wall: [['counter', 1], ['bench', 3]], free: [['bench', 3]] }, { wall: [['cabinet', 3]], free: [['desk', 4]] }],
+    kiosk: [{ wall: [['counter', 1], ['shelf', 1]], free: [] }],
+};
+const FURNITURE_ITEMS = {
+    sofa: { w: 2.0, d: 0.85, parts: [[-1, 1, 0, 0.85, 0, 0.42, 'fabric'], [-1, 1, 0, 0.22, 0.42, 0.85, 'fabric'], [-1, -0.82, 0.22, 0.85, 0.42, 0.62, 'fabric'], [0.82, 1, 0.22, 0.85, 0.42, 0.62, 'fabric']] },
+    counter: { w: 2.4, d: 0.62, parts: [[-1.2, 1.2, 0, 0.6, 0, 0.88, 'white'], [-1.2, 1.2, 0, 0.62, 0.88, 0.92, 'dark']] },
+    cabinet: { w: 1.2, d: 0.45, parts: [[-0.6, 0.6, 0, 0.45, 0, 0.95, 'wood']] },
+    shelf: { w: 1.6, d: 0.4, parts: [[-0.8, 0.8, 0, 0.4, 0, 1.9, 'wood']] },
+    wardrobe: { w: 1.3, d: 0.6, parts: [[-0.65, 0.65, 0, 0.6, 0, 2.0, 'white']] },
+    bed: { w: 1.5, d: 2.05, parts: [[-0.75, 0.75, 0, 2.05, 0, 0.32, 'wood'], [-0.72, 0.72, 0.05, 2.0, 0.32, 0.5, 'linen'], [-0.75, 0.75, 0, 0.06, 0, 0.95, 'wood']] },
+    desk: { w: 1.4, d: 0.7, parts: [[-0.7, 0.7, 0, 0.7, 0.72, 0.76, 'wood'], [-0.68, -0.62, 0.05, 0.65, 0, 0.72, 'metal'], [0.62, 0.68, 0.05, 0.65, 0, 0.72, 'metal'], [-0.25, 0.25, 0.8, 1.2, 0, 0.45, 'dark']] },
+    table: { w: 1.5, d: 1.9, parts: [[-0.75, 0.75, 0.5, 1.4, 0.72, 0.76, 'wood'], [-0.7, -0.64, 0.55, 0.61, 0, 0.72, 'wood'], [0.64, 0.7, 0.55, 0.61, 0, 0.72, 'wood'],
+        [-0.7, -0.64, 1.29, 1.35, 0, 0.72, 'wood'], [0.64, 0.7, 1.29, 1.35, 0, 0.72, 'wood'], [-0.45, -0.05, 0.02, 0.42, 0, 0.45, 'fabric'],
+        [-0.45, -0.05, 0.0, 0.05, 0.45, 0.9, 'wood'], [0.05, 0.45, 1.48, 1.88, 0, 0.45, 'fabric'], [0.05, 0.45, 1.85, 1.9, 0.45, 0.9, 'wood']] },
+    bench: { w: 2.2, d: 0.5, parts: [[-1.1, 1.1, 0, 0.5, 0.4, 0.46, 'wood'], [-1.0, -0.94, 0.05, 0.45, 0, 0.4, 'metal'], [0.94, 1.0, 0.05, 0.45, 0, 0.4, 'metal']] },
+};
+const FURNITURE_COLORS = { fabric: [0.30, 0.34, 0.42], white: [0.82, 0.81, 0.78], dark: [0.16, 0.16, 0.17], wood: [0.46, 0.32, 0.20], linen: [0.86, 0.84, 0.80], metal: [0.40, 0.42, 0.44] };
+const INTERIOR_DRAW = 160;   // m from a building's centre: its interior and see-through glass are drawn; further off, opaque panes (fsPane)
+const BUILDING_FLOATS = 16;  // per building in the `buildings` storage buffer (see WGSL_BUILDING)
+const BLD_ID = 256;          // interior, glass and door vertices: material + building index * BLD_ID
+const DOOR_SPEED = 1.6;      // door swing, fraction of its travel per s
+const DOOR_REACH = 2.4;      // m: E opens or closes the door in view this close to the eye
 
 // -------------------------------------------------------------------------------------------------- math
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
@@ -673,7 +735,7 @@ const FRAME_LAYOUT = [
     ['zoneDirs', `array<vec4f, ${MAX_RAIN_ZONES / 2}>`], // the route's direction at them, two per vec4: x, z
     ['drips', 'vec4f'],     // roof edges in dripEdges, -, -, -
     ['dripEdges', `array<vec4f, ${MAX_DRIPS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, edge height, drop to the ground] [share of drops up to this edge, edges (0 all four, 1 along local x), share of its drops kept, -]
-    ['blockers', `array<vec4f, ${MAX_BLOCKERS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, bottom, top] [sky occlusion, slope, -, -]
+    ['blockers', `array<vec4f, ${MAX_BLOCKERS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, bottom, top] [sky occlusion, slope, moving, enclosed]
     ['blockGrid', `array<vec4u, ${BLOCK_GRID * BLOCK_GRID}>`], // per cell of blockBox: bit k set if box k can shade a point in it
     // the bus nearest the camera, or the one ridden (BusLine): world to its frame (each bus is drawn with its own, wgslBus)
     ['busInv', 'mat4x4f'],
@@ -713,6 +775,7 @@ const WORLD_BINDINGS = [
     ['layerTex', 'tex', 'var layerTex: texture_2d<f32>'],     // coverage of each cloud genus layer
     ['styleTex', 'tex', 'var styleTex: texture_2d<f32>'],     // laminar plates, green tint, wall cloud lowering (m), -
     ['occ', 'read', 'var<storage, read> occ: array<u32>'],     // per column, bit k: height cell k may hold noise cloud
+    ['buildings', 'read', 'var<storage, read> buildings: array<vec4f>'],   // every building's frame, storeys and windows (WGSL_BUILDING)
 ];
 
 function layoutEntry(binding, visibility, kind) {
@@ -1354,8 +1417,8 @@ fn blockCell(p: vec3f) -> vec4u {
     return F.blockGrid[c.y * ${BLOCK_GRID}u + c.x];
 }
 
-// the ray from o along d enters box k (a ray starting inside a box does not count, so surfaces do not shade themselves)
-fn blockerHit(k: i32, o: vec3f, d: vec3f) -> bool {
+// where the ray from o along d is inside box k: [t in, t out]
+fn blockerSpan(k: i32, o: vec3f, d: vec3f) -> vec2f {
     let A = F.blockers[k * 3];
     let B = F.blockers[k * 3 + 1];
     let slope = F.blockers[k * 3 + 2].y;
@@ -1367,9 +1430,21 @@ fn blockerHit(k: i32, o: vec3f, d: vec3f) -> bool {
     let inv = 1.0 / select(ld, vec3f(1e-6), abs(ld) < vec3f(1e-6));
     let a = (vec3f(-A.z, B.z, -A.w) - lo) * inv;
     let b = (vec3f(A.z, B.w, A.w) - lo) * inv;
-    let tn = max(max(min(a.x, b.x), min(a.y, b.y)), min(a.z, b.z));
-    let tf = min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z));
-    return tn > 0.02 && tn <= tf;
+    return vec2f(max(max(min(a.x, b.x), min(a.y, b.y)), min(a.z, b.z)), min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z)));
+}
+
+// the ray from o along d enters box k (a ray starting inside a box does not count, so surfaces do not shade themselves)
+fn blockerHit(k: i32, o: vec3f, d: vec3f) -> bool {
+    let s = blockerSpan(k, o, d);
+    return s.x > 0.02 && s.x <= s.y;
+}
+
+// box k keeps the rain coming down along -r off p: the way back up enters it, or p is inside it and it is enclosed (a
+// building's interior, Structures.building: sheltered however the wind blows). One span either way (a ray from inside
+// starts before the box's near side)
+fn blockerRain(k: i32, p: vec3f, r: vec3f) -> bool {
+    let s = blockerSpan(k, p, r);
+    return (s.x > 0.02 && s.x <= s.y) || (F.blockers[k * 3 + 2].w > 0.5 && s.x < 0.0 && s.y > 0.0);
 }
 
 // the way the rain (or snow) reaching height y came: back up against its fall, slanted by the wind as the near-field
@@ -1388,7 +1463,8 @@ fn rainReaches(p: vec3f) -> f32 {
     for (var w = 0u; w < 4u; w++) {
         var bits = m[w];
         while (bits != 0u) {
-            if (blockerHit(i32(w * 32u + countTrailingZeros(bits)), p, r)) { return 0.0; }
+            let k = i32(w * 32u + countTrailingZeros(bits));
+            if (blockerRain(k, p, r)) { return 0.0; }
             bits &= bits - 1u;
         }
     }
@@ -1411,7 +1487,7 @@ fn structureLight(p: vec3f, sun: bool, rain: bool) -> vec3f {
             bits &= bits - 1u;
             if (doSun && o.x > 0.0 && blockerHit(k, p, s)) { o.x = 0.0; }
             // a moving box (the bus) does not leave a dry patch: the ground it passes over stays wet
-            if (rain && o.y > 0.0 && F.blockers[k * 3 + 2].z < 0.5 && blockerHit(k, p, r)) { o.y = 0.0; }
+            if (rain && o.y > 0.0 && F.blockers[k * 3 + 2].z < 0.5 && blockerRain(k, p, r)) { o.y = 0.0; }
             let ao = F.blockers[k * 3 + 2].x;
             if (ao > 0.0 && blockerHit(k, p, vec3f(0.0, 1.0, 0.0))) { o.z = min(o.z, 1.0 - ao); }
         }
@@ -1442,6 +1518,57 @@ fn cabinSpan(o: vec3f, d: vec3f) -> vec2f {
     let tf = min(min(max(a.x, b.x), max(a.y, b.y)), max(a.z, b.z));
     return vec2f(max(tn, 0.0), tf);
 }
+`;
+
+// needs F, buildings. Building `id` (Structures.building) in buildings[id * 4 ..]:
+//   [centre x, z, cos yaw, sin yaw] [half size x, z, floor (m), storey height] [storeys, sill, window height, pitch]
+//   [window width, wall thickness, share of storeys lit, faces with windows (bits: 1 -z, 2 +z, 4 -x, 8 +x)]
+// Its interior, glass and door vertices carry material + id * BLD_ID. All of it is O(1) per pixel: the window pattern is
+// a formula (the same one the mesh was built with), so the sun through a window is one box exit.
+const WGSL_BUILDING = /* wgsl */`
+struct Bld { a: vec4f, b: vec4f, c: vec4f, d: vec4f };
+fn bld(id: u32) -> Bld { let k = id * 4u; return Bld(buildings[k], buildings[k + 1u], buildings[k + 2u], buildings[k + 3u]); }
+
+// world to the building's frame (local x along (cos, sin), z along (-sin, cos), y stays the world height), and back
+fn bldLocal(b: Bld, p: vec3f) -> vec3f { let r = p.xz - b.a.xy; return vec3f(r.x * b.a.z + r.y * b.a.w, p.y, -r.x * b.a.w + r.y * b.a.z); }
+fn bldDir(b: Bld, d: vec3f) -> vec3f { return vec3f(d.x * b.a.z + d.z * b.a.w, d.y, -d.x * b.a.w + d.z * b.a.z); }
+fn bldWorld(b: Bld, q: vec3f) -> vec3f { return vec3f(b.a.x + q.x * b.a.z - q.z * b.a.w, q.y, b.a.y + q.x * b.a.w + q.z * b.a.z); }
+fn bldCentre(b: Bld) -> vec3f { return vec3f(b.a.x, b.b.z + b.c.x * b.b.w * 0.5, b.a.y); }
+fn bldStorey(b: Bld, y: f32) -> f32 { return clamp(floor((y - b.b.z) / b.b.w), 0.0, b.c.x - 1.0); }
+
+// the lamps of storey s are on: a share of the storeys (b.d.z), picked by a hash
+fn storeyLit(id: u32, b: Bld, s: f32) -> f32 { return select(0.0, 1.0, rnd(id * 131u + u32(s) * 7u + 3u) < b.d.z); }
+
+// u along a wall len m long, yr above its storey's floor, is in a window: they are spread evenly over the wall, keeping
+// clear of its corners (as Structures.building lays them out)
+fn inWindow(b: Bld, u: f32, len: f32, yr: f32) -> bool {
+    let usable = len - 2.0 * (b.d.y + 0.2);
+    let nw = max(1.0, floor(usable / b.c.w));
+    let cell = usable / nw;
+    let k = (u + usable * 0.5) / cell;
+    return k >= 0.0 && k < nw && abs(fract(k) - 0.5) * cell < b.d.x * 0.5 && yr > b.c.y && yr < b.c.y + b.c.z;
+}
+
+// the ray from q (building frame, inside) along local d leaves the building through a window of q's own storey (the floors
+// above and below it are in the way of the others): xyz where it leaves, w 1 if through glass
+fn throughWindow(b: Bld, q: vec3f, d: vec3f) -> vec4f {
+    let lo = vec3f(-b.b.x, b.b.z, -b.b.y);
+    let hi = vec3f(b.b.x, b.b.z + b.c.x * b.b.w, b.b.y);
+    let inv = 1.0 / select(d, vec3f(1e-6), abs(d) < vec3f(1e-6));
+    let t = max((lo - q) * inv, (hi - q) * inv);
+    let te = min(t.x, min(t.y, t.z));
+    let e = q + d * te;
+    let yr = e.y - b.b.z - bldStorey(b, q.y) * b.b.w;
+    if (te == t.y || yr < 0.0 || yr > b.b.w) { return vec4f(e, 0.0); }
+    let faces = u32(b.d.w + 0.5);
+    var hit = false;
+    if (te == t.x) { hit = inWindow(b, e.z, 2.0 * b.b.y, yr) && (faces & select(4u, 8u, d.x > 0.0)) != 0u; }
+    else { hit = inWindow(b, e.x, 2.0 * b.b.x, yr) && (faces & select(1u, 2u, d.z > 0.0)) != 0u; }
+    return vec4f(e, select(0.0, 1.0, hit));
+}
+
+// what a lamp-lit room adds to a window seen from outside
+fn windowGlow(id: u32, b: Bld, y: f32) -> vec3f { return vec3f(1.0, 0.86, 0.62) * 0.1 / max(F.sunCol.w, 0.2) * storeyLit(id, b, bldStorey(b, y)); }
 `;
 
 // One bus as it is drawn (each bus of each BusLine in turn, at a dynamic offset of BUS_UNIFORM bytes): its frame to clip
@@ -2456,6 +2583,69 @@ fn shadeCabin(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
     return vec4f(shadeStruct(i.world, i.n, i.col.rgb, mat), 1.0);
 }
 
+// inside building id (WGSL_BUILDING): no weather; sky light that comes in through the windows (more near the outer walls
+// than deep in the room), the sun where its ray leaves through a window of the same storey and nothing outside shades
+// it, the ceiling lamps of the storey if they are on (the eye adapts to them, as in the bus), a little of a flash
+fn shadeInterior(p: vec3f, nIn: vec3f, colIn: vec3f, mat: u32, id: u32) -> vec3f {
+    let b = bld(id);
+    let v = normalize(F.cam.xyz - p);
+    var n = normalize(nIn);
+    if (dot(n, v) < 0.0) { n = -n; }
+    let q = bldLocal(b, p + n * 0.02);
+    let lit = storeyLit(id, b, bldStorey(b, q.y));
+    let lampC = vec3f(1.0, 0.9, 0.74) / max(F.sunCol.w, 0.2);
+    let sh = shadowAt(p);
+    if (mat == 7u) { return colIn * mix(F.ambient.rgb * sh.y * 0.08, lampC * 1.6, lit); }        // the lamps themselves
+    let s = F.sunDir.xyz;
+    var sun = 0.0;
+    if (s.y > 0.0 && dot(n, s) > 0.0 && sh.x > 0.002) {
+        let w = throughWindow(b, q, bldDir(b, s));
+        if (w.w > 0.0) {
+            let e = bldWorld(b, w.xyz) + s * 0.1;
+            sun = shadowAt(e).x * structureLight(e, true, false).x;
+        }
+    }
+    let dw = min(b.b.x - abs(q.x), b.b.y - abs(q.z));
+    let near = 1.0 - smoothstep(0.3, 5.0, dw);
+    // and what the sunlit floors and walls bounce around the room (where the sun comes in at all)
+    let sky = F.ambient.rgb * sh.y * (0.12 + 0.3 * near) * (0.75 + 0.25 * abs(n.y)) + F.sunCol.rgb * max(s.y, 0.0) * sh.x * (0.015 + 0.03 * near);
+    let lamp = lampC * 0.13 * lit * (0.35 + 0.65 * sat(n.y * 0.5 + 0.5));
+    let alb = colIn * (0.96 + 0.08 * vnoise2(vec2f(q.x + q.z, q.y) * 3.0));
+    var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sun + sky + lamp + FLASH_COLOR * flashLit(p) * 0.004 * near);
+    if (mat == 4u) {
+        let r = reflect(-v, n);
+        col += (skyColor(r) * sh.y * 0.1 + lamp * 0.5) * (0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0)) * 0.3;
+    }
+    return col;
+}
+
+// a building's interior (drawn within INTERIOR_DRAW of it): walls' inner faces, floors, stairs, furniture, lamps
+@fragment fn fsInterior(i: StructOut) -> @location(0) vec4f {
+    let m = u32(i.col.a + 0.5);
+    return vec4f(shadeInterior(i.world, i.n, i.col.rgb, m & 7u, m / ${BLD_ID}u), 1.0);
+}
+
+// a door leaf, open or shut: lit as the interior on its inner side, by the weather on its outer one
+@fragment fn fsDoor(i: StructOut) -> @location(0) vec4f {
+    let m = u32(i.col.a + 0.5);
+    let id = m / ${BLD_ID}u;
+    let b = bld(id);
+    var n = normalize(i.n);
+    if (dot(n, F.cam.xyz - i.world) < 0.0) { n = -n; }
+    let q = bldLocal(b, i.world + n * 0.03);
+    if (abs(q.x) < b.b.x - b.d.y + 0.01 && abs(q.z) < b.b.y - b.d.y + 0.01) { return vec4f(shadeInterior(i.world, n, i.col.rgb, m & 7u, id), 1.0); }
+    return vec4f(shadeStruct(i.world, n, i.col.rgb, i32(m & 7u)), 1.0);
+}
+
+// a window seen from beyond INTERIOR_DRAW (its interior and its glass are not drawn there): an opaque pane that reflects
+// the sky, glowing where the storey's lamps are on
+@fragment fn fsPane(i: StructOut) -> @location(0) vec4f {
+    let id = u32(i.col.a + 0.5) / ${BLD_ID}u;
+    let b = bld(id);
+    if (distance(F.cam.xyz, bldCentre(b)) < ${INTERIOR_DRAW}.0) { discard; }
+    return vec4f(shadeStruct(i.world, i.n, i.col.rgb, 5) + windowGlow(id, b, i.world.y), 1.0);
+}
+
 // a structure surface lit by the sky and the sun, under the cloud shadow, wet or snowy where the weather reaches it
 fn shadeStruct(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
     let v = normalize(F.cam.xyz - p);
@@ -2682,7 +2872,8 @@ fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
         for (var w = 0u; w < 4u; w++) {
             var bits = m[w];
             while (bits != 0u) {
-                if (blockerHit(i32(w * 32u + countTrailingZeros(bits)), wp, back)) { return o; }
+                let k = i32(w * 32u + countTrailingZeros(bits));
+                if (blockerRain(k, wp, back)) { return o; }
                 bits &= bits - 1u;
             }
         }
@@ -2773,6 +2964,64 @@ struct GlassOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @loc
     let a = sat(0.06 + fres * 0.85 + drop * 0.6);
     let col = (spec * fres * (1.0 - drop) + vec3f(0.02, 0.025, 0.03) * F.ambient.rgb + dropCol * drop * 0.6) / a;
     return vec4f(tonemap(col), a);
+}
+
+// a building's window glass (Structures.building), drawn over the composite like the bus's: a faint tint, the sky
+// reflected at grazing angles, rain drops on it where the rain reaches its outer side (one test per vertex). Towards
+// INTERIOR_DRAW from the building it turns into the opaque pane fsPane draws beyond it, so the switch does not show
+struct PaneOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @location(1) n: vec3f, @location(2) @interpolate(flat) id: u32, @location(3) wet: f32 };
+
+@vertex fn vsWindow(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec4f) -> PaneOut {
+    var o: PaneOut;
+    o.world = p;
+    o.n = n;                                                            // outward
+    o.id = u32(c.a + 0.5) / ${BLD_ID}u;
+    o.wet = rainReaches(p + n * 0.2);
+    o.pos = F.viewProj * vec4f(p, 1.0);
+    return o;
+}
+
+@fragment fn fsWindow(i: PaneOut) -> @location(0) vec4f {
+    let b = bld(i.id);
+    let dc = distance(F.cam.xyz, bldCentre(b));
+    if (dc >= ${INTERIOR_DRAW}.0) { discard; }
+    let p = i.world;
+    let v = normalize(F.cam.xyz - p);
+    let out = normalize(i.n);
+    let n = select(-out, out, dot(out, v) >= 0.0);
+    let sh = shadowAt(p);
+    let s = F.sunDir.xyz;
+    let r = reflect(-v, n);
+    let fres = 0.04 + 0.96 * pow(1.0 - abs(dot(n, v)), 5.0);
+    let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 600.0) * 6.0;
+    // drops as on the bus's windows, but still: a hashed 2 cm cell holds one or not, and they come and go slowly
+    let rain = sat(F.near.x * 1.5) * sat(i.wet);
+    var drop = 0.0;
+    var rim = 0.0;
+    if (rain > 0.01) {
+        let g = vec2f(dot(p.xz, vec2f(-out.z, out.x)), p.y) / 0.02;
+        let cell = floor(g);
+        let cx = u32(i32(cell.x) + 1000000);
+        let cy = u32(i32(cell.y) + 1000000);
+        let life = floor(F.cam.w * 0.25 + rnd(cx * 7919u + cy));
+        let h = rnd((cx * 73856093u) ^ (cy * 19349663u) ^ (u32(life) * 83492791u));
+        if (h < rain * 0.3) {
+            let c = vec2f(rnd(u32(h * 1e6)), rnd(u32(h * 1e6) + 7u)) * 0.5 + 0.25;
+            let d = length(fract(g) - c) / (0.12 + 0.12 * fract(h * 13.0));
+            drop = 1.0 - smoothstep(0.6, 1.0, d);
+            rim = smoothstep(0.25, 0.85, d);
+        }
+    }
+    let sky = F.ambient.rgb * sh.y;
+    let dropCol = mix(sky * 0.25, sky * 2.2 + F.sunCol.rgb * sh.x * 0.05, rim);
+    var a = sat(0.06 + fres * 0.85 + drop * 0.6);
+    var c = spec * fres * (1.0 - drop) + vec3f(0.02, 0.025, 0.03) * F.ambient.rgb + dropCol * drop * 0.6;
+    // the opaque pane it becomes (shadeStruct's window, mat 5, and the glow of a lit room)
+    let far = smoothstep(${INTERIOR_DRAW - 40}.0, ${INTERIOR_DRAW}.0, dc);
+    let pane = vec3f(0.06, 0.08, 0.10) * (F.ambient.rgb * sh.y * 0.55 + F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x) + spec * fres * 0.8 + windowGlow(i.id, b, p.y);
+    c = mix(c, pane, far);
+    a = mix(a, 1.0, far);
+    return vec4f(tonemap(c / a), a);
 }
 
 // lightning bolts: segment k = (bolts[2k] start + brightness, bolts[2k + 1] end + width in m)
@@ -2946,6 +3195,24 @@ class GroundFrame {
     turned(a) { return new GroundFrame(this.c, this.yaw + a); }
 }
 
+// the rectangle [u0, u1] x [v0, v1] less rectangular holes [a0, a1, b0, b1] (that do not overlap each other; clipped to
+// it), as rectangles: in bands between the holes' edges, the stretches between the holes cutting each band
+function rectMinusHoles(u0, u1, v0, v1, holes) {
+    const hs = holes.map(([a0, a1, b0, b1]) => [Math.max(a0, u0), Math.min(a1, u1), Math.max(b0, v0), Math.min(b1, v1)]).filter(h => h[0] < h[1] && h[2] < h[3]);
+    const vs = [...new Set([v0, v1, ...hs.flatMap(h => [h[2], h[3]])])].sort((a, b) => a - b), out = [];
+    for (let k = 0; k + 1 < vs.length; k++) {
+        const b0 = vs[k], b1 = vs[k + 1];
+        if (b1 - b0 < 1e-4) continue;
+        let a = u0;
+        for (const h of hs.filter(h => h[2] < b1 - 1e-6 && h[3] > b0 + 1e-6).sort((p, q) => p[0] - q[0])) {
+            if (h[0] > a + 1e-4) out.push([a, h[0], b0, b1]);
+            a = Math.max(a, h[1]);
+        }
+        if (u1 > a + 1e-4) out.push([a, u1, b0, b1]);
+    }
+    return out;
+}
+
 const STRUCT_COLORS = {
     walls: [[0.78, 0.74, 0.66], [0.74, 0.72, 0.68], [0.70, 0.55, 0.38], [0.56, 0.32, 0.25], [0.58, 0.63, 0.64], [0.68, 0.64, 0.50]],
     roofs: [[0.40, 0.15, 0.11], [0.22, 0.23, 0.25], [0.32, 0.23, 0.17], [0.28, 0.31, 0.28]],
@@ -2955,16 +3222,30 @@ const STRUCT_COLORS = {
 };
 
 class Structures {
-    constructor(field) { this.field = field; this.v = []; this.blockers = []; this.drips = []; this.solids = []; }
+    // types: the scenario's `buildings`, merged over BUILDING_TYPES (each archetype key by key, window and door too)
+    constructor(field, types = {}) {
+        this.field = field; this.v = []; this.blockers = []; this.drips = []; this.solids = [];
+        this.cur = this.v;           // where tri() puts its triangles: the outside (v), or a building's interior (iv)
+        this.iv = []; this.glass = []; this.panes = [];
+        this.buildings = [];         // per building: its GPU record (WGSL_BUILDING), its interior's vertex range, its frame
+        this.doors = [];
+        this.types = {};
+        for (const k of new Set([...Object.keys(BUILDING_TYPES), ...Object.keys(types)])) {
+            const a = BUILDING_TYPES[k] || BUILDING_TYPES.house, b = types[k] || {};
+            this.types[k] = { ...a, ...b, window: { ...a.window, ...b.window }, door: { ...a.door, ...b.door } };
+        }
+    }
 
     ground(x, z) { return this.field.surface(x, z); }
 
     // what a walker collides with (see Walker): every box, and the bridges' decks and parapets. { x, z, hx, hz, cs, sn,
     // y0, y1 (at the centre), slope (m per m along local x) }. A top within a step of the feet is a floor, else a wall
+    // (a door's solids are switched `off` while it is open, or shut)
     solid(f, ox, oz, hx, hz, y0, y1, slope = 0) {
-        const [x, z] = f.xz(ox, oz);
-        this.solids.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y0, y1, slope });
+        const [x, z] = f.xz(ox, oz), b = { x, z, hx, hz, cs: f.cs, sn: f.sn, y0, y1, slope };
+        this.solids.push(b);
         this.solidGrid = null;
+        return b;
     }
 
     // the solids that reach within r of x, z (a 16 m grid over their footprints, built on first use)
@@ -2990,17 +3271,20 @@ class Structures {
 
     tri(a, b, c, col, mat = 0) {
         const n = v3.norm(v3.cross(v3.sub(b, a), v3.sub(c, a)));          // facing either way: the shader turns it to the eye
-        for (const p of [a, b, c]) this.v.push(p[0], p[1], p[2], n[0], n[1], n[2], col[0], col[1], col[2], mat);
+        for (const p of [a, b, c]) this.cur.push(p[0], p[1], p[2], n[0], n[1], n[2], col[0], col[1], col[2], mat);
     }
     quad(a, b, c, d, col, mat = 0) { this.tri(a, b, c, col, mat); this.tri(a, c, d, col, mat); }
 
-    // box in frame f around local (ox, oz): half sizes hx, hz, from y0 up to y1
-    box(f, ox, oz, hx, hz, y0, y1, col, mat = 0) {
+    // box in frame f around local (ox, oz): half sizes hx, hz, from y0 up to y1 (prism: the mesh only, nothing to walk on)
+    prism(f, ox, oz, hx, hz, y0, y1, col, mat = 0) {
         const c = [[-1, -1], [1, -1], [1, 1], [-1, 1]], p = ([sx, sz], y) => f.at(ox + sx * hx, y, oz + sz * hz);
         for (let k = 0; k < 4; k++) this.quad(p(c[k], y0), p(c[(k + 1) % 4], y0), p(c[(k + 1) % 4], y1), p(c[k], y1), col, mat);
         this.quad(...c.map(q => p(q, y1)), col, mat);
         this.quad(...c.map(q => p(q, y0)), col, mat);
-        this.solid(f, ox, oz, hx, hz, y0, y1);
+    }
+    box(f, ox, oz, hx, hz, y0, y1, col, mat = 0) {
+        this.prism(f, ox, oz, hx, hz, y0, y1, col, mat);
+        return this.solid(f, ox, oz, hx, hz, y0, y1);
     }
 
     // a rectangular section swept along a path: at point k ([x, z]) it spans offsets o0..o1 along `side` (a horizontal
@@ -3016,10 +3300,11 @@ class Structures {
     }
 
     // a shader box (see WGSL_SHELTER): frame f around local (ox, oz), half sizes, bottom / top at its centre, sky
-    // occlusion under it, slope (m per m along local x), and the lowest ground it shades (default: its bottom)
-    blocker(f, ox, oz, hx, hz, y0, y1, ao = 0, slope = 0, base = y0) {
+    // occlusion under it, slope (m per m along local x), the lowest ground it shades (default: its bottom), and enclosed
+    // (a building's interior: what is inside it is sheltered whichever way the rain blows, blockerRain)
+    blocker(f, ox, oz, hx, hz, y0, y1, ao = 0, slope = 0, base = y0, enclosed = false) {
         const [x, z] = f.xz(ox, oz);
-        this.blockers.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y0, y1, ao, slope, base });
+        this.blockers.push({ x, z, hx, hz, cs: f.cs, sn: f.sn, y0, y1, ao, slope, base, enclosed });
     }
 
     // a roof edge rain runs off (see drip in WGSL): the rectangle around local (ox, oz) in frame f, half sizes hx, hz, at
@@ -3073,52 +3358,282 @@ class Structures {
         }
     }
 
-    // a house: plinth, walls, a gable roof (ridge along local x, or across with `across`), door, windows, maybe a chimney
+    // a house (Village): a building of the `house` archetype (o.type) with a gable roof (ridge along local x, or across
+    // with `across`), one or two storeys by its wall height, its door on the front (local -z), maybe a chimney
     house(f, w, dp, o) {
-        const C = STRUCT_COLORS, hx = w / 2, hz = dp / 2;
-        const g = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sz]) => this.ground(...f.xz(sx * hx, sz * hz)));
-        const gLo = Math.min(...g), floor = Math.max(...g) + 0.35, ye = floor + o.wallH;
-        this.box(f, 0, 0, hx + 0.08, hz + 0.08, gLo - 1, floor, C.plinth);
-        this.box(f, 0, 0, hx, hz, floor, ye, o.wall);
-        // roof: two slopes from the eaves (overhanging by e) to the ridge, with thickness; gable triangles in wall colour
-        const rf = o.across ? f.turned(Math.PI / 2) : f, rx = o.across ? hz : hx, rz = o.across ? hx : hz;
-        const k = Math.tan(o.pitch), e = o.eave, th = 0.18, yr = ye + rz * k, yE = ye - e * k, ex = rx + e;
-        for (const sg of [-1, 1]) {
-            const zE = sg * (rz + e);
-            this.quad(rf.at(-ex, yE, zE), rf.at(ex, yE, zE), rf.at(ex, yr, 0), rf.at(-ex, yr, 0), o.roof, 1);
-            this.quad(rf.at(-ex, yE - th, zE), rf.at(ex, yE - th, zE), rf.at(ex, yr - th, 0), rf.at(-ex, yr - th, 0), o.roof, 1);
-            this.quad(rf.at(-ex, yE, zE), rf.at(ex, yE, zE), rf.at(ex, yE - th, zE), rf.at(-ex, yE - th, zE), o.roof, 1);
-            for (const x of [-ex, ex]) this.quad(rf.at(x, yE, zE), rf.at(x, yr, 0), rf.at(x, yr - th, 0), rf.at(x, yE - th, zE), o.roof, 1);
-        }
-        for (const x of [-rx, rx]) this.tri(rf.at(x, ye, -rz), rf.at(x, ye, rz), rf.at(x, yr, 0), o.wall);
-        if (o.chimney) {
-            const cz = rz * 0.45, y = ye + (rz - cz) * k;
-            this.box(rf, rx * 0.5, cz, 0.35, 0.35, y - 0.3, yr + 0.8, C.brick);
-        }
-        // door on the front (local -z), windows on every side, one row per storey
-        const d = 0.025, door = o.door;
-        const face = (side, u0, u1, y0, y1, col, mat) => {
-            const P = (u, y) => side === 'front' ? f.at(u, y, -hz - d) : side === 'back' ? f.at(u, y, hz + d)
-                : side === 'left' ? f.at(-hx - d, y, u) : f.at(hx + d, y, u);
-            this.quad(P(u0, y0), P(u1, y0), P(u1, y1), P(u0, y1), col, mat);
-        };
-        face('front', door - 0.5, door + 0.5, floor, floor + 2.1, C.door);
         const storeys = o.wallH > 5 ? 2 : 1;
-        for (let st = 0; st < storeys; st++) {
-            const y0 = floor + 0.9 + st * 2.8;
-            for (const [side, len] of [['front', w], ['back', w], ['left', dp], ['right', dp]]) {
-                const nw = Math.max(1, Math.floor(len / 3.2));
-                for (let i = 0; i < nw; i++) {
-                    const u = -len / 2 + (i + 0.5) * len / nw;
-                    if (side === 'front' && st === 0 && Math.abs(u - door) < 1.4) continue;
-                    face(side, u - 0.55, u + 0.55, y0, y0 + 1.25, C.window, 5);
-                }
+        return this.building(f, {
+            type: o.type || 'house', w, d: dp, storeys, storeyHeight: o.wallH / storeys, color: o.wall, seed: o.seed,
+            roof: { kind: 'gable', pitch: o.pitch, eave: o.eave, across: o.across, chimney: o.chimney, color: o.roof }, doors: [{ face: '-z', at: o.door }],
+        });
+    }
+
+    // A building of archetype spec.type (BUILDING_TYPES, the scenario's `buildings`), centred on frame f. spec: w, d (m
+    // along local x, z), storeys, color (walls), roof { kind: gable (pitch, eave, across, chimney) | flat (overhang,
+    // thick, drip), color }, doors [{ face, at (m along it), width, height }] (faces -z (the front), +z, -x, +x; default
+    // one at the middle of the front), windows (the faces that have them; default all), floor / base (m: the floor and the
+    // bottom of the plinth, for a building on something else than the ground), seed, and any archetype key to override.
+    // Builds, all from that data:
+    //   outside   the walls' outer faces with real openings and their reveals, plinth, roof
+    //   interior  (drawn near it, Renderer) the walls' inner faces, floors and ceilings, stairs between the storeys
+    //             (switchbacks along a wall, the slabs open above them, balustrades), furniture (FURNITURE), lamps
+    //   glass     a pane in each window (see-through near it, fsWindow) and an opaque one for far off (fsPane)
+    //   doors     leaves that swing into the room (E, App), and the solids to walk on: walls with door openings,
+    //             floors, steps, furniture, a door's leaf while it is shut
+    //   shader boxes  the shell enclosed (shelter: no rain or snow inside, whatever the wind) and the roof
+    // and its GPU record (WGSL_BUILDING). Returns { id, floor, top }
+    building(f, spec) {
+        const C = STRUCT_COLORS, A = this.types[spec.type || 'house'] || this.types.house;
+        const T = { ...A, ...spec, window: { ...A.window, ...spec.window }, door: { ...A.door, ...spec.door } };
+        const id = this.buildings.length, M = mat => mat + id * BLD_ID, rnd = mulberry32(T.seed ?? id * 7919 + 13);
+        const hx = T.w / 2, hz = T.d / 2, t = T.wall, H = T.storeyHeight, n = Math.max(1, Math.round(T.storeys ?? 1)), W = T.window;
+        const g = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sz]) => this.ground(...f.xz(sx * hx, sz * hz)));
+        const gLo = T.base ?? Math.min(...g) - 1, floor = T.floor ?? Math.max(...g) + T.plinth, top = floor + n * H;
+        const wallCol = T.color || C.walls[0], iv0 = this.iv.length / STRUCT_FLOATS;
+        // the faces: o(u, d) is local [x, z] at u along the face and d in from its outer side; U, D those directions
+        const FACES = {
+            '-z': { len: 2 * hx, o: (u, d) => [u, -hz + d], U: [1, 0], D: [0, 1], bit: 1 },
+            '+z': { len: 2 * hx, o: (u, d) => [-u, hz - d], U: [-1, 0], D: [0, -1], bit: 2 },
+            '-x': { len: 2 * hz, o: (u, d) => [-hx + d, -u], U: [0, -1], D: [1, 0], bit: 4 },
+            '+x': { len: 2 * hz, o: (u, d) => [hx - d, u], U: [0, 1], D: [-1, 0], bit: 8 },
+        };
+        const OPPOSITE = { '-z': '+z', '+z': '-z', '-x': '+x', '+x': '-x' };
+        // in face coordinates: a box centred at u, d with half sizes along and in ([local x, z, half x, half z]); a rectangle
+        // [x0, x1, z0, z1]; a local direction in the world; rectangles that overlap
+        const fbox = (fc, u, d, hu, hd) => { const [x, z] = fc.o(u, d); return fc.U[0] ? [x, z, hu, hd] : [x, z, hd, hu]; };
+        const frect = (fc, u0, u1, d0, d1) => { const a = fc.o(u0, d0), b = fc.o(u1, d1); return [Math.min(a[0], b[0]), Math.max(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[1], b[1])]; };
+        const wdir = ([x, z]) => [x * f.cs - z * f.sn, x * f.sn + z * f.cs];
+        const overlaps = (a, b) => a[0] < b[1] && a[1] > b[0] && a[2] < b[3] && a[3] > b[2];
+
+        // openings: the doors, then windows on every storey of the faces that have them (spread evenly, clear of the
+        // corners and the doors: the same layout inWindow in WGSL assumes)
+        const doors = (T.doors || [{ face: '-z', at: 0 }]).map(d => {
+            const w = d.width ?? T.door.width, lim = FACES[d.face].len / 2 - t - 0.2 - w / 2;
+            return { face: d.face, w, h: Math.min(d.height ?? T.door.height, H - 0.3), at: clamp(d.at ?? 0, -lim, lim) };
+        });
+        const holes = {};
+        let faceMask = 0;
+        for (const [name, fc] of Object.entries(FACES)) {
+            const hs = holes[name] = doors.filter(d => d.face === name).map(d => [d.at - d.w / 2, d.at + d.w / 2, floor, floor + d.h, 'door']);
+            const usable = fc.len - 2 * (t + 0.2), nw = Math.max(1, Math.floor(usable / W.pitch)), cell = usable / nw;
+            if ((T.windows && !T.windows.includes(name)) || usable < W.width) continue;
+            faceMask |= fc.bit;
+            for (let s = 0; s < n; s++) for (let i = 0; i < nw; i++) {
+                const u = -usable / 2 + (i + 0.5) * cell, y0 = floor + s * H + W.sill;
+                if (s === 0 && doors.some(d => d.face === name && Math.abs(u - d.at) < (d.w + W.width) / 2 + 0.25)) continue;
+                hs.push([u - W.width / 2, u + W.width / 2, y0, y0 + W.height, 'window']);
             }
         }
-        // shader boxes: the walls, and the roof with its eaves (which keep the rain off the top of the walls)
-        this.blocker(f, 0, 0, hx, hz, gLo - 1, ye, 0);
-        this.blocker(rf, 0, 0, ex, rz + e, yE - th, lerp(ye, yr, 0.55), 0.25, 0, gLo - 1);
-        this.drip(rf, 0, 0, ex, rz + e, yE - th, yE - th - (floor - 0.35), true);
+
+        // the plinth, and the walls: outer faces with their openings and the reveals through the wall outside, the inner
+        // faces in the interior, glass at mid-wall in the windows (its normal outward), a solid between the doors
+        if (floor - gLo > 0.01) this.box(f, 0, 0, hx + 0.08, hz + 0.08, gLo, floor, C.plinth);
+        for (const [name, fc] of Object.entries(FACES)) {
+            const hs = holes[name], half = fc.len / 2, out = wdir([-fc.D[0], -fc.D[1]]), nOut = [out[0], 0, out[1]];
+            const P = (u, y, d) => { const [x, z] = fc.o(u, d); return f.at(x, y, z); };
+            const face = (rects, d, col, mat) => { for (const [u0, u1, y0, y1] of rects) this.quad(P(u0, y0, d), P(u1, y0, d), P(u1, y1, d), P(u0, y1, d), col, mat); };
+            this.cur = this.v;
+            face(rectMinusHoles(-half, half, floor, top, hs), 0, wallCol, 0);
+            this.quad(P(-half, top, 0), P(half, top, 0), P(half, top, t), P(-half, top, t), wallCol, 0);
+            for (const [u0, u1, y0, y1, kind] of hs) {
+                const rv = (a, b) => this.quad(P(a[0], a[1], 0), P(b[0], b[1], 0), P(b[0], b[1], t), P(a[0], a[1], t), wallCol, 0);
+                rv([u0, y0], [u0, y1]);
+                rv([u1, y0], [u1, y1]);
+                rv([u0, y1], [u1, y1]);
+                if (kind !== 'window') continue;
+                rv([u0, y0], [u1, y0]);
+                for (const to of [this.glass, this.panes]) {
+                    this.cur = to;
+                    this.quadN(P(u0, y0, t / 2), P(u1, y0, t / 2), P(u1, y1, t / 2), P(u0, y1, t / 2), nOut, C.window, M(5));
+                }
+                this.cur = this.v;
+            }
+            this.cur = this.iv;
+            face(rectMinusHoles(-half + t, half - t, floor, top, hs), t, T.inner, M(0));
+            this.cur = this.v;
+            let a = -half;
+            const wall = (u0, u1) => { if (u1 - u0 > 0.01) this.solid(f, ...fbox(fc, (u0 + u1) / 2, t / 2, (u1 - u0) / 2, t / 2), floor, top); };
+            for (const h of hs.filter(h => h[4] === 'door').sort((p, q) => p[0] - q[0])) { wall(a, h[0]); a = h[1]; }
+            wall(a, half);
+        }
+
+        // stairs: a switchback of straight flights along the first wall long enough (the one opposite the front door
+        // first), flight s from storey s to s + 1 in lane s % 2 (even ones climb along the wall, odd ones back), a landing
+        // at both ends. The slab above each flight is open over it
+        const lo = [-hx + t, -hz + t], hi = [hx - t, hz - t], flights = [], reserved = [];
+        if (n > 1 && T.stairs) {
+            const sw = T.stairs.width, steps = Math.ceil(H / 0.19), rise = H / steps, landing = 1.0, lanes = n > 2 ? 2 : 1;
+            const first = doors[0]?.face ?? '-z', order = [OPPOSITE[first], ...Object.keys(FACES).filter(k => k !== first && k !== OPPOSITE[first]), first];
+            for (const name of order) {
+                const fc = FACES[name], run = Math.min(0.3, (fc.len - 2 * t - 2 * landing) / steps);
+                const across = (fc.U[0] ? 2 * hz : 2 * hx) - 2 * t;
+                if (run < 0.22 || across < lanes * sw + 1.5) continue;
+                const a0 = -steps * run / 2, a1 = steps * run / 2;
+                this.cur = this.iv;
+                for (let s = 0; s + 1 < n; s++) {
+                    const lane = s % 2, d0 = t + lane * sw, up = lane === 0, y = floor + s * H;
+                    for (let k = 0; k < steps; k++) {
+                        const u0 = up ? a0 + k * run : a1 - (k + 1) * run;
+                        this.box(f, ...fbox(fc, u0 + run / 2, d0 + sw / 2, run / 2, sw / 2), y, y + (k + 1) * rise, T.floorColor, M(0));
+                    }
+                    flights.push({ s, fc, up, d0, sw, a0, a1, hole: frect(fc, up ? a0 - 0.25 : a0, up ? a1 : a1 + 0.25, d0, d0 + sw) });
+                }
+                reserved.push(frect(fc, a0 - landing, a1 + landing, t, t + lanes * sw + 0.3));
+                break;
+            }
+        }
+        // floors and ceilings: the ground floor, a slab per storey above (open over the flight below it, with a balustrade
+        // along the opening's open sides), the top storey's ceiling
+        this.cur = this.iv;
+        const flat = (rects, y, col, mat) => { for (const [x0, x1, z0, z1] of rects) this.quad(f.at(x0, y, z0), f.at(x1, y, z0), f.at(x1, y, z1), f.at(x0, y, z1), col, mat); };
+        flat([[lo[0], hi[0], lo[1], hi[1]]], floor + 0.005, T.floorColor, M(0));
+        for (let s = 1; s < n; s++) {
+            const y = floor + s * H, below = flights.filter(fl => fl.s === s - 1), pieces = rectMinusHoles(lo[0], hi[0], lo[1], hi[1], below.map(fl => fl.hole));
+            flat(pieces, y, T.floorColor, M(0));
+            flat(pieces, y - T.slab, T.ceiling, M(0));
+            for (const [x0, x1, z0, z1] of pieces) this.solid(f, (x0 + x1) / 2, (z0 + z1) / 2, (x1 - x0) / 2, (z1 - z0) / 2, y - T.slab, y);
+            for (const fl of below) {
+                const [x0, x1, z0, z1] = fl.hole, e = (a, b) => this.quad(f.at(a[0], y - T.slab, a[1]), f.at(b[0], y - T.slab, b[1]), f.at(b[0], y, b[1]), f.at(a[0], y, a[1]), T.ceiling, M(0));
+                e([x0, z0], [x1, z0]); e([x1, z0], [x1, z1]); e([x1, z1], [x0, z1]); e([x0, z1], [x0, z0]);
+                const { fc, up, d0, sw, a0, a1 } = fl, rail = b => this.box(f, b[0], b[1], b[2], b[3], y, y + 1.0, C.wood, M(0));
+                rail(fbox(fc, (a0 + a1) / 2, d0 + sw + 0.03, (a1 - a0) / 2 + 0.25, 0.03));
+                rail(fbox(fc, up ? a0 - 0.28 : a1 + 0.28, d0 + sw / 2, 0.03, sw / 2));
+            }
+        }
+        flat([[lo[0], hi[0], lo[1], hi[1]]], top - 0.01, T.ceiling, M(0));
+        // lamps under each ceiling, about every 4 m (lit or not per storey, storeyLit in WGSL)
+        const nlx = Math.max(1, Math.round((hi[0] - lo[0]) / 4)), nlz = Math.max(1, Math.round((hi[1] - lo[1]) / 4));
+        for (let s = 0; s < n; s++) {
+            const yc = s + 1 < n ? floor + (s + 1) * H - T.slab : top - 0.01;
+            for (let i = 0; i < nlx; i++) for (let j = 0; j < nlz; j++) {
+                const x = lerp(lo[0], hi[0], (i + 0.5) / nlx), z = lerp(lo[1], hi[1], (j + 0.5) / nlz);
+                if (flights.some(fl => fl.s === s && overlaps([x - 0.3, x + 0.3, z - 0.3, z + 0.3], fl.hole))) continue;
+                this.prism(f, x, z, 0.28, 0.28, yc - 0.05, yc - 0.005, [1.0, 0.95, 0.86], M(7));
+            }
+        }
+        // furniture along the walls and out in the room, clear of the stairs, the landings and the doors' swing
+        const plan = FURNITURE[T.furnish] || [];
+        const swing = doors.map(d => frect(FACES[d.face], d.at - d.w / 2 - 0.25, d.at + d.w / 2 + 0.25, 0, t + d.w + 0.4));
+        const names = Object.keys(FACES);
+        for (let s = 0; s < n && plan.length; s++) {
+            const p = plan[Math.min(s, plan.length - 1)], y = floor + s * H, taken = [...reserved, ...(s === 0 ? swing : [])];
+            const fits = rc => rc[0] >= lo[0] - 1e-3 && rc[1] <= hi[0] + 1e-3 && rc[2] >= lo[1] - 1e-3 && rc[3] <= hi[1] + 1e-3 && !taken.some(q => overlaps(rc, q));
+            const place = (name, free) => {
+                const it = FURNITURE_ITEMS[name];
+                if (!it) return;
+                const f0 = Math.floor(rnd() * 4);
+                for (let k = 0; k < 4; k++) {
+                    const fc = FACES[names[(f0 + k) % 4]], half = fc.len / 2 - t - it.w / 2 - 0.1;
+                    if (half < 0) continue;
+                    const deep = (fc.U[0] ? 2 * hz : 2 * hx) - 2 * t;
+                    for (let tries = 0; tries < 10; tries++) {
+                        const u = (rnd() * 2 - 1) * half, v = free ? t + 1.0 + rnd() * Math.max(0, deep - it.d - 2.0) : t + 0.02;
+                        const pad = free ? 0.6 : 0.15;
+                        if (!fits(frect(fc, u - it.w / 2 - pad, u + it.w / 2 + pad, v - (free ? pad : 0), v + it.d + pad))) continue;
+                        taken.push(frect(fc, u - it.w / 2 - 0.1, u + it.w / 2 + 0.1, v - 0.1, v + it.d + 0.1));
+                        for (const [u0, u1, v0, v1, y0, y1, col] of it.parts)
+                            this.box(f, ...fbox(fc, u + (u0 + u1) / 2, v + (v0 + v1) / 2, (u1 - u0) / 2, (v1 - v0) / 2), y + y0, y + y1, FURNITURE_COLORS[col], M(col === 'metal' ? 4 : 0));
+                        return;
+                    }
+                }
+            };
+            for (const [name, count] of p.wall) for (let c = 0; c < count; c++) place(name, false);
+            for (const [name, count] of p.free) for (let c = 0; c < count; c++) place(name, true);
+        }
+        this.cur = this.v;
+
+        // doors: a leaf hinged at one side of the opening on its inner side, swinging into the room (doorMesh); shut, it
+        // is a solid across the opening, open, one along the inner wall
+        for (const d of doors) {
+            const fc = FACES[d.face], u0 = d.at - d.w / 2, lt = 0.05, [x, z] = fc.o(u0 + 0.02, t - lt / 2 - 0.01);
+            const shut = this.solid(f, ...fbox(fc, d.at, t / 2, d.w / 2, t / 2), floor, floor + d.h);
+            const open = this.solid(f, ...fbox(fc, u0 + 0.05, t + d.w / 2, 0.05, d.w / 2), floor, floor + d.h);
+            open.off = true;
+            const [cx, cz] = fc.o(d.at, t / 2);
+            this.doors.push({ building: id, hinge: f.xz(x, z), u: wdir(fc.U), d: wdir(fc.D), w: d.w - 0.04, h: d.h - 0.02, y: floor, lt, open: 0, target: 0,
+                shut, openSolid: open, col: C[T.door.color] || C.door, mat: M(0), centre: f.at(cx, floor + 1.2, cz) });
+        }
+
+        // the roof: a gable over the walls (its triangles close the attic) with eaves and maybe a chimney, or a flat slab
+        // that overhangs; shader boxes for it (rain shadow, sky occlusion under the eaves), and its edges drip
+        const R = T.roof || { kind: 'flat' }, roofCol = R.color || C.concrete;
+        if (R.kind === 'gable') {
+            const rf = R.across ? f.turned(Math.PI / 2) : f, rx = R.across ? hz : hx, rz = R.across ? hx : hz;
+            const k = Math.tan(R.pitch ?? 35 * DEG), e = R.eave ?? 0.5, th = 0.18, yr = top + rz * k, yE = top - e * k, ex = rx + e;
+            for (const sg of [-1, 1]) {
+                const zE = sg * (rz + e);
+                this.quad(rf.at(-ex, yE, zE), rf.at(ex, yE, zE), rf.at(ex, yr, 0), rf.at(-ex, yr, 0), roofCol, 1);
+                this.quad(rf.at(-ex, yE - th, zE), rf.at(ex, yE - th, zE), rf.at(ex, yr - th, 0), rf.at(-ex, yr - th, 0), roofCol, 1);
+                this.quad(rf.at(-ex, yE, zE), rf.at(ex, yE, zE), rf.at(ex, yE - th, zE), rf.at(-ex, yE - th, zE), roofCol, 1);
+                for (const x of [-ex, ex]) this.quad(rf.at(x, yE, zE), rf.at(x, yr, 0), rf.at(x, yr - th, 0), rf.at(x, yE - th, zE), roofCol, 1);
+            }
+            for (const x of [-rx, rx]) this.tri(rf.at(x, top, -rz), rf.at(x, top, rz), rf.at(x, yr, 0), wallCol);
+            if (R.chimney) {
+                const cz = rz * 0.45, y = top + (rz - cz) * k;
+                this.box(rf, rx * 0.5, cz, 0.35, 0.35, y - 0.3, yr + 0.8, C.brick);
+            }
+            this.blocker(rf, 0, 0, ex, rz + e, yE - th, lerp(top, yr, 0.55), 0.25, 0, gLo);
+            this.drip(rf, 0, 0, ex, rz + e, yE - th, yE - th - (floor - T.plinth), true);
+        } else {
+            const ov = R.overhang ?? 0.25, th = R.thick ?? 0.5;
+            this.box(f, 0, 0, hx + ov, hz + ov, top, top + th, roofCol, R.mat ?? 0);
+            // a roof that hardly overhangs shares the shell's shader box (one box less in every shelter test)
+            if (ov > 0.5) this.blocker(f, 0, 0, hx + ov, hz + ov, top, top + th, 0.4, 0, gLo);
+            if (R.drip !== false) this.drip(f, 0, 0, hx + ov, hz + ov, top, top - floor + T.plinth);
+        }
+        // the shell: enclosed, so nothing falls inside it however the wind blows (unless the archetype says otherwise)
+        const roofTop = R.kind !== 'gable' && (R.overhang ?? 0.25) <= 0.5 ? top + (R.thick ?? 0.5) : top;
+        this.blocker(f, 0, 0, hx, hz, gLo, roofTop, 0, 0, gLo, T.shelter !== false);
+        // (each flight's start and its direction up it, in the world: to walk it in tests and tours)
+        const stairs = flights.map(fl => { const [x, z] = fl.fc.o(fl.up ? fl.a0 - 0.6 : fl.a1 + 0.6, fl.d0 + fl.sw / 2); return { at: f.at(x, floor + fl.s * H, z), dir: wdir(fl.up ? fl.fc.U : [-fl.fc.U[0], -fl.fc.U[1]]) }; });
+        this.buildings.push({ id, f, hx, hz, t, floor, top, n, H, stairs, centre: [f.c[0], floor + n * H / 2, f.c[1]], range: [iv0, this.iv.length / STRUCT_FLOATS],
+            record: [f.c[0], f.c[1], f.cs, f.sn, hx, hz, floor, H, n, W.sill, W.height, W.pitch, W.width, t, T.lamps ?? 0.5, faceMask] });
+        return { id, floor, top };
+    }
+
+    // a quad with its normal given (the glass: outward, which fsWindow needs)
+    quadN(a, b, c, d, n, col, mat) {
+        for (const p of [a, b, c, a, c, d]) this.cur.push(p[0], p[1], p[2], n[0], n[1], n[2], col[0], col[1], col[2], mat);
+    }
+
+    // the doors' leaves as they stand (rebuilt whenever one moves, App): each turned about its hinge into the room by up
+    // to 95 degrees, with a handle on both sides
+    doorMesh() {
+        const out = [], keep = this.cur;
+        this.cur = out;
+        for (const d of this.doors) {
+            const a = d.open * 95 * DEG, dir = [d.u[0] * Math.cos(a) + d.d[0] * Math.sin(a), d.u[1] * Math.cos(a) + d.d[1] * Math.sin(a)];
+            const lf = new GroundFrame([d.hinge[0] + dir[0] * d.w / 2, d.hinge[1] + dir[1] * d.w / 2], Math.atan2(dir[1], dir[0]));
+            this.prism(lf, 0, 0, d.w / 2, d.lt / 2, d.y, d.y + d.h, d.col, d.mat);
+            this.prism(lf, d.w / 2 - 0.12, 0, 0.06, d.lt / 2 + 0.04, d.y + 0.98, d.y + 1.03, STRUCT_COLORS.metal, d.mat + 4);
+        }
+        this.cur = keep;
+        return out;
+    }
+
+    // the doors swing toward where they were sent; true if one moved (its leaf's mesh, and its solids, change)
+    updateDoors(dt) {
+        let moved = false;
+        for (const d of this.doors) {
+            if (d.open === d.target) continue;
+            d.open = d.target > d.open ? Math.min(d.target, d.open + dt * DOOR_SPEED) : Math.max(d.target, d.open - dt * DOOR_SPEED);
+            d.shut.off = d.open > 0.05;
+            d.openSolid.off = d.open < 0.95;
+            moved = true;
+        }
+        return moved;
+    }
+
+    // the door the eye looks at, within DOOR_REACH (its opening, mid-height), or null
+    doorAt(eye, fwd) {
+        let best = null, score = 0;
+        for (const d of this.doors) {
+            const v = v3.sub(d.centre, eye), l = v3.len(v);
+            if (l > DOOR_REACH || l < 1e-3) continue;
+            const c = v3.dot(v, fwd) / l, need = Math.cos(Math.atan2(d.w / 2 + 0.25, l));
+            if (c > need && c - need > score) { score = c - need; best = d; }
+        }
+        return best;
     }
 
     // bus shelter: a roof on four posts, glass back and side panels, a bench, a timetable and the stop sign by the kerb.
@@ -3205,7 +3720,7 @@ class Structures {
             this.listed = list;
             this.data ??= new Float32Array(MAX_BLOCKERS * 12);
             this.data.fill(0);
-            list.forEach((b, i) => this.data.set([b.x, b.z, b.hx, b.hz, b.cs, b.sn, b.y0, b.y1, b.ao, b.slope, b.dyn ? 1 : 0, 0], i * 12));
+            list.forEach((b, i) => this.data.set([b.x, b.z, b.hx, b.hz, b.cs, b.sn, b.y0, b.y1, b.ao, b.slope, b.dyn ? 1 : 0, b.enclosed ? 1 : 0], i * 12));
             this.lo = Math.min(...list.map(b => Math.min(b.base, b.y0 - Math.abs(b.slope) * b.hx)));
             this.hi = Math.max(...list.map(b => b.y1 + Math.abs(b.slope) * b.hx));
         }
@@ -3269,6 +3784,13 @@ class Structures {
         return list.length;
     }
 
+    // as blockerRain in WGSL: p is inside the enclosed box b
+    static holds(b, p) {
+        if (!b.enclosed) return false;
+        const rx = p[0] - b.x, rz = p[2] - b.z, lx = rx * b.cs + rz * b.sn, lz = -rx * b.sn + rz * b.cs, y = p[1] - b.slope * lx;
+        return Math.abs(lx) < b.hx && Math.abs(lz) < b.hz && y > b.y0 && y < b.y1;
+    }
+
     // blockerHit in WGSL: the ray from o along d enters box b
     static hit(b, o, d) {
         const rx = o[0] - b.x, rz = o[2] - b.z, lx = rx * b.cs + rz * b.sn, dx = d[0] * b.cs + d[2] * b.sn;
@@ -3285,7 +3807,15 @@ class Structures {
     }
 
     // a structure keeps off what falls on p along -d (d: back up against the fall)
-    shelters(p, d) { return this.blockers.some(b => Structures.hit(b, p, d)); }
+    shelters(p, d) { return this.blockers.some(b => Structures.holds(b, p) || Structures.hit(b, p, d)); }
+
+    // the building p is inside (its interior), or null
+    inside(p) {
+        return this.buildings.find(b => {
+            const rx = p[0] - b.f.c[0], rz = p[2] - b.f.c[1], lx = rx * b.f.cs + rz * b.f.sn, lz = -rx * b.f.sn + rz * b.f.cs;
+            return Math.abs(lx) < b.hx - b.t && Math.abs(lz) < b.hz - b.t && p[1] > b.floor - 0.2 && p[1] < b.top;
+        }) || null;
+    }
 }
 
 // A small village on a road, laid out from a seed on the terrain as drawn. The road runs across the river `river` (an
@@ -3412,7 +3942,7 @@ class Village extends Entity {
                     const c = [c0[0] + side[0] * sg * off, c0[1] + side[1] * sg * off], rad = Math.hypot(w, dp) / 2;
                     if (!free(...c, rad)) continue;
                     const hf = GroundFrame.facing(c, [side[0] * sg, side[1] * sg]);
-                    S.house(hf, w, dp, {
+                    S.house(hf, w, dp, { type: d.houseType,
                         wallH: rnd() < 0.3 ? r(5.4, 6) : r(2.9, 3.4), pitch: r(28, 42) * DEG, eave: r(0.4, 0.7), across: rnd() < 0.35,
                         wall: C2.walls[Math.floor(rnd() * C2.walls.length)], roof: C2.roofs[Math.floor(rnd() * C2.roofs.length)],
                         chimney: rnd() < 0.4, door: r(-w / 2 + 1.2, w / 2 - 1.2),
@@ -3528,10 +4058,9 @@ class BusStation extends Entity {
 
         // on the platform: kiosk, benches, timetables, bins
         const kx = -L * 0.3;
-        S.box(f, kx, 2.6, 2.2, 1.6, plat, plat + 2.4, [0.30, 0.31, 0.30], 4);
-        S.box(f, kx, 2.6, 2.3, 1.7, plat + 2.4, plat + 2.95, red, 4);
-        for (const sz of [-1, 1]) S.box(f, kx, 2.6 + sz * 1.62, 1.8, 0.02, plat + 0.9, plat + 2.2, C.glass, 2);
-        S.blocker(f, kx, 2.6, 2.3, 1.7, plat, plat + 2.95, 0.1);
+        S.building(new GroundFrame(f.xz(kx, 2.6), f.yaw), { type: d.kioskType || 'kiosk', w: 4.4, d: 3.2, storeys: 1, floor: plat, base: plat,
+            color: [0.30, 0.31, 0.30], windows: ['-z', '+z'], doors: [{ face: '+x', at: 0 }], seed: 31,
+            roof: { kind: 'flat', overhang: 0.1, thick: 0.55, color: red, mat: 4, drip: false } });
         for (let i = 0; i + 1 < pillars.length; i++) {
             const x = (pillars[i] + pillars[i + 1]) / 2;
             if (Math.abs(x - kx) < 4) continue;
@@ -3549,18 +4078,10 @@ class BusStation extends Entity {
         }
 
         // terminal building at the west end: offices and a waiting hall, window bands, a flat roof that overhangs
-        const tx = -L - 18, thx = 12, thz = 13, th = gHi + 7.6;
-        S.box(f, tx, 0, thx, thz, gLo, th, [0.74, 0.72, 0.66]);
-        for (const sz of [-1, 1]) {
-            S.box(f, tx, sz * (thz + 0.02), thx - 1, 0.03, gHi + 1.0, gHi + 3.0, C.window, 5);
-            S.box(f, tx, sz * (thz + 0.02), thx - 1, 0.03, gHi + 4.6, gHi + 6.4, C.window, 5);
-        }
-        S.box(f, tx + thx + 0.02, 0, 0.03, thz - 2, gHi + 0.2, gHi + 3.0, C.glass, 2);
-        S.box(f, tx - thx - 0.02, 0, 0.03, thz - 2, gHi + 4.6, gHi + 6.4, C.window, 5);
-        S.box(f, tx, 0, thx + 1.6, thz + 1.6, th, th + 0.45, canopy);
-        S.blocker(f, tx, 0, thx, thz, gLo, th, 0);
-        S.blocker(f, tx, 0, thx + 1.6, thz + 1.6, th, th + 0.45, 0.4, 0, gLo);
-        S.drip(f, tx, 0, thx + 1.6, thz + 1.6, th, th - gHi);
+        const tx = -L - 18, thx = 12, thz = 13;
+        S.building(new GroundFrame(f.xz(tx, 0), f.yaw), { type: d.terminalType || 'terminal', w: 2 * thx, d: 2 * thz, storeys: 2,
+            base: gLo, floor: gHi + 0.15, color: [0.74, 0.72, 0.66], doors: [{ face: '+x', at: -2.4 }, { face: '+x', at: 2.4 }], seed: 17,
+            roof: { kind: 'flat', overhang: 1.6, thick: 0.45, color: canopy } });
         // a bus line from here (BusLine) comes in through a gap in the railing, stops in the drive-through lane by the
         // platform, and leaves past the east end; its road runs along the south side of the town blocks (local z = road)
         const served = (this.world.scenario.entities || []).some(e => e.type === 'bus' && e.from === this.id);
@@ -3606,18 +4127,13 @@ class BusStation extends Entity {
         // town-centre blocks around the forecourt: flat roofs, window bands per storey
         const blocks = [[-L - 10, 52, 22, 9], [-L + 40, 50, 16, 8], [-L + 82, 54, 24, 10], [L + 4, 48, 14, 9],
             [L + 38, 6, 10, 20], [-L - 10, -52, 24, 10], [-L + 44, -50, 18, 9], [L - 6, -54, 20, 11], [-L - 62, 6, 9, 18]];
-        for (const [bx, bz, bhx, bhz] of blocks) {
-            const storeys = 2 + Math.floor(rnd() * 4), top = gHi + 0.3 + storeys * 3.2;
-            const col = C.walls[Math.floor(rnd() * C.walls.length)];
-            S.box(f, bx, bz, bhx, bhz, gLo, top, col);
-            S.box(f, bx, bz, bhx + 0.25, bhz + 0.25, top, top + 0.5, C.concrete);
-            for (let k = 0; k < storeys; k++) {
-                const y0 = gHi + 1.2 + k * 3.2;
-                for (const sz of [-1, 1]) S.box(f, bx, bz + sz * (bhz + 0.02), bhx - 0.8, 0.02, y0, y0 + 1.5, C.window, 5);
-                for (const sx of [-1, 1]) S.box(f, bx + sx * (bhx + 0.02), bz, 0.02, bhz - 0.8, y0, y0 + 1.5, C.window, 5);
-            }
-            S.blocker(f, bx, bz, bhx, bhz, gLo, top + 0.5, 0);
-        }
+        // each with its door on the side facing the forecourt
+        blocks.forEach(([bx, bz, bhx, bhz], k) => {
+            const storeys = 2 + Math.floor(rnd() * 4), col = C.walls[Math.floor(rnd() * C.walls.length)];
+            const face = Math.abs(bx) - L > Math.abs(bz) ? (bx > 0 ? '-x' : '+x') : (bz > 0 ? '-z' : '+z');
+            S.building(new GroundFrame(f.xz(bx, bz), f.yaw), { type: d.blockType || 'block', w: 2 * bhx, d: 2 * bhz, storeys, base: gLo,
+                floor: gHi + 0.3, color: col, doors: [{ face, at: r(-3, 3) }], seed: 101 + k, roof: { kind: 'flat', overhang: 0.25, thick: 0.5, color: C.concrete, drip: false } });
+        });
 
         // shader boxes: the canopy slab (dry under it: its box starts at the slab, since a point inside a box is not
         // sheltered by it), the fascia as thin boxes round its edges (they keep slanting rain off), the clerestory, the
@@ -4623,7 +5139,7 @@ class World {
         for (const def of scenario.entities || []) this.add(def, false);
         for (const e of this.entities) { e.stamp(this.field); this.field.updateRange(); }
         this.field.freeze();
-        this.structures = new Structures(this.field);
+        this.structures = new Structures(this.field, scenario.buildings);
         for (const e of this.entities) e.build(this.structures);
         for (const e of [...this.entities]) e.spawn();
         this.rainZones = new RainZones(this);
@@ -4998,8 +5514,8 @@ class Renderer {
     createPipelines() {
         const d = this.device;
         this.screenLayout = makeLayout(d, GPUShaderStage.FRAGMENT, ['tex', 'tex']);
-        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, wgslBus(1), WGSL_SCENE) });
-        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, wgslBus(2), WGSL_FINAL) });
+        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, wgslBus(1), WGSL_SCENE) });
+        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, wgslBus(2), WGSL_FINAL) });
         const layoutA = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout] });
         const layoutB = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout, this.screenLayout] });
         // one bus's uniforms (wgslBus), at a dynamic offset per bus: group 1 in the scene pass, group 2 in the final one
@@ -5025,6 +5541,11 @@ class Renderer {
         }];
         this.pStruct = pipe(layoutA, scene, 'vsStruct', 'fsStruct', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
         this.pBus = pipe(layoutBus, scene, 'vsBus', 'fsBus', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
+        // buildings (Structures.building): interiors near them, door leaves, the opaque panes far off, the glass near
+        this.pInterior = pipe(layoutA, scene, 'vsStruct', 'fsInterior', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
+        this.pDoor = pipe(layoutA, scene, 'vsStruct', 'fsDoor', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
+        this.pPane = pipe(layoutA, scene, 'vsStruct', 'fsPane', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
+        this.pWindow = pipe(layoutB, final, 'vsWindow', 'fsWindow', this.format, { write: false, compare: 'greater' }, blendAlpha, structVerts);
         this.pComposite = pipe(layoutB, final, 'vsFull', 'fsComposite', this.format, { write: false, compare: 'always' });
         this.pGlass = pipe(layoutGlass, final, 'vsGlass', 'fsGlass', this.format, { write: false, compare: 'greater' }, blendAlpha, structVerts);
         this.pPrecip = pipe(layoutB, final, 'vsPrecip', 'fsPrecip', this.format, { write: false, compare: 'greater' }, blendAlpha);
@@ -5046,6 +5567,20 @@ class Renderer {
         const sv = new Float32Array(world.structures.v);
         this.structCount = sv.length / STRUCT_FLOATS;
         this.structBuf = this.structCount ? makeBuffer(d, sv.byteLength, GPUBufferUsage.VERTEX, sv) : null;
+        // the buildings: their records (WGSL_BUILDING), interiors (one vertex range each, drawn near them: interiorDraws),
+        // window glass and far panes, and the door leaves (rewritten when one moves: writeDoors)
+        const S = world.structures, vb = arr => { const a = new Float32Array(arr); return { n: a.length / STRUCT_FLOATS, buf: a.length ? makeBuffer(d, a.byteLength, GPUBufferUsage.VERTEX, a) : null }; };
+        for (const k of ['interior', 'glassV', 'paneV', 'doorV']) this[k]?.buf?.destroy();
+        this.buildingBuf?.destroy();
+        this.interior = vb(S.iv);
+        this.glassV = vb(S.glass);
+        this.paneV = vb(S.panes);
+        const dm = S.doorMesh();
+        this.doorV = { n: dm.length / STRUCT_FLOATS, buf: dm.length ? makeBuffer(d, dm.length * 4, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, new Float32Array(dm)) : null };
+        const rec = new Float32Array(Math.max(1, S.buildings.length) * BUILDING_FLOATS);
+        S.buildings.forEach((b, i) => rec.set(b.record, i * BUILDING_FLOATS));
+        this.buildingBuf = makeBuffer(d, rec.byteLength, GPUBufferUsage.STORAGE, rec);
+        this.interiorDraws = [];
         // the buses, each in its own frame: opaque mesh and glass, and its uniforms (busData, BUS_UNIFORM bytes each); the
         // app lists the ones to draw this frame in busDraws, nearest first
         for (const m of this.busMeshes || []) { m.buf?.destroy(); m.glass?.destroy(); }
@@ -5064,9 +5599,12 @@ class Renderer {
             F: this.frameBuf, shapeTex: this.noise.shapeView, detailTex: this.noise.detailView, weatherTex: this.weatherPass.weatherView,
             shadowTex: this.weatherPass.shadowView, heightTex: this.heightView, landTex: this.landMap.createView(), repSamp: this.repSamp,
             clampSamp: this.clampSamp, cells: this.cellBuf, ground: this.groundPass.buffer, bolts: this.boltBuf, anvilTex: this.weatherPass.anvilView,
-            layerTex: this.weatherPass.layerView, styleTex: this.weatherPass.styleView, occ: this.weatherPass.occ,
+            layerTex: this.weatherPass.layerView, styleTex: this.weatherPass.styleView, occ: this.weatherPass.occ, buildings: this.buildingBuf,
         }, 'world');
     }
+
+    // the door leaves as they stand now (Structures.doorMesh, same size every time)
+    writeDoors(mesh) { if (this.doorV.buf) this.device.queue.writeBuffer(this.doorV.buf, 0, new Float32Array(mesh)); }
 
     resize(scale) {
         const c = this.canvas, dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -5122,6 +5660,15 @@ class Renderer {
                 a.draw(m.count);
             }
         }
+        // buildings: interiors within INTERIOR_DRAW (vertex ranges, nearest first), door leaves, and the panes of the
+        // windows further off (fsPane drops those of the near ones)
+        if (this.interiorDraws.length) {
+            a.setPipeline(this.pInterior);
+            a.setVertexBuffer(0, this.interior.buf);
+            for (const [first, count] of this.interiorDraws) a.draw(count, 1, first);
+        }
+        if (this.doorV.n) { a.setPipeline(this.pDoor); a.setVertexBuffer(0, this.doorV.buf); a.draw(this.doorV.n); }
+        if (this.paneV.n) { a.setPipeline(this.pPane); a.setVertexBuffer(0, this.paneV.buf); a.draw(this.paneV.n); }
         a.end();
 
         if (froxels && volumetrics) this.froxelPass.encode(enc, prof);
@@ -5137,8 +5684,10 @@ class Renderer {
         b.setPipeline(this.pComposite);
         b.draw(3);
         if (particles) { b.setPipeline(this.pPrecip); b.draw(6, particles); }
+        // the buildings' window glass after the rain (fsWindow drops the panes of buildings beyond INTERIOR_DRAW); then
         // the buses' windows after the rain outside them (seen from inside, the drops on the glass are in front of it),
         // furthest first
+        if (this.glassV.n && this.interiorDraws.length) { b.setPipeline(this.pWindow); b.setVertexBuffer(0, this.glassV.buf); b.draw(this.glassV.n); }
         if (this.busDraws.length) {
             b.setPipeline(this.pGlass);
             for (let i = this.busDraws.length - 1; i >= 0; i--) {
@@ -5251,6 +5800,7 @@ function collideWalker(p, boxes, ground) {
     const R = WALK.radius;
     for (let it = 0; it < 3; it++) {
         for (const b of boxes) {
+            if (b.off) continue;
             const rx = p[0] - b.x, rz = p[2] - b.z;
             let lx = rx * b.cs + rz * b.sn, lz = -rx * b.sn + rz * b.cs;
             if (Math.abs(lx) > b.hx + R || Math.abs(lz) > b.hz + R) continue;
@@ -5266,6 +5816,7 @@ function collideWalker(p, boxes, ground) {
         }
     }
     for (const b of boxes) {
+        if (b.off) continue;
         const rx = p[0] - b.x, rz = p[2] - b.z, lx = rx * b.cs + rz * b.sn, lz = -rx * b.sn + rz * b.cs;
         if (Math.abs(lx) > b.hx || Math.abs(lz) > b.hz) continue;
         const top = b.y1 + b.slope * lx;
@@ -5450,7 +6001,7 @@ class Hud {
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>N</b> rain: drizzle / light / medium / downpour / mixed   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
             '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
-            '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
+            '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> open / shut a door, sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
             'drop a scenario .json on the page',
         ].join('\n');
     }
@@ -5485,7 +6036,7 @@ class Hud {
             `air       ${c.temperature.toFixed(0)} °C at sea level · freezing level ${(wx.freezingLevel / 1000).toFixed(1)} km · wind ${wind.toFixed(0)} m/s from ${from}`,
             `clouds    ${w.clouds.active(c).map(([n, v]) => `${n} ${(v * 100).toFixed(0)}%`).join(' · ') || 'none'}`,
             `storms    ${storms.length} cells · ${raining} raining · ${w.flashCount} flashes`,
-            `here      ${here}${app.sheltered ? ` <span class="w">${app.inBus ? 'in the bus' : 'sheltered'}</span>` : ''} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
+            `here      ${here}${app.sheltered || app.indoors ? ` <span class="w">${app.inBus ? 'in the bus' : app.indoors ? `indoors, storey ${Math.min(app.indoors.n, 1 + Math.floor((app.camera.pos[1] - app.indoors.floor) / app.indoors.H))} of ${app.indoors.n}` : 'sheltered'}</span>` : ''} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
             ...(app.rideBus ? [`bus       ${app.rideBus.label} ${app.rideBus.describe()}${app.walker.active ? ` · <span class="w">${app.walker.seat ? 'seated' : app.walker.bus ? 'aboard' : 'on foot'}</span>` : ''}${w.busBoost > 1 ? ' <span class="w">×10</span>' : ''}`] : []),
             `render    ${RENDER_MODES[app.mode]} · ${q.name} ${cw.w}×${cw.h}${q.interleave > 1 ? ` 1/${q.interleave} px` : ''}${q.blur ? ' blur' : ''}${app.tiles ? ' tiles' : ''} ${q.steps} steps · froxels ${app.froxels ? FROXEL.join('×') : 'off'} · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
             app.renderer.profiler.enabled
@@ -5773,6 +6324,15 @@ class App {
             draws.push([dist, k]);
         });
         r.busDraws = draws.sort((p, q2) => p[0] - q2[0]).map(e => e[1]);
+        // building interiors within INTERIOR_DRAW of their centre (the same test fsWindow and fsPane make) whose bounding
+        // sphere is in the view frustum, nearest first
+        const kx = Math.hypot(1, tanX), ky = Math.hypot(1, tanY);
+        const inView = b => {
+            const v = v3.sub(b.centre, cam.pos), r = b.radius ??= Math.hypot(b.hx, b.hz, b.n * b.H / 2), z = v3.dot(v, fwd);
+            return z > -r && Math.abs(v3.dot(v, right)) - z * tanX < r * kx && Math.abs(v3.dot(v, up)) - z * tanY < r * ky;
+        };
+        const nearB = w.structures.buildings.map(b => [v3.len(v3.sub(b.centre, cam.pos)), b]).filter(e => e[0] < INTERIOR_DRAW && inView(e[1])).sort((p, q2) => p[0] - q2[0]);
+        r.interiorDraws = nearB.map(([, b]) => [b.range[0], b.range[1] - b.range[0]]).filter(e => e[1] > 0);
         // the cabin the rain and the march leave out: the bus ridden, or the nearest
         if (this.rideBus) {
             F.set('busInv', this.rideBus.inverse);
@@ -5865,6 +6425,17 @@ class App {
         w.update(this.paused ? 0 : dt, wdt, this.time);
         // on foot after the bus has moved, so a rider's eye is where the bus is this frame
         if (this.walker.active) this.walker.update(dt, io, this.input, this);
+        // doors: E opens or shuts the one in view (on foot or flying, not aboard a bus); they swing, and their leaves'
+        // mesh is rewritten only while one moves
+        const S = w.structures, wk = this.walker;
+        this.door = wk.bus ? null : S.doorAt(this.camera.pos, this.camera.basis().fwd);
+        if (this.door && io.pressed.includes('KeyE')) this.door.target = this.door.target > 0.5 ? 0 : 1;
+        if (wk.active && !wk.bus) {
+            wk.aim = this.door;
+            wk.prompt = this.door ? `E ${this.door.target > 0.5 ? 'shut' : 'open'} the door` : '';
+        }
+        if (S.updateDoors(dt)) r.writeDoors(S.doorMesh());
+        this.indoors = S.inside(this.camera.pos);
         if (v3.len(v3.sub(before, this.camera.pos)) > 3000) this.reset = true;
         this.probe = r.weatherPass.probe;
         this.near = this.nearPrecip();
@@ -5874,7 +6445,7 @@ class App {
         const cp = this.camera.pos, bd = b => Math.hypot(b.pose.x - cp[0], b.pose.y - cp[1], b.pose.z - cp[2]);
         this.rideBus = (this.walker.active && this.walker.bus) || w.buses.reduce((a, b) => !a || bd(b) < bd(a) ? b : a, null);
         this.inBus = !!this.rideBus && (() => { const q = this.rideBus.toLocal(this.camera.pos); return Math.abs(q[0]) < BUS.hl && Math.abs(q[2]) < BUS.hw && q[1] > BUS.skirt && q[1] < BUS.roof; })();
-        this.sheltered = this.near.rain + this.near.snow > 0.01 && (this.inBus || w.structures.shelters(this.camera.pos, v3.norm([-c.wind[0] * 0.8, fall, -c.wind[1] * 0.8])));
+        this.sheltered = this.near.rain + this.near.snow > 0.01 && (this.inBus || !!this.indoors || w.structures.shelters(this.camera.pos, v3.norm([-c.wind[0] * 0.8, fall, -c.wind[1] * 0.8])));
 
         this.writeFrame(dt, wdt);
         const enc = r.device.createCommandEncoder();

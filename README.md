@@ -78,7 +78,8 @@ Each frame runs these passes. All distances are metres and heights are above sea
      and mountains with rock above the tree line.
    - It is lit with cloud shadows, snow, wet darkening and reflections, and lightning.
    - Then the **structures** (`vsStruct` / `fsStruct`): houses, a bus shelter, bridges, roads and the river's water in a
-     village, and a town's central bus station, as flat-shaded triangles built on the CPU. They stand on `Heightfield.surface`, the terrain exactly as
+     village, and a town's central bus station, as flat-shaded triangles built on the CPU. Every building has an
+     interior, glass windows and doors that open (see **Buildings**). They stand on `Heightfield.surface`, the terrain exactly as
      drawn (half-float heights, filtered at the mesh vertices, flat triangles between them), so they neither float
      nor sink. They get cloud shadows, wetness, snow on what faces up, and glass, metal and wet surfaces reflect the
      sky. See **Rain shelter** below.
@@ -228,7 +229,7 @@ and from 25–28 ms to 10–12 ms at high.
 | V, L, P, H | next view, labels, pause weather, help |
 | X | walk (from the ground below the camera) / fly |
 | B | go to the next bus of the line (each press another): outside its front door while it stands at a stop, else aboard in the aisle |
-| E | aboard: sit in the seat you look at, or stand up |
+| E | open or shut the door you look at (within 2.4 m); aboard: sit in the seat you look at, or stand up |
 | hold Z | the buses run ten times as fast |
 
 On foot, WASD walks (Shift runs, Alt creeps) and dragging looks around; Space and C do nothing.
@@ -301,6 +302,66 @@ go into the frame (the village and the bus station lie 9 km apart). Each frame a
 boxes' bounds lists, per cell, the boxes that can shade it: a capsule from each box toward where its sun shadow and its
 rain shadow fall, as far as a ray from the ground under it to its top runs sideways. A point tests only its cell's
 boxes, which keeps the structures at about 0.2 ms of scene time at street level.
+
+### Buildings
+
+Every building is a shell with an interior: the village's houses, the bus station's terminal and kiosk, and the town
+blocks round its forecourt. `Structures.building(frame, spec)` builds one from data: an archetype from
+`BUILDING_TYPES` (`house`, `terminal`, `block`, `kiosk`), merged key by key with the scenario's `buildings`, then the
+building's own spec (size, storeys, colours, roof, doors). A village's houses take `houseType`, a station
+`terminalType`, `blockType` and `kioskType`, so a scenario can give them other archetypes.
+
+- **Shell**: walls `wall` m thick with real openings. Their outer faces, the reveals through the wall, the plinth and
+  the roof (a gable with eaves and maybe a chimney, or a flat slab that overhangs) are outside. Windows sit on every
+  storey of the faces that have them, spread evenly along each wall and kept clear of the corners and the doors.
+- **Interior**: the walls' inner faces, a floor per storey, ceilings, and stairs between the storeys: switchbacks along a
+  wall (the one opposite the front door first), the slab open above each flight, with balustrades along the opening.
+  Furniture (`FURNITURE`: home, office, hall, kiosk) stands along the walls and out in the room, clear of the stairs,
+  their landings and the doors' swing. There is a lamp about every 4 m under each ceiling.
+- **Glass**: each window has a pane at mid-wall. Within `INTERIOR_DRAW` (160 m) of a building's centre its interior is
+  drawn and the glass is see-through (`fsWindow`, in the final pass like the bus's): a faint tint, the sky reflected at
+  grazing angles, and rain drops where the rain reaches its outer side. Further off the interior is not drawn and the
+  windows are opaque panes (`fsPane`) that reflect the sky. Over the last 40 m before that distance the glass blends into
+  the pane, so the switch does not show. Both tests use the distance to the building's centre, on the CPU and the GPU.
+- **Light inside** (`shadeInterior`): sky light through the windows, more near the outer walls than deep in the room,
+  plus some light bounced off sunlit floors. The sun comes in only where its ray leaves through a window of the same
+  storey, and only where nothing outside (another building, the eaves) and no cloud shades it. That is one box exit,
+  because the window layout is a formula the shader shares with the mesh (`throughWindow`), so the sun falls in
+  window-shaped patches on the floor. Each storey's lamps are on or off by a hash, for a share of the storeys (`lamps`).
+  A lit storey glows in its windows from outside, near and far.
+- **Doors** (`E`): each door's leaf is hinged on the inner side of the opening and swings 95° into the room
+  (`DOOR_SPEED`). Leaves are a small vertex buffer rebuilt only while one moves. A shut leaf is a solid across the
+  opening; an open one is a solid along the inner wall. Solids are switched with `off`, which `collideWalker` skips.
+  A leaf is lit as the interior on its inner side and by the weather on its outer side (`fsDoor`).
+- **Walking**: the walls (between the door openings), floors, steps, balustrades and furniture are solids, so you
+  step up the plinth, through the door and up the stairs. The HUD says `indoors, storey k of n`.
+- **Shelter by default**: the shell is an *enclosed* shader box (`shelter`, default true). A point inside it is
+  sheltered whichever way the wind blows (`blockerRain`), so no near-field drops or flakes fall in the rooms and the rain
+  shafts are taken out of the march there. The test is the same ray-box span as the rain shadow, so it costs nothing
+  extra per box. A flat roof that hardly overhangs shares the shell's box.
+
+Data per building for the GPU sits in a static storage buffer (`buildings`, 4 `vec4f` each: frame, sizes, storeys,
+window layout, lamps). Interior, glass and door vertices carry `material + id × BLD_ID`, so shading a pixel is O(1)
+whatever the building count. Each frame the CPU picks the interiors within `INTERIOR_DRAW` whose bounding sphere is in
+view and draws their vertex ranges. On the test machine (Brave, 1925 × 925, medium, medium rain) the scene pass took
++0.03 ms at the village bus stop, +0.13 ms on the bus station platform and none at town street level, against the
+version with solid buildings (39 buildings, 40 doors, about 140 k interior vertices).
+
+| Archetype key | Meaning |
+|---|---|
+| `storeyHeight`, `plinth`, `wall`, `slab` | m: storey height, floor above the highest ground under it, wall and floor thickness |
+| `window` | `{ width, height, sill, pitch }`: sill above each storey's floor, `pitch` m of wall per window |
+| `door` | `{ width, height, color }` (a `STRUCT_COLORS` key) |
+| `stairs` | `{ width }`, or `false` for none |
+| `furnish` | a `FURNITURE` key |
+| `lamps` | share of storeys lit (0–1) |
+| `shelter` | interior keeps rain and snow out (default true) |
+| `inner`, `floorColor`, `ceiling` | colours `[r, g, b]` |
+
+A building spec adds `w`, `d`, `storeys`, `color`, `roof` (`{ kind: "gable", pitch, eave, across, chimney, color }` or
+`{ kind: "flat", overhang, thick, drip, color }`), `doors` (`[{ face: "-z" | "+z" | "-x" | "+x", at, width, height }]`),
+`windows` (the faces that have them), `floor` / `base` (for a building standing on something other than the ground,
+like the kiosk on the platform), `seed`, and any archetype key.
 
 ### Walking and the bus
 
@@ -379,6 +440,7 @@ the same way. Their tops get more sky light than their undersides, which is what
 | `clouds` | up to 4 cloud genus layers (below) |
 | `weather` | `start`, `transition` (s), `cycle` { `enabled`, `hold` }, `states` { name: state } |
 | `entities` | `{ type, id, label, ... }`, where `type` maps to a class in `ENTITY_TYPES` (below), applied in order |
+| `buildings` | building archetypes, merged key by key over `BUILDING_TYPES` (see **Buildings**) |
 | `lighting` | `start`, `presets` { name: { `azimuth`, `elevation`, `intensity`, `exposure` } } |
 | `views` | `{ name, pos [x, y, z], look [x, y, z] }`, or `{ name, follow (entity id), offset [x, height above ground, z], lookOffset }` to frame a moving entity, or `{ name, follow (entity id), spot }` for a viewpoint the entity laid out (a village's; a bus's `seat` puts you in one); optional `lighting` (preset), `weather` (state) and `walk` (true: on foot from there) |
 
@@ -501,8 +563,8 @@ The cell moves through its life like this:
 1. Subclass `Entity` and override the hooks it needs:
    - `stamp(field)`: shape `field.h` and paint land use with `field.paint(idx, channel, value)`, where
      the channel is 0 town, 1 forest or 2 water.
-   - `build(structures)`: after every entity has stamped, add meshes (`box`, `sweep`, `quad`, or `house`,
-     `busStop`, `bridge`, `road`, `water`) and shader boxes (`blocker`) to the `Structures`. Place them with
+   - `build(structures)`: after every entity has stamped, add meshes (`box`, `sweep`, `quad`, or `building`,
+     `house`, `busStop`, `bridge`, `road`, `water`) and shader boxes (`blocker`) to the `Structures`. Place them with
      `structures.ground(x, z)`, the terrain as drawn.
    - `spawn()`: register with the world. `world.add(def)` creates more entities at runtime.
    - `update(dt, wdt, t)`: per frame. `dt` is real seconds and `wdt` is weather seconds. Set `dead` to
@@ -525,7 +587,8 @@ WGSL_SHADOW, WGSL_GROUND                   ground state
 WGSL_FROXEL, WGSL_SKIP_SAMPLE,             compute: froxel lighting, occupancy / tile lookups, cloud tile pre-pass,
 WGSL_TILES, WGSL_MARCH, WGSL_RESOLVE       volumetric march, temporal resolve
 WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
-WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion; the bus cabin
+WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion, enclosed interiors; the bus cabin
+WGSL_BUILDING                              building records: frames, storeys, window layout, sun through a window, lamps
 Entity, ENTITY_TYPES                       terrain features, GroundFrame / Structures / Village / BusStation, BusLine (+ buildBus,
                                            roundPath, offsetLine), StormCell, Supercell,
                                            SquallLine, Spawner
