@@ -328,6 +328,15 @@ const CLEAR_RADIUS = 450, CLEAR_WIDE = 3;   // a clear stretch's opening: m past
 const MAX_DRIPS = 8;                 // roof edges near the camera that rain runs off (see vsPrecip)
 const DRIP_DENSITY = 100;           // at most this many of them per metre of edge
 const DRIP_PARTICLES = 40000;        // near-field drops falling off those edges, drawn after the rain
+const SPLASH_GRID = 128, SPLASH_RADIUS = 20;  // splashes near the camera (splash): world cells per side, m out from the camera
+const SPLASH_PIECES = 9, SPLASH_MIST = 3;  // per splash cell: pieces, of which the first are mist sprites (the rest droplets)
+const SPLASH_PARTICLES = SPLASH_GRID * SPLASH_GRID * SPLASH_PIECES;
+// the spray off the ground (rainSpray): 1/m per unit rain, and its layers' scale heights (m) and weights: the dense
+// carpet in the lowest 30 cm, a metre of mist over it, a thin veil some ten metres deep
+const SPRAY = 0.03, SPRAY_LAYERS = [[0.2, 3.8], [1.0, 1.0], [8.0, 0.2]];
+// beyond the splashes' mist sprites (splash), the carpet takes over their share: [scale height (m), weight]
+const SPRAY_MIST = [0.25, 2.4];
+const SPLASH_FADE = 0.4;            // the splashes and their mist fade out from this share of SPLASH_RADIUS to its end
 const STRUCT_FLOATS = 10;            // structure mesh vertex: position, normal, colour, material
 const GRID_N = 512;                 // terrain mesh vertices per side (inner part covers the heightfield, outer rings run to the horizon)
 const NOISE_SHAPE = 128;
@@ -733,7 +742,7 @@ const FRAME_LAYOUT = [
     ['zoneInfo', 'vec4f'],  // rain zones in rainZones, their fade (0 .. 1), their radius (m), a clear stretch's opening along the route (m)
     ['rainZones', `array<vec4f, ${MAX_RAIN_ZONES}>`], // points along the bus route (mixed rain): x, z, genus layer cover scale, precipitation scale
     ['zoneDirs', `array<vec4f, ${MAX_RAIN_ZONES / 2}>`], // the route's direction at them, two per vec4: x, z
-    ['drips', 'vec4f'],     // roof edges in dripEdges, -, -, -
+    ['drips', 'vec4f'],     // roof edges in dripEdges, first splash particle (after the rain and drip ones), -, -
     ['dripEdges', `array<vec4f, ${MAX_DRIPS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, edge height, drop to the ground] [share of drops up to this edge, edges (0 all four, 1 along local x), share of its drops kept, -]
     ['blockers', `array<vec4f, ${MAX_BLOCKERS * 3}>`], // [x, z, half x, half z] [cos yaw, sin yaw, bottom, top] [sky occlusion, slope, moving, enclosed]
     ['blockGrid', `array<vec4u, ${BLOCK_GRID * BLOCK_GRID}>`], // per cell of blockBox: bit k set if box k can shade a point in it
@@ -2009,6 +2018,7 @@ fn tiles(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 const WGSL_MARCH = /* wgsl */`
+const SPRAY = ${SPRAY.toFixed(4)};
 @group(1) @binding(0) var depthTex: texture_depth_2d;
 @group(1) @binding(1) var outColor: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var outDepth: texture_storage_2d<r32float, write>;
@@ -2096,6 +2106,34 @@ fn cloudLight(p: vec3f, mu: f32, dirY: f32, w: vec4f, lightSteps: i32, stepScale
     return F.sunCol.rgb * sun + amb + bounce + FLASH_COLOR * flashLit(p) * 0.05;
 }
 
+// The spray rain throws up where it hits the ground (rain extinction, 1/m, over the march step [ta, tb] of the ray from
+// ro along dir; p in it): the drops shatter into a mist that hangs over the wet ground in layers (SPRAY_LAYERS): a dense
+// carpet in the lowest 30 cm, a metre of mist over it, a thin veil some ten metres deep that the gusts lift. Seen along
+// the street it thickens into the whitish veil a downpour lays over everything at ground level. Each layer is
+// exponential over the terrain, integrated over the step's height range, so a long step that crosses the thin layers at
+// once still takes all of them. It scales with the rain reaching the ground below (precipEnvelope, so virga throws up
+// none) and the drops' size: drizzle hardly splashes. lift: how far the surface this ray ends on stands above the
+// terrain (paving, asphalt, decks laid over it), so the thin layers lie on that and not under it
+fn rainSpray(p: vec3f, ro: vec3f, dir: vec3f, ta: f32, tb: f32, w: vec4f, lift: f32) -> f32 {
+    let yLo = min(ro.y + dir.y * ta, ro.y + dir.y * tb);
+    if (yLo - terrainHeight(p.xz).x > ${SPRAY_LAYERS[2][0] * 6 + 40}.0) { return 0.0; }    // the mesh is within metres of it
+    let g = meshHeight(p.xz) + lift;
+    let hA = max(ro.y + dir.y * ta - g, 0.0);
+    let hB = max(ro.y + dir.y * tb - g, 0.0);
+    if (min(hA, hB) > ${SPRAY_LAYERS[2][0] * 6}.0) { return 0.0; }
+    let rate = precipEnvelope(vec3f(p.x, g + 1.0, p.z), w).x / max(F.precip.z, 1e-6);
+    if (rate <= 0.0) { return 0.0; }
+    let dh = hB - hA;
+    var sum = 0.0;
+    ${SPRAY_LAYERS.map(([H, k]) => `sum += ${k.toFixed(3)} * select(${H.toFixed(3)} * (exp(-hA / ${H.toFixed(3)}) - exp(-hB / ${H.toFixed(3)})) / dh, exp(-hA / ${H.toFixed(3)}), abs(dh) < 0.002);`).join('\n    ')}
+    // the splashes' mist sprites fade out between SPLASH_FADE and 1 x SPLASH_RADIUS from the camera: over the same distances
+    // a layer of their depth fades in, so the near mist and the far carpet meet without a step in brightness
+    let far = smoothstep(${SPLASH_RADIUS * SPLASH_FADE}.0, ${SPLASH_RADIUS}.0, length(p.xz - F.cam.xz));
+    sum += ${SPRAY_MIST[1].toFixed(3)} * far * select(${SPRAY_MIST[0].toFixed(3)} * (exp(-hA / ${SPRAY_MIST[0].toFixed(3)}) - exp(-hB / ${SPRAY_MIST[0].toFixed(3)})) / dh, exp(-hA / ${SPRAY_MIST[0].toFixed(3)}), abs(dh) < 0.002);
+    let drops = mix(0.15, 1.0, F.rain.x);
+    return SPRAY * rate * drops * sum * sat(rate * 2.0);
+}
+
 fn rayBox(ro: vec3f, rd: vec3f, lo: vec3f, hi: vec3f, t0: f32, t1: f32) -> bool {
     let inv = 1.0 / select(rd, vec3f(1e-6), abs(rd) < vec3f(1e-6));
     let a = (lo - ro) * inv;
@@ -2149,6 +2187,14 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
     let base = F.cloud.x;
 
     let sp = slabSpan(ro, dir, min(sceneT, F.march.z));
+    // the spray's layers lie on the drawn terrain (meshHeight), and on the paving and roads laid over it where this ray
+    // ends on them (rainSpray); eased out where it ends high on a wall or a roof
+    var lift = 0.0;
+    if (sceneT < 1e8) {
+        let e = ro + dir * sceneT;
+        let d = e.y - meshHeight(e.xz);
+        lift = d * (1.0 - smoothstep(0.8, 2.0, abs(d)));
+    }
     let t0 = sp.x;
     let t1 = sp.y;
 
@@ -2228,9 +2274,11 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                 if (froxels) { fx = froxelAt(p); } else { fx = vec3f(shadowAt(p), -1.0); }
                 let sh = fx.xy;
                 if (doPrecip) {
-                    var pd = precipDensity(p, precipSourceAt(p));
-                    if (sheltered && pd.x + pd.y > 0.0) { pd *= rainReaches(p); }
-                    if (pd.x + pd.y > 0.0) {
+                    let src = precipSourceAt(p);
+                    var pd = precipDensity(p, src);
+                    var sd = rainSpray(p, ro, dir, t0 + span * fa * fa, t0 + span * fb * fb, src, lift);
+                    if (sheltered && pd.x + pd.y + sd > 0.0) { let k = rainReaches(p); pd *= k; sd *= k; }
+                    if (pd.x + pd.y + sd > 0.0) {
                         // the diffuse light under the cloud: what the column lets through (sh.y), brighter looking up,
                         // and what the ground bounces up where the sun reaches it
                         // (deep in the rain), or with sky from the side near a shaft's edge seen from outside (side)
@@ -2238,11 +2286,13 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                         let amb = F.ambient.rgb * mix(deepAmb, 0.25 + 0.75 * sh.y, side) + F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.02 * sh.x;
                         S += pd.x * (F.sunCol.rgb * sh.x * rainPhase + amb * 0.85) * 0.9;
                         S += pd.y * (F.sunCol.rgb * sh.x * snowPhase * 0.6 + amb * 1.25) * 0.95;
+                        // the spray: fine droplets, lit from all round, whiter than the falling rain
+                        S += sd * sprayColor(sh);
                         var fl = fx.z;
                         if (fl < 0.0) { fl = flashLit(p); }
-                        S += (pd.x + pd.y) * FLASH_COLOR * fl * 0.05;
-                        sigma += pd.x + pd.y;
-                        medium += pd.x + pd.y;
+                        S += (pd.x + pd.y + sd) * FLASH_COLOR * fl * 0.05;
+                        sigma += pd.x + pd.y + sd;
+                        medium += pd.x + pd.y + sd;
                     }
                 }
                 if (doHaze) {
@@ -2356,6 +2406,90 @@ fn resolve(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 // ------------------------------------------------------------------------------------------ WGSL scene
+// needs F, heightTex, clampSamp: the terrain's height and normal at xz (beyond the heightfield it flattens to the base)
+const WGSL_TERRAIN = /* wgsl */`
+fn terrainHeight(xz: vec2f) -> vec4f {
+    let uv = (xz - F.tdomain.xy) / F.tdomain.z;
+    let s = textureSampleLevel(heightTex, clampSamp, uv, 0.0);
+    let out = max(max(abs(uv.x - 0.5), abs(uv.y - 0.5)) - 0.5, 0.0) * F.tdomain.z;
+    let k = exp(-out / 4000.0);
+    return vec4f(mix(F.misc.z, s.x, k), normalize(mix(vec3f(0.0, 1.0, 0.0), s.yzw, k * k * k)));
+}
+
+// the height of the terrain as drawn (vsTerrain), which between its vertices runs above or below terrainHeight (its
+// vertices sample it, its triangles do not): over the heightfield the grid is linear (gridWarp's inner part), each cell
+// two triangles split from vertex (i + 1, j) to (i, j + 1). Beyond it, the sampled height
+fn meshHeight(xz: vec2f) -> f32 {
+    let r0 = F.tdomain.z * 0.5;
+    let c = F.tdomain.xy + r0;
+    if (any(abs(xz - c) >= vec2f(r0))) { return terrainHeight(xz).x; }
+    let n = f32(${GRID_N - 1});
+    let g = ((xz - c) / r0 * 0.72 + 1.0) * 0.5 * n;
+    let i = floor(g);
+    let f = g - i;
+    let vert = (i / n * 2.0 - 1.0) / 0.72 * r0 + c;
+    let step = 2.0 / n / 0.72 * r0;
+    let hb = terrainHeight(vert + vec2f(step, 0.0)).x;
+    let hc = terrainHeight(vert + vec2f(0.0, step)).x;
+    if (f.x + f.y <= 1.0) {
+        let ha = terrainHeight(vert).x;
+        return ha + (hb - ha) * f.x + (hc - ha) * f.y;
+    }
+    let hd = terrainHeight(vert + vec2f(step)).x;
+    return hd + (hc - hd) * (1.0 - f.x) + (hb - hd) * (1.0 - f.y);
+}
+
+// The scene pass writes a rain surface code into the HDR target's alpha, for the splashes (splash): 0 where no rain lands
+// (sky, walls, glass, interiors, the buses, under roofs, snow), else the kind of surface, an integer, plus 0.45 x its
+// puddle (puddleAt). Kinds: 1 soaks the drops up (fields, grass, forest floor), 2 hard (paving, roofs, decks, metal,
+// rock), 3 asphalt, 4 open water
+// the light the spray off the ground scatters (the volumetric carpet, rainSpray, and the splashes' mist sprites, splash,
+// alike, so the one passes into the other unseen), under sh (shadowAt: sun, sky light left)
+fn sprayColor(sh: vec2f) -> vec3f { return F.ambient.rgb * (0.35 + 0.55 * sh.y) + F.sunCol.rgb * sh.x * 0.04; }
+
+fn rainKind(code: f32) -> f32 { return floor(code + 0.01); }
+fn rainPuddle(code: f32) -> f32 { return sat((code - floor(code + 0.01)) / 0.45); }
+
+// a pixel's footprint (m) on a surface at p with normal n, seen along v (towards the eye)
+fn pixelSize(p: vec3f, n: vec3f, v: vec3f) -> f32 {
+    return distance(F.cam.xyz, p) * 2.0 * length(F.up.xyz) / F.screen.y / max(abs(dot(n, v)), 0.15);
+}
+
+// standing water on asphalt and paving: puddles in its dips (two octaves of noise, more of them the wetter it is), 0..1
+fn puddleAt(xz: vec2f, wet: f32) -> f32 {
+    let n = vnoise2(xz / 2.3) * 0.65 + vnoise2(xz / 0.7 + 7.1) * 0.35;
+    return smoothstep(0.66 - 0.2 * wet, 0.70 - 0.2 * wet, n) * smoothstep(0.15, 0.45, wet);
+}
+
+// the rings rain drops make on standing water: each 0.3 m cell of three offset grids takes a drop now and then (more
+// often the harder it rains, rain 0..1) at a hashed spot, whose ring runs out to 8 cm as it fades. The slope of the
+// water (dh/dx, dh/dz). Where a pixel covers more than a centimetre or so (px, m) the ring widens with it, so it blurs
+// instead of aliasing, and further off it fades out
+fn rainRipples(xz: vec2f, px: f32, rain: f32) -> vec2f {
+    let fade = (1.0 - smoothstep(0.05, 0.12, px)) * sat(rain * 3.0);
+    let w2 = 1.0 / pow(max(0.011, px * 0.6), 2.0);
+    let k = 6.2832 / max(0.024, px * 2.0);
+    if (fade <= 0.0) { return vec2f(0.0); }
+    var g = vec2f(0.0);
+    for (var l = 0; l < 3; l++) {
+        let q = xz / 0.3 + vec2f(0.37, 0.71) * f32(l);
+        let cell = floor(q);
+        let seed = cell + f32(l) * 17.3;
+        let cyc = F.cam.w * 1.1 + hash12(seed);
+        let k = floor(cyc);
+        let ph = fract(cyc);
+        if (hash12(seed + k * 3.7) > 0.25 + 0.75 * sat(rain)) { continue; }
+        let c = cell + 0.3 + 0.4 * vec2f(hash12(seed + k * 1.3 + 5.0), hash12(seed + k * 2.9 + 9.0));
+        let dv = (q - c) * 0.3;
+        let d = length(dv);
+        let x = d - ph * 0.08;
+        let env = (1.0 - ph) * (1.0 - ph) * exp(-x * x * w2) * smoothstep(0.0, 0.05, ph);
+        g += dv / max(d, 1e-4) * cos(x * k) * env;
+    }
+    return g * fade * 0.45;
+}
+`;
+
 const WGSL_SCENE = /* wgsl */`
 struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
 
@@ -2371,7 +2505,7 @@ struct SkyOut { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
     let d = rayDir(i.ndc);
     var c = skyColor(d);
     c += F.sunCol.rgb * 30.0 * smoothstep(0.99990, 0.99996, dot(d, F.sunDir.xyz));
-    return vec4f(c, 1.0);
+    return vec4f(c, 0.0);
 }
 
 // geometric grid: linear over the heightfield, then rings growing out to the horizon
@@ -2381,14 +2515,6 @@ fn gridWarp(u: f32) -> f32 {
     let inner = 0.72;
     let r = select(r0 * exp((a - inner) / (1.0 - inner) * log(260000.0 / r0)), a / inner * r0, a < inner);
     return sign(u) * r;
-}
-
-fn terrainHeight(xz: vec2f) -> vec4f {
-    let uv = (xz - F.tdomain.xy) / F.tdomain.z;
-    let s = textureSampleLevel(heightTex, clampSamp, uv, 0.0);
-    let out = max(max(abs(uv.x - 0.5), abs(uv.y - 0.5)) - 0.5, 0.0) * F.tdomain.z;
-    let k = exp(-out / 4000.0);
-    return vec4f(mix(F.misc.z, s.x, k), normalize(mix(vec3f(0.0, 1.0, 0.0), s.yzw, k * k * k)));
 }
 
 struct TerrOut { @builtin(position) pos: vec4f, @location(0) world: vec3f };
@@ -2489,16 +2615,26 @@ fn townColor(xz: vec2f, px: f32) -> vec3f {
     let wet = gs.y * (1.0 - snow) * sl.y;
     alb = mix(alb * (1.0 - 0.45 * wet), vec3f(0.85, 0.88, 0.92), snow);
     let water = land.z;
+    // the town's paving puddles; rain rings on the puddles, on open water, faintly on the wet film elsewhere
+    let paved = sat(land.x * 1.6 - 0.4) * (1.0 - wild);
+    let puddle = puddleAt(p.xz, wet) * paved * (1.0 - water) * smoothstep(0.97, 0.995, n.y);
+    let pool = max(water, puddle);
+    let rainNow = sat(F.near.x * 1.5) * sl.y * (1.0 - snow);
+    let rg = rainRipples(p.xz, px, rainNow) * max(pool, 0.25 * wet * paved);
+    let nw = normalize(vec3f(-rg.x, 1.0, -rg.y));
+    alb *= 1.0 - 0.4 * puddle;
 
     let v = normalize(F.cam.xyz - p);
     var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + FLASH_COLOR * flashLit(p) * 0.03);
     // wet ground and open water reflect the sky
-    let r = reflect(-v, vec3f(0.0, 1.0, 0.0));
-    let fres = 0.02 + 0.98 * pow(1.0 - max(v.y, 0.0), 5.0);
+    let r = reflect(-v, nw);
+    let fres = 0.02 + 0.98 * pow(1.0 - max(dot(nw, v), 0.0), 5.0);
     let spec = skyColor(r) * sh.y + F.sunCol.rgb * sh.x * pow(max(dot(r, s), 0.0), 400.0) * 4.0;
-    col = mix(col, vec3f(0.01, 0.02, 0.025) * F.ambient.rgb + spec * fres, water);
-    col += spec * fres * wet * 0.35 * (1.0 - water);
-    return vec4f(col, 1.0);
+    col = mix(col, vec3f(0.01, 0.02, 0.025) * F.ambient.rgb + spec * fres, pool);
+    col += spec * fres * wet * 0.35 * (1.0 - pool);
+    col += skyColor(r) * sh.y * length(rg) * 1.5;                         // the rings catch the sky at any angle
+    let kind = select(select(select(1.0, 2.0, rock * wild > 0.5), 3.0, paved > 0.5), 4.0, water > 0.5);
+    return vec4f(col, select(0.0, kind + 0.45 * puddle, rainNow > 0.0 && n.y > 0.7));
 }
 
 // structures (houses, bus stop, bridges, roads): flat-shaded triangles, colour per vertex and a material
@@ -2514,7 +2650,7 @@ struct StructOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @lo
     return o;
 }
 
-@fragment fn fsStruct(i: StructOut) -> @location(0) vec4f { return vec4f(shadeStruct(i.world, i.n, i.col.rgb, i32(i.col.a + 0.5)), 1.0); }
+@fragment fn fsStruct(i: StructOut) -> @location(0) vec4f { return shadeStruct(i.world, i.n, i.col.rgb, i32(i.col.a + 0.5)); }
 
 // a moving bus (BusLine): its mesh is in its own frame (busVertex), drawn with busU.mvp
 @vertex fn vsBus(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec4f) -> StructOut {
@@ -2578,9 +2714,9 @@ fn shadeCabin(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
 @fragment fn fsBus(i: StructOut) -> @location(0) vec4f {
     let m = u32(i.col.a + 0.5);
     let mat = i32(m & 7u);
-    if (mat == 7) { return vec4f(i.col.rgb * 1.6 / max(F.sunCol.w, 0.2), 1.0); }   // lamps, lights, the destination display
-    if ((m & ${BUS_IN}u) != 0u) { return vec4f(shadeCabin(i.world, i.n, i.col.rgb, mat), 1.0); }
-    return vec4f(shadeStruct(i.world, i.n, i.col.rgb, mat), 1.0);
+    if (mat == 7) { return vec4f(i.col.rgb * 1.6 / max(F.sunCol.w, 0.2), 0.0); }   // lamps, lights, the destination display
+    if ((m & ${BUS_IN}u) != 0u) { return vec4f(shadeCabin(i.world, i.n, i.col.rgb, mat), 0.0); }
+    return vec4f(shadeStruct(i.world, i.n, i.col.rgb, mat).rgb, 0.0);          // no splashes on a moving bus
 }
 
 // inside building id (WGSL_BUILDING): no weather; sky light that comes in through the windows (more near the outer walls
@@ -2622,7 +2758,7 @@ fn shadeInterior(p: vec3f, nIn: vec3f, colIn: vec3f, mat: u32, id: u32) -> vec3f
 // a building's interior (drawn within INTERIOR_DRAW of it): walls' inner faces, floors, stairs, furniture, lamps
 @fragment fn fsInterior(i: StructOut) -> @location(0) vec4f {
     let m = u32(i.col.a + 0.5);
-    return vec4f(shadeInterior(i.world, i.n, i.col.rgb, m & 7u, m / ${BLD_ID}u), 1.0);
+    return vec4f(shadeInterior(i.world, i.n, i.col.rgb, m & 7u, m / ${BLD_ID}u), 0.0);
 }
 
 // a door leaf, open or shut: lit as the interior on its inner side, by the weather on its outer one
@@ -2633,8 +2769,8 @@ fn shadeInterior(p: vec3f, nIn: vec3f, colIn: vec3f, mat: u32, id: u32) -> vec3f
     var n = normalize(i.n);
     if (dot(n, F.cam.xyz - i.world) < 0.0) { n = -n; }
     let q = bldLocal(b, i.world + n * 0.03);
-    if (abs(q.x) < b.b.x - b.d.y + 0.01 && abs(q.z) < b.b.y - b.d.y + 0.01) { return vec4f(shadeInterior(i.world, n, i.col.rgb, m & 7u, id), 1.0); }
-    return vec4f(shadeStruct(i.world, n, i.col.rgb, i32(m & 7u)), 1.0);
+    if (abs(q.x) < b.b.x - b.d.y + 0.01 && abs(q.z) < b.b.y - b.d.y + 0.01) { return vec4f(shadeInterior(i.world, n, i.col.rgb, m & 7u, id), 0.0); }
+    return vec4f(shadeStruct(i.world, n, i.col.rgb, i32(m & 7u)).rgb, 0.0);
 }
 
 // a window seen from beyond INTERIOR_DRAW (its interior and its glass are not drawn there): an opaque pane that reflects
@@ -2643,11 +2779,12 @@ fn shadeInterior(p: vec3f, nIn: vec3f, colIn: vec3f, mat: u32, id: u32) -> vec3f
     let id = u32(i.col.a + 0.5) / ${BLD_ID}u;
     let b = bld(id);
     if (distance(F.cam.xyz, bldCentre(b)) < ${INTERIOR_DRAW}.0) { discard; }
-    return vec4f(shadeStruct(i.world, i.n, i.col.rgb, 5) + windowGlow(id, b, i.world.y), 1.0);
+    return vec4f(shadeStruct(i.world, i.n, i.col.rgb, 5).rgb + windowGlow(id, b, i.world.y), 0.0);
 }
 
-// a structure surface lit by the sky and the sun, under the cloud shadow, wet or snowy where the weather reaches it
-fn shadeStruct(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
+// a structure surface lit by the sky and the sun, under the cloud shadow, wet or snowy where the weather reaches it; alpha
+// the rain surface code (WGSL_TERRAIN)
+fn shadeStruct(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec4f {
     let v = normalize(F.cam.xyz - p);
     var n = normalize(nIn);
     if (dot(n, v) < 0.0) { n = -n; }                                  // thin panels are seen from both sides
@@ -2658,32 +2795,43 @@ fn shadeStruct(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec3f {
     let sl = structureLight(p + n * 0.06, sh.x * dot(n, s) > 0.002, gs.x + gs.y > 0.002 && mat != 6);
     let snow = sat(gs.x * 3.0) * smoothstep(0.55, 0.85, n.y) * sl.y * select(1.0, 0.0, mat == 6);
     let wet = gs.y * sl.y * (0.35 + 0.65 * sat(n.y)) * (1.0 - snow);
-    var alb = colIn * (0.9 + 0.2 * vnoise2(vec2f(p.x + p.z, p.y) * 1.7 + n.xz * 13.0));
     let glass = mat == 2 || mat == 5;
-    if (!glass) { alb *= 1.0 - select(0.35, 0.55, mat == 3) * wet; }
+    // puddles on flat asphalt (and fewer on paving); rain rings on them, on open water, faintly on the wet film
+    let flat = smoothstep(0.97, 0.995, n.y);
+    let rainNow = sat(F.near.x * 1.5) * sl.y * (1.0 - snow);
+    let puddle = puddleAt(p.xz, wet) * flat * select(select(0.0, 0.5, mat == 0), 1.0, mat == 3);
+    let pool = select(puddle, 1.0, mat == 6);
+    var rg = vec2f(0.0);
+    if (!glass && rainNow > 0.0) { rg = rainRipples(p.xz, pixelSize(p, n, v), rainNow) * max(pool, 0.25 * wet * flat); }
+    let nr = normalize(n + vec3f(-rg.x, 0.0, -rg.y));
+    var alb = colIn * (0.9 + 0.2 * vnoise2(vec2f(p.x + p.z, p.y) * 1.7 + n.xz * 13.0));
+    if (!glass) { alb *= (1.0 - select(0.35, 0.55, mat == 3) * wet) * (1.0 - 0.4 * puddle); }
     alb = mix(alb, vec3f(0.85, 0.88, 0.92), snow);
     // sky light from above, and light the ground bounces up into eaves, roof and deck undersides
     let bounce = (F.ambient.rgb * sh.y * 0.25 + F.sunCol.rgb * max(s.y, 0.0) * sh.x * 0.06) * sat(-n.y);
     var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + bounce + FLASH_COLOR * flashLit(p) * 0.03);
     // glass, metal and wet surfaces reflect the sky
-    let r = reflect(-v, n);
-    let fres = 0.04 + 0.96 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+    let r = reflect(-v, nr);
+    let fres = 0.04 + 0.96 * pow(1.0 - max(dot(nr, v), 0.0), 5.0);
     let spec = skyColor(r) * sh.y * sl.z + F.sunCol.rgb * sh.x * sl.x * pow(max(dot(r, s), 0.0), 300.0) * 4.0;
     var gloss = select(select(select(0.0, 0.04, mat == 1), 0.12, mat == 4), 0.8, glass);
     gloss = max(gloss, wet * select(0.3, 0.5, mat == 3));
-    col += spec * fres * gloss;
+    gloss = mix(gloss, 1.0, puddle);
+    col += spec * fres * gloss + skyColor(r) * sh.y * sl.z * length(rg) * 1.5;   // the rings catch the sky at any angle
     if (mat == 6) {                                                     // open water, as on the terrain
-        let fw = 0.02 + 0.98 * pow(1.0 - max(v.y, 0.0), 5.0);
+        let fw = 0.02 + 0.98 * pow(1.0 - max(dot(nr, v), 0.0), 5.0);
         col = vec3f(0.01, 0.02, 0.025) * F.ambient.rgb * sl.z + spec * fw;
     }
-    return col;
+    let kind = select(select(2.0, 3.0, mat == 3), 4.0, mat == 6);
+    return vec4f(col, select(0.0, kind + 0.45 * puddle, rainNow > 0.0 && n.y > 0.7 && !glass));
 }
 `;
 
 // ------------------------------------------------------------------------------------------ WGSL final
 const WGSL_FINAL = /* wgsl */`
 @group(1) @binding(0) var cloudTex: texture_2d<f32>;
-@group(1) @binding(1) var hdrTex: texture_2d<f32>;
+@group(1) @binding(1) var hdrTex: texture_2d<f32>;                 // alpha: the rain surface code (WGSL_TERRAIN)
+@group(1) @binding(2) var depthTex: texture_depth_2d;              // read-only in the final pass (the splashes look at it)
 
 struct FsIn { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
@@ -2840,13 +2988,122 @@ fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
     (*o).uv.x = 0.0;
 }
 
+// rain hitting the ground, roofs and decks near the camera. The splashes sit on a world grid of SPLASH_GRID^2 cells
+// around the camera, snapped to the cells, so they stay put as the view turns: each cell takes a drop every life
+// seconds at a hashed spot, and piece k of the splash particles is one of the SPLASH_PIECES droplets it throws up, or
+// (the first SPLASH_MIST) a puff of the mist the splashes leave, which lingers longer: a soft sprite standing on the
+// surface, densest at the bottom, so that many of them overlap into the smooth bright band at ground level. The
+// spot is aimed at the terrain or the highest box top over it, then moved onto the surface the eye sees along the line
+// to it (the depth buffer: the asphalt and paving laid over the terrain, kerbs, decks; nothing when a wall or a bus is
+// in the way), and splashes as that surface does (its rain surface code, WGSL_TERRAIN, which is 0 where no rain lands):
+// fields and grass soak most drops up, hard ground and asphalt throw a crown, puddles and open water a low wide crown
+// and a jet straight up out of the crater. Big drops splash high and wide, drizzle hardly at all
+fn splash(k: u32, vi: u32, o: ptr<function, LineOut>) {
+    let rain = F.near.x;
+    let size = F.rain.x;
+    if (rain <= 0.02) { return; }
+    let slot = k / ${SPLASH_PIECES}u;
+    let piece = k % ${SPLASH_PIECES}u;
+    let cs = ${(SPLASH_RADIUS * 2 / SPLASH_GRID).toFixed(5)};
+    let cell = floor(F.cam.xz / cs) - ${SPLASH_GRID / 2}.0 + vec2f(f32(slot % ${SPLASH_GRID}u), f32(slot / ${SPLASH_GRID}u));
+    let cid = (u32(i32(cell.x) + 0x20000000) * 73856093u) ^ (u32(i32(cell.y) + 0x20000000) * 19349663u);
+    let mist = piece < ${SPLASH_MIST}u;
+    // the droplets share their splash's cycle; each mist puff has its own, longer one
+    let life = select(mix(0.25, 0.4, size), 1.4, mist);
+    let salt = select(0u, 0x9e3779b9u * (piece + 1u), mist);
+    let cyc = F.cam.w / life + rnd(cid ^ salt);
+    let ph = fract(cyc);
+    let id = pcg(cid ^ salt ^ (u32(floor(cyc)) * 83492791u));
+    if (rnd(id + 7u) > sat(rain * 1.2) * mix(0.5, 1.0, size)) { return; }
+    let xz = (cell + vec2f(rnd(id), rnd(id + 1u))) * cs;
+    if (distance(xz, F.cam.xz) > ${SPLASH_RADIUS}.0) { return; }
+    var p = vec3f(xz.x, meshHeight(xz), xz.y);
+    if (nearStructures(p)) {
+        let top = vec3f(p.x, F.blocks.z + 1.0, p.z);
+        let m = blockCell(p);
+        for (var w = 0u; w < 4u; w++) {
+            var bits = m[w];
+            while (bits != 0u) {
+                let b = i32(w * 32u + countTrailingZeros(bits));
+                bits &= bits - 1u;
+                let s = blockerSpan(b, top, vec3f(0.0, -1.0, 0.0));
+                if (s.x <= s.y && s.y > 0.0) { p.y = max(p.y, top.y - max(s.x, 0.0)); }
+            }
+        }
+    }
+    // the surface seen along the line to it (which does not turn with the view)
+    let c0 = F.viewProj * vec4f(p, 1.0);
+    if (c0.w < 0.3) { return; }
+    let ndc = c0.xy / c0.w;
+    if (any(abs(ndc) > vec2f(1.0))) { return; }
+    let pix = vec2i(min((ndc * vec2f(0.5, -0.5) + 0.5) * F.screen.xy, F.screen.xy - 1.0));
+    let z = textureLoad(depthTex, pix, 0);
+    let code = textureLoad(hdrTex, pix, 0).a;
+    let kind = rainKind(code);
+    if (z <= 0.0 || kind < 0.5) { return; }
+    let dir = normalize(p - F.cam.xyz);
+    let sp = F.cam.xyz + dir * (F.fwd.w / z / dot(dir, F.fwd.xyz));
+    if (abs(sp.y - p.y) > 0.6) { return; }
+    let soak = kind < 1.5;
+    if (soak && rnd(id + 8u) > select(0.3, 0.5, mist)) { return; }
+    let pool = max(rainPuddle(code), select(0.0, 1.0, kind > 3.5));
+    let lightc = sprayColor(shadowAt(sp));
+    if (mist) {
+        // a billboard turned to the eye about the vertical (so it does not turn with the view), its foot a little
+        // below the surface so it meets it softly; it swells and rises a little through its life, and fades in and out
+        let toEye = sp.xz - F.cam.xz;
+        let side = normalize(vec3f(-toEye.y, 0.0, toEye.x) + vec3f(1e-5, 0.0, 0.0));
+        let wide = mix(0.5, 1.2, size) * (0.7 + 0.6 * rnd(id + 40u)) * (0.6 + 0.4 * ph);
+        let tall = mix(0.15, 0.35, size) * (0.7 + 0.6 * rnd(id + 41u)) * (0.7 + 0.5 * ph);
+        var ends = array<f32, 6>(0.0, 1.0, 0.0, 0.0, 1.0, 1.0);
+        var sides = array<f32, 6>(-1.0, -1.0, 1.0, 1.0, -1.0, 1.0);
+        let e = ends[vi];
+        let sd = sides[vi];
+        let wp = sp + side * sd * wide * 0.5 + vec3f(0.0, e * (tall + 0.1) - 0.1, 0.0);
+        let dm = distance(sp, F.cam.xyz);
+        (*o).pos = F.viewProj * vec4f(wp, 1.0);
+        let fadeM = smoothstep(1.0, 3.0, dm) * (1.0 - smoothstep(${SPLASH_RADIUS * SPLASH_FADE}.0, ${SPLASH_RADIUS}.0, distance(sp.xz, F.cam.xz))) * sat(rain * 1.5);
+        let soakM = select(1.0, 0.5, soak);
+        (*o).col = vec4f(lightc, 0.11 * sin(3.1416 * ph) * fadeM * soakM * mix(0.45, 1.0, size));
+        (*o).uv = vec2f(2.0 + e, sd);
+        return;
+    }
+    // a droplet: free flight from the impact, gone when it lands again
+    let jet = piece == 0u && pool > 0.5;
+    var up = mix(0.4, 1.4, size) * (0.6 + 0.6 * rnd(id + 10u + piece));
+    var out = mix(0.15, 0.7, size) * (0.5 + rnd(id + 20u + piece));
+    if (soak) { up *= 0.45; out *= 0.5; }
+    if (jet) { up = mix(0.5, 1.2, size) * (0.8 + 0.4 * rnd(id + 11u)); out = 0.02; }
+    else if (pool > 0.5) { up *= 0.6; out *= 1.3; }
+    let az = rnd(id + 30u + piece) * 6.2832;
+    let v0 = vec3f(cos(az) * out, up, sin(az) * out);
+    let ts = ph * life;
+    let tLand = 2.0 * up / 9.81;
+    if (ts > tLand) { return; }
+    let q = sp + v0 * ts - vec3f(0.0, 4.905, 0.0) * ts * ts;
+    let vel = v0 - vec3f(0.0, 9.81, 0.0) * ts;
+    let a = F.viewProj * vec4f(q, 1.0);
+    let b = F.viewProj * vec4f(q - vel * 0.02, 1.0);
+    if (a.w < 0.3 || b.w < 0.3) { return; }
+    let dist = distance(q, F.cam.xyz);
+    let focal = F.screen.y * 0.5 / length(F.up.xyz);
+    let wpx = 0.003 * focal / a.w;
+    lineQuad(a, b, clamp(wpx, 1.0, 3.5), vi, o);
+    // clear water: it shows the light around it, brighter than the dark wet ground; a sub-pixel droplet covers less
+    // than the line it is drawn as
+    let fade = sat(dist / 0.5) * (1.0 - smoothstep(${SPLASH_RADIUS * SPLASH_FADE}.0, ${SPLASH_RADIUS}.0, dist)) * sat(rain * 2.0);
+    (*o).col = vec4f(lightc * 1.3, 0.6 * fade * sat(wpx + 0.4) * (1.0 - smoothstep(0.7, 1.0, ts / tLand)));
+    (*o).uv.x = 0.0;
+}
+
 // near-field precipitation: drops and flakes in a box that wraps around the camera. The drops' size (F.rain.x) sets how
 // they look: drizzle is a dense, slow mist of fine droplets in a small box, a downpour long, heavy, fast streaks.
-// Instances from F.rain.w on are drops running off roof edges (drip).
+// Instances from F.rain.w on are drops running off roof edges (drip), from F.drips.y on splashes (splash).
 @vertex fn vsPrecip(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> LineOut {
     var o: LineOut;
     o.pos = vec4f(0.0, 0.0, -2.0, 1.0);
     o.col = vec4f(0.0);
+    if (f32(ii) >= F.drips.y) { splash(ii - u32(F.drips.y), vi, &o); return o; }
     if (f32(ii) >= F.rain.w) { drip(ii - u32(F.rain.w), vi, &o); return o; }
     let total = F.near.x + F.near.y;
     let size = F.rain.x;
@@ -2904,7 +3161,16 @@ fn drip(k: u32, vi: u32, o: ptr<function, LineOut>) {
 
 @fragment fn fsPrecip(i: LineOut) -> @location(0) vec4f {
     let across = 1.0 - abs(i.uv.y);
-    let a = select(i.col.w * across, i.col.w * smoothstep(0.0, 0.6, across), i.uv.x > 0.5);
+    var a = select(i.col.w * across, i.col.w * smoothstep(0.0, 0.6, across), i.uv.x > 0.5);
+    // a splash's mist (uv.x 2 + height up it, uv.y across): a Gaussian across, densest at its foot, thinning upwards.
+    // A soft particle: it fades out as it nears the surface behind it (the depth buffer), so where it meets the ground
+    // it leaves no edge
+    if (i.uv.x > 1.5) {
+        let h = i.uv.x - 2.0;
+        let zs = textureLoad(depthTex, vec2i(i.pos.xy), 0);
+        let gap = select(1e3, F.fwd.w / zs, zs > 0.0) - F.fwd.w / i.pos.z;
+        a = i.col.w * max(exp(-i.uv.y * i.uv.y * 3.0) - 0.05, 0.0) * (1.0 - h) * (1.0 - h) * smoothstep(0.0, 0.35, gap);
+    }
     return vec4f(tonemap(i.col.rgb), a);
 }
 
@@ -5368,7 +5634,7 @@ class CloudPass {
         this.resolveIO = makeLayout(d, C, ['tex', 'tex:unfilterable-float', 'tex', 'write:rgba16float']);
         const rSet = new BindingSet(d, ['F', 'clampSamp']);
         this.pMarch = computePipeline(d, 'march', [r.worldSet.layout, this.marchOut],
-            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_SKIP_SAMPLE, WGSL_SHELTER, WGSL_MARCH), 'march');
+            shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SHADOW_SAMPLE, WGSL_SKIP_SAMPLE, WGSL_SHELTER, WGSL_TERRAIN, WGSL_MARCH), 'march');
         this.tileOut = makeLayout(d, C, ['write:rg32uint']);
         this.pTiles = computePipeline(d, 'tiles', [r.worldSet.layout, this.tileOut],
             shaderSource(r.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_DENSITY, WGSL_SKIP_SAMPLE, WGSL_TILES), 'tiles');
@@ -5513,9 +5779,9 @@ class Renderer {
 
     createPipelines() {
         const d = this.device;
-        this.screenLayout = makeLayout(d, GPUShaderStage.FRAGMENT, ['tex', 'tex']);
-        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, wgslBus(1), WGSL_SCENE) });
-        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, wgslBus(2), WGSL_FINAL) });
+        this.screenLayout = makeLayout(d, GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, ['tex', 'tex', 'depth']);
+        const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, WGSL_TERRAIN, wgslBus(1), WGSL_SCENE) });
+        const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, WGSL_TERRAIN, wgslBus(2), WGSL_FINAL) });
         const layoutA = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout] });
         const layoutB = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout, this.screenLayout] });
         // one bus's uniforms (wgslBus), at a dynamic offset per bus: group 1 in the scene pass, group 2 in the final one
@@ -5621,7 +5887,7 @@ class Renderer {
         this.hdrView = this.hdr.createView();
         this.depthView = this.depth.createView();
         this.cloudPass.resize(Math.max(1, Math.ceil(w * scale)), Math.max(1, Math.ceil(h * scale)), this.depthView);
-        this.screenGroups = this.cloudPass.histViews.map((hv, k) => makeGroup(this.device, this.screenLayout, [hv, this.hdrView], `screen-${k}`));
+        this.screenGroups = this.cloudPass.histViews.map((hv, k) => makeGroup(this.device, this.screenLayout, [hv, this.hdrView, this.depthView], `screen-${k}`));
         return true;
     }
 
@@ -6378,6 +6644,8 @@ class App {
         F.set('rain', [drops, rainFall(drops), c.rain, this.rainParticles]);
         w.rainZones.write(F);
         this.drips = w.structures.write(F, cam.pos, sky.dir, c.wind, w.weather.freezingLevel, rainFall(drops));
+        this.splashStart = this.rainParticles + (this.drips && this.near.rain > 0.02 ? DRIP_PARTICLES : 0);
+        F.set('drips', [this.splashStart], 1);
         F.set('misc', [c.temperature, this.time * cfg.fallSpeed % 52000, f.base, wdt]);
         w.lightning.write(F);
 
@@ -6450,7 +6718,7 @@ class App {
         this.writeFrame(dt, wdt);
         const enc = r.device.createCommandEncoder();
         const total = this.near.rain + this.near.snow;
-        const particles = total > 0.005 ? this.rainParticles + (this.drips && this.near.rain > 0.02 ? DRIP_PARTICLES : 0) : 0;
+        const particles = total > 0.005 ? this.splashStart + (this.near.rain > 0.02 ? SPLASH_PARTICLES : 0) : 0;
         r.render(enc, this.probeTexel, particles, w.lightning.count, QUALITY[this.quality].interleave, this.shadowSlices, this.froxels, this.mode !== 1, this.tiles);
         r.device.queue.submit([enc.finish()]);
         r.weatherPass.afterSubmit();
