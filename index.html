@@ -317,8 +317,8 @@ const CELL_FLOATS = 16;
 const MAX_LAYERS = 4;
 const MAX_MOTHERSHIPS = 4;           // analytic storm structures (see mothershipDensity / shelfLineDensity)
 const MAX_SHELVES = 2;                // stratiform / cellular cloud genera besides the convective layer
-const MAX_FLASHES = 4;
-const MAX_BOLT_SEGS = 256;
+const MAX_FLASHES = 6;
+const MAX_BOLT_SEGS = 768;
 const MAX_BLOCKERS = 128;            // structure boxes in the frame uniform (sun and rain shadows, see WGSL_SHELTER)
 const BLOCK_GRID = 32;               // cells per side over their bounds, each listing the boxes that can shade it (4 x 32 bits)
 const BLOCK_RANGE = 2500;            // only boxes this close to the camera (m) go into the frame, so the grid stays fine
@@ -714,7 +714,7 @@ const FRAME_LAYOUT = [
     ['sunCol', 'vec4f'],    // rgb irradiance, exposure
     ['zenith', 'vec4f'],    // rgb sky radiance, haze extinction at the ground (1/m)
     ['horizon', 'vec4f'],   // rgb sky radiance, haze scale height (m)
-    ['ambient', 'vec4f'],   // rgb sky ambient, -
+    ['ambient', 'vec4f'],   // rgb sky ambient, lightning veil (a flash close by floods the view)
     ['screen', 'vec4f'],    // full w, h, volumetric w, h
     ['cloud', 'vec4f'],     // base, layer top, extinction (1/m), coverage
     ['noise', 'vec4f'],     // shape scale, detail scale, detail strength, slab top
@@ -2911,6 +2911,9 @@ fn cloudAt(uv: vec2f) -> vec4f {
     let c = cloudAt(i.uv);
     var col = hdr * c.a + c.rgb;
     if (i32(F.ground.w) == 1) { col = hdr; }
+    // a flash close by lights everything up and floods the eye: the dark storm scene goes near white for an instant
+    let fv = F.ambient.w;
+    col = col * (1.0 + 3.0 * fv) + FLASH_COLOR * fv * 1.5 / max(F.sunCol.w, 0.2);
     var o = tonemap(col);
     if (F.march.w > 0.5) { o = radar(i.pos.xy, o); }
     return vec4f(o, 1.0);
@@ -5313,17 +5316,64 @@ class Lightning {
         this.flashes = [];
         this.segs = new Float32Array(MAX_BOLT_SEGS * 8);
         this.count = 0;
+        this.nearClock = 0;
+        this.onStrike = null;            // f => (the App plays its thunder)
     }
 
-    strike(cell, forceBolt = false) {
+    // at [x, z] (else somewhere in the cell's core)
+    strike(cell, forceBolt = false, at = null) {
         if (this.flashes.length >= MAX_FLASHES) this.flashes.shift();
         const s = cell.state, w = cell.world.weather.cur, ang = Math.random() * Math.PI * 2, r = s.radius * 0.35 * Math.sqrt(Math.random());
-        const x = cell.pos[0] + Math.cos(ang) * r, z = cell.pos[1] + Math.sin(ang) * r;
+        const x = at ? at[0] : cell.pos[0] + Math.cos(ang) * r, z = at ? at[1] : cell.pos[1] + Math.sin(ang) * r;
         const y = lerp(w.base + 800, s.top * 0.75, Math.random());
         const f = { pos: [x, y, z], age: 0, dur: 0.35 + Math.random() * 0.5, peak: 25 + Math.random() * 35, seed: Math.random() * 100, bolt: null };
         if (forceBolt || Math.random() < 0.35) f.bolt = this.makeBolt([x, w.base + 150, z], cell.world.field);
         this.flashes.push(f);
         cell.world.flashCount++;
+        if (this.onStrike) this.onStrike(f);
+    }
+
+    // more strikes around the camera when it is under or beside a mature storm: the nearer, the more often, and
+    // mostly cloud-to-ground; each lands within 5 km of the camera, pulled in under the storm
+    around(world, cam, dt) {
+        const wl = world.weather.cur.lightning;
+        if (!(wl > 0)) return;
+        let rate = 0, best = null, bestP = 0;
+        for (const c of world.storms) {
+            const L = c.def.lightning || 0;
+            if (!L || !c.mature || c.state.precip < 0.15) continue;
+            const reach = c.state.radius * 1.3 + 3000, d = Math.hypot(c.pos[0] - cam[0], c.pos[1] - cam[2]);
+            if (d >= reach) continue;
+            const prox = 1 - d / reach;
+            rate += L * wl / 60 * 1.5 * prox;
+            if (prox > bestP) { bestP = prox; best = c; }
+        }
+        if (!best) { this.nearClock = 0; return; }
+        this.nearClock -= dt;
+        if (this.nearClock > 0) return;
+        this.nearClock = -Math.log(1 - Math.random() * 0.999) / rate;
+        const ang = Math.random() * Math.PI * 2, r = 250 + 4750 * Math.pow(Math.random(), 1.5);
+        let x = cam[0] + Math.cos(ang) * r, z = cam[2] + Math.sin(ang) * r;
+        const R = best.state.radius * 0.8, dx = x - best.pos[0], dz = z - best.pos[1], dl = Math.hypot(dx, dz);
+        if (dl > R) { x = best.pos[0] + dx * R / dl; z = best.pos[1] + dz * R / dl; }
+        this.strike(best, Math.random() < 0.7, [x, z]);
+    }
+
+    // nearest and farthest point of a flash (its channel, for a bolt) from p
+    reach(f, p) {
+        let lo = v3.len(v3.sub(f.pos, p)), hi = lo;
+        if (f.bolt) for (const [a, c] of f.bolt) for (const q of [a, c]) { const d = v3.len(v3.sub(q, p)); lo = Math.min(lo, d); hi = Math.max(hi, d); }
+        return [lo, hi];
+    }
+
+    // how much the flashes near p flood the view (0 far away, ~1 for a strike a few hundred metres off)
+    veil(p) {
+        let v = 0;
+        for (const f of this.flashes) {
+            const d = this.reach(f, p)[0] / 1200;
+            v += this.level(f) / 40 * (f.bolt ? 1 : 0.6) / (1 + d * d);
+        }
+        return Math.min(v, 1.5);
     }
 
     // jagged path from the cloud base to the ground, with a few branches
@@ -5385,6 +5435,187 @@ class Lightning {
     }
 
     get brightness() { return this.flashes.reduce((s, f) => s + this.level(f), 0); }
+}
+
+// ------------------------------------------------------------------------------------------------- sound
+// Everything synthesised with WebAudio from two noise buffers (white, brown): beds that follow the scene (rain in the
+// open, muffled indoors or drumming on a shelter, snow, wind, the engine of the nearest bus) and one-shots (thunder,
+// which arrives distance / 343 m/s after its flash, a crack for a strike close by, bus doors, building doors,
+// footsteps). Browsers allow no sound before a click or key, so the context starts on the first; U turns it off / on.
+const SOUND_SPEED = 343;
+class Sound {
+    constructor() {
+        this.ctx = null;
+        this.on = true;
+        this.stepDist = 0;
+        this.busDoors = new Map();
+    }
+
+    start() {
+        if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        const ctx = this.ctx = new AC(), sr = ctx.sampleRate, n = sr * 6;
+        this.master = ctx.createGain();
+        this.master.gain.value = this.on ? 0.9 : 0;
+        const comp = ctx.createDynamicsCompressor();
+        comp.threshold.value = -16; comp.knee.value = 10; comp.ratio.value = 8; comp.attack.value = 0.002; comp.release.value = 0.35;
+        this.master.connect(comp).connect(ctx.destination);
+        this.white = ctx.createBuffer(1, n, sr);
+        this.brown = ctx.createBuffer(1, n, sr);
+        const wd = this.white.getChannelData(0), bd = this.brown.getChannelData(0);
+        let last = 0;
+        for (let i = 0; i < n; i++) {
+            const r = Math.random() * 2 - 1;
+            wd[i] = r;
+            last = (last + 0.02 * r) / 1.02;
+            bd[i] = last * 3.5;
+        }
+        // beds: [filter type, frequency, Q]
+        this.rain = this.bed(this.white, [['highpass', 500, 0.7], ['lowpass', 7000, 0.7]]);
+        this.roof = this.bed(this.brown, [['bandpass', 700, 0.8]]);
+        this.snow = this.bed(this.white, [['bandpass', 2500, 0.5]]);
+        this.wind = this.bed(this.brown, [['bandpass', 350, 0.9]]);
+        // bus: a diesel note (sawtooth, its pitch the engine speed) over a rumble
+        this.bus = this.bed(this.brown, [['lowpass', 220, 0.7]]);
+        const osc = ctx.createOscillator(), og = ctx.createGain(), lp = ctx.createBiquadFilter();
+        osc.type = 'sawtooth'; osc.frequency.value = 32;
+        lp.type = 'lowpass'; lp.frequency.value = 260;
+        og.gain.value = 0.35;
+        osc.connect(lp).connect(og).connect(this.bus.filters[0]);
+        osc.start();
+        this.busOsc = osc;
+    }
+
+    toggle() {
+        this.on = !this.on;
+        this.start();
+        if (this.ctx) this.master.gain.setTargetAtTime(this.on ? 0.9 : 0, this.ctx.currentTime, 0.05);
+        return this.on;
+    }
+
+    // a looped noise source through filters into a gain (silent until update sets it)
+    bed(buf, filters) {
+        const ctx = this.ctx, src = ctx.createBufferSource(), gain = ctx.createGain();
+        src.buffer = buf; src.loop = true;
+        gain.gain.value = 0;
+        let node = src;
+        const fs = filters.map(([type, f, q]) => {
+            const b = ctx.createBiquadFilter();
+            b.type = type; b.frequency.value = f; b.Q.value = q;
+            node.connect(b); node = b;
+            return b;
+        });
+        node.connect(gain).connect(this.master);
+        src.start(0, Math.random() * buf.duration);
+        return { gain, filters: fs };
+    }
+
+    // a one-shot: buffer through a filter, gain ramping through env [[t, v], ...] from t0; returns the filter
+    shot(buf, type, freq, q, t0, env, rate = 1) {
+        const ctx = this.ctx, src = ctx.createBufferSource(), f = ctx.createBiquadFilter(), g = ctx.createGain();
+        src.buffer = buf; src.playbackRate.value = rate;
+        f.type = type; f.frequency.value = freq; f.Q.value = q;
+        g.gain.setValueAtTime(0, t0);
+        for (const [t, v] of env) g.gain.linearRampToValueAtTime(v, t0 + t);
+        src.connect(f).connect(g).connect(this.master);
+        const len = env[env.length - 1][0] + 0.05;
+        src.start(t0, Math.random() * Math.max(buf.duration - len * rate - 0.1, 0), len);
+        return f;
+    }
+
+    // thunder for a flash whose channel is near..far metres away: the near end is heard first and loudest, the rest
+    // rolls in after it; a strike within 1.5 km cracks first, with its return strokes
+    thunder(near, far, bolt) {
+        if (!this.ctx || !this.on || near > 22000) return;
+        const t0 = this.ctx.currentTime + near / SOUND_SPEED;
+        const amp = Math.min(1.3, 1500 / (near + 350)) * (bolt ? 1 : 0.55);
+        const cut = 110 + 4500 * Math.exp(-near / 1600);           // the air takes the highs of distant thunder
+        const len = clamp(2 + (far - near) / SOUND_SPEED * 0.8 + near / 3500, 2.2, 10);
+        if (bolt && near < 1500) {
+            const k = amp * 1.6 * (1 - near / 1500);
+            for (const dt of [0, 0.07 + Math.random() * 0.05, 0.16 + Math.random() * 0.08])
+                this.shot(this.white, 'highpass', 900 + 2500 * (1 - near / 1500), 0.5, t0 + dt, [[0.004, k * (dt ? 0.6 : 1)], [0.05, k * 0.35], [0.35, 0]]);
+        }
+        // rumble: rolling peaks decaying over len
+        const env = [[near < 1500 ? 0.03 : 0.3, amp * 0.8]];
+        for (let i = 1; i <= 24; i++) {
+            const u = i / 24, roll = Math.random() < 0.25 ? 1.3 : 0.45 + 0.5 * Math.random();
+            env.push([0.3 + u * len, amp * Math.exp(-2.8 * u) * roll]);
+        }
+        env.push([len + 0.4, 0]);
+        this.shot(this.brown, 'lowpass', cut, 0.8, t0, env, 0.8 + Math.random() * 0.3);
+        // the low boom under it
+        this.shot(this.brown, 'lowpass', 80, 1.2, t0, [[0.08, amp * 1.4], [len * 0.4, amp * 0.5], [len, 0]], 0.5);
+    }
+
+    // a building door: a creak sweeping in pitch, and the thud as it meets the frame when shut
+    door(dist, open) {
+        if (!this.ctx || !this.on || dist > 40) return;
+        const t = this.ctx.currentTime, a = 0.25 / (1 + dist / 4);
+        const f = this.shot(this.white, 'bandpass', open ? 500 : 900, 12, t, [[0.05, a * 0.6], [0.5, a * 0.4], [0.7, 0]]);
+        f.frequency.linearRampToValueAtTime(open ? 900 : 450, t + 0.7);
+        if (!open) this.shot(this.brown, 'lowpass', 160, 1, t + 0.75, [[0.01, a * 2.5], [0.25, 0]]);
+    }
+
+    // the pneumatic hiss of a bus door, and its clunk
+    hiss(dist) {
+        if (!this.ctx || !this.on || dist > 80) return;
+        const t = this.ctx.currentTime, a = 0.35 / (1 + dist / 5);
+        this.shot(this.white, 'highpass', 3000, 0.7, t, [[0.03, a], [0.5, a * 0.5], [0.9, 0]]);
+        this.shot(this.brown, 'lowpass', 140, 1, t + 0.9, [[0.01, a * 1.5], [0.2, 0]]);
+    }
+
+    // a footstep: a thump, and a splash on wet ground
+    step(wet, run) {
+        if (!this.ctx || !this.on) return;
+        const t = this.ctx.currentTime, a = (run ? 0.16 : 0.11) * (0.8 + 0.4 * Math.random());
+        this.shot(this.brown, 'lowpass', 300, 1, t, [[0.01, a * 2], [0.12, 0]]);
+        this.shot(this.white, wet ? 'bandpass' : 'highpass', wet ? 1800 : 2500, wet ? 1.2 : 0.5, t, [[0.005, a * (wet ? 0.6 : 0.3)], [wet ? 0.18 : 0.07, 0]]);
+    }
+
+    set(b, v, tc = 0.25) { b.gain.gain.setTargetAtTime(v, this.ctx.currentTime, tc); }
+
+    // the beds, from the scene around the camera, once a frame
+    update(app, dt) {
+        if (!this.ctx || !this.on) return;
+        const t = this.ctx.currentTime, w = app.world, c = w.weather.cur, cam = app.camera.pos;
+        const inside = !!app.indoors || app.inBus, rain = app.near.rain, snow = app.near.snow;
+        // rain: a hiss in the open, muffled indoors, and drumming on whatever shelters the camera
+        this.set(this.rain, Math.pow(rain, 0.7) * 0.3 * (inside ? 0.25 : app.sheltered ? 0.55 : 1));
+        this.rain.filters[1].frequency.setTargetAtTime(inside ? 1400 : 7000, t, 0.2);
+        this.set(this.roof, app.sheltered ? Math.pow(rain, 0.7) * 0.5 : 0);
+        this.set(this.snow, inside ? 0 : snow * 0.05);
+        // wind: with the wind speed and the height above the ground, gusting; little of it indoors
+        const ws = Math.hypot(c.wind[0], c.wind[1]), agl = cam[1] - w.field.surface(cam[0], cam[2]);
+        const gust = 0.7 + 0.3 * Math.sin(app.time * 0.37) * Math.sin(app.time * 0.13 + 1.3);
+        const wind = clamp(ws / 25, 0, 1) * 0.12 * (0.6 + 0.4 * smoothstep(0, 400, agl)) * gust + smoothstep(200, 3000, agl) * 0.05;
+        this.set(this.wind, wind * (inside ? 0.15 : 1), 0.6);
+        this.wind.filters[0].frequency.setTargetAtTime(250 + 300 * gust + ws * 6, t, 0.6);
+        // the nearest bus: its engine note follows its speed; any bus door that starts to open or shut hisses
+        let near = null, nd = Infinity;
+        for (const b of w.buses) {
+            const d = Math.hypot(b.pose.x - cam[0], b.pose.y - cam[1], b.pose.z - cam[2]);
+            if (d < nd) { nd = d; near = b; }
+            const was = this.busDoors.get(b);
+            if (was !== undefined && ((was <= 0 && b.doors > 0) || (was >= 1 && b.doors < 1))) this.hiss(d);
+            this.busDoors.set(b, b.doors);
+        }
+        if (near) {
+            const g = app.inBus && app.rideBus === near ? 0.35 : nd < 300 ? 0.5 / (1 + nd / 12) : 0;
+            this.set(this.bus, g * (0.55 + 0.45 * clamp(near.v / 12, 0, 1)));
+            this.busOsc.frequency.setTargetAtTime(30 + near.v * 3.2, t, 0.3);
+        } else this.set(this.bus, 0);
+        // footsteps on foot, every 0.75 m walked (1.1 m running)
+        const wk = app.walker;
+        if (wk.active && !wk.bus && this.lastPos) {
+            const run = app.input.keys.has('ShiftLeft') || app.input.keys.has('ShiftRight');
+            const dx = Math.hypot(cam[0] - this.lastPos[0], cam[2] - this.lastPos[2]);
+            this.stepDist += dx < 5 ? dx : 0;
+            if (this.stepDist > (run ? 1.1 : 0.75)) { this.stepDist = 0; this.step(rain > 0.05 && !inside, run); }
+        }
+        this.lastPos = [...cam];
+    }
 }
 
 // ------------------------------------------------------------------------------------------------- world
@@ -6266,7 +6497,7 @@ class Hud {
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>N</b> rain: drizzle / light / medium / downpour / mixed   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
+            '<b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
             '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> open / shut a door, sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
             'drop a scenario .json on the page',
         ].join('\n');
@@ -6383,6 +6614,9 @@ class App {
         this.frameNo = 0;
         this.near = { rain: 0, snow: 0 };
         this.sheltered = false;
+        this.sound = new Sound();
+        this.flashVeil = 0;
+        for (const ev of ['pointerdown', 'keydown']) window.addEventListener(ev, () => this.sound.start());
         this.probe = { coverage: 0, top: 0, precip: 0, virga: 0, cover: 0 };
         this.groundSnowHint = 'none';
         this.reset = true;
@@ -6393,6 +6627,8 @@ class App {
     load(scenario) {
         const world = new World(scenario);
         this.world = world;
+        // thunder from each flash, timed by its distance from the camera then
+        world.lightning.onStrike = f => { const [lo, hi] = world.lightning.reach(f, this.camera.pos); this.sound.thunder(lo, hi, !!f.bolt); };
         this.scenario = scenario;
         this.cfg = { ...RENDER_DEFAULTS, ...(scenario.render || {}) };
         this.quality = clamp(this.cfg.quality, 0, QUALITY.length - 1);
@@ -6516,6 +6752,7 @@ class App {
                     this.hud.toast(`${bus.label}: ${bus.describe()}`);
                     break;
                 }
+                case 'KeyU': this.hud.toast(`Sound ${this.sound.toggle() ? 'on' : 'off'}`); break;
                 case 'KeyR': this.radar = !this.radar; break;
                 case 'KeyG': this.tiles = !this.tiles; this.hud.toast(`Cloud tile pre-pass: ${this.tiles ? 'on' : 'off'}`); break;
                 case 'KeyF': this.froxels = !this.froxels; this.hud.toast(`Froxel lighting: ${this.froxels ? 'on' : 'off'}`); break;
@@ -6619,7 +6856,7 @@ class App {
         F.set('sunCol', [...sky.sun, this.sun.exposure]);
         F.set('zenith', [...sky.zenith, 0.00007 * c.haze]);
         F.set('horizon', [...sky.horizon, 1400]);
-        F.set('ambient', [...sky.ambient, 0]);
+        F.set('ambient', [...sky.ambient, this.flashVeil]);
         F.set('screen', [r.width, r.height, r.cloudPass.w, r.cloudPass.h]);
         F.set('cloud', [c.base, Math.max(c.top, c.base + 400), c.density, c.coverage]);
         F.set('noise', [cfg.shapeScale, cfg.detailScale, cfg.detailStrength, cfg.maxTop]);
@@ -6691,13 +6928,17 @@ class App {
         if (!this.paused) { this.time += dt; this.weatherTime += wdt; }
         w.busBoost = this.input.keys.has('KeyZ') ? 10 : 1;          // hold Z: the bus runs ten times as fast
         w.update(this.paused ? 0 : dt, wdt, this.time);
+        if (!this.paused) w.lightning.around(w, this.camera.pos, dt);
         // on foot after the bus has moved, so a rider's eye is where the bus is this frame
         if (this.walker.active) this.walker.update(dt, io, this.input, this);
         // doors: E opens or shuts the one in view (on foot or flying, not aboard a bus); they swing, and their leaves'
         // mesh is rewritten only while one moves
         const S = w.structures, wk = this.walker;
         this.door = wk.bus ? null : S.doorAt(this.camera.pos, this.camera.basis().fwd);
-        if (this.door && io.pressed.includes('KeyE')) this.door.target = this.door.target > 0.5 ? 0 : 1;
+        if (this.door && io.pressed.includes('KeyE')) {
+            this.door.target = this.door.target > 0.5 ? 0 : 1;
+            this.sound.door(Math.hypot(this.door.hinge[0] - this.camera.pos[0], this.door.y - this.camera.pos[1], this.door.hinge[1] - this.camera.pos[2]), this.door.target > 0.5);
+        }
         if (wk.active && !wk.bus) {
             wk.aim = this.door;
             wk.prompt = this.door ? `E ${this.door.target > 0.5 ? 'shut' : 'open'} the door` : '';
@@ -6715,6 +6956,8 @@ class App {
         this.inBus = !!this.rideBus && (() => { const q = this.rideBus.toLocal(this.camera.pos); return Math.abs(q[0]) < BUS.hl && Math.abs(q[2]) < BUS.hw && q[1] > BUS.skirt && q[1] < BUS.roof; })();
         this.sheltered = this.near.rain + this.near.snow > 0.01 && (this.inBus || !!this.indoors || w.structures.shelters(this.camera.pos, v3.norm([-c.wind[0] * 0.8, fall, -c.wind[1] * 0.8])));
 
+        this.flashVeil = w.lightning.veil(this.camera.pos) * (this.indoors || this.inBus ? 0.4 : 1);
+        this.sound.update(this, dt);
         this.writeFrame(dt, wdt);
         const enc = r.device.createCommandEncoder();
         const total = this.near.rain + this.near.snow;
