@@ -219,6 +219,7 @@ and from 25–28 ms to 10–12 ms at high.
 | 1–9 | weather states: clear, fair cumulus, mackerel sky, warm front, stratus deck, showers, thunderstorm, snow squalls, overcast rain (they blend over `transition` seconds). A 10th, severe storms, is reached by auto-cycle and by the shelf and mothership views |
 | 0 | auto-cycle the weather states |
 | K | lightning from the nearest raining cell |
+| J | hide / show the persistent cloud chosen in the **cloud** dropdown (under the radar): the scenario's supercells (motherships), squall lines and pinned or held cells. They start hidden; a view that follows one (Mothership, Shelf cloud) shows it. A hidden cloud drops out of the weather map, the analytic structures, lightning and the labels; it keeps evolving, so it comes back where it would be. The button next to the dropdown does the same |
 | , . | weather time scale (×1 … ×160) |
 | T, arrows | next lighting preset; move the sun (azimuth, elevation) |
 | R | radar inset |

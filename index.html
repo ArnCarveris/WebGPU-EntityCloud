@@ -52,6 +52,14 @@
         #states { bottom: 12px; right: 12px; white-space: pre; color: var(--muted); }
         #states b { color: var(--accent); font-weight: normal; }
         #states .sel { color: var(--warn); }
+        #clouds { top: 12px; right: 12px; pointer-events: auto; display: flex; gap: 6px; align-items: center; color: var(--muted); }
+        #clouds select, #clouds button {
+            font: inherit; color: var(--text); background: rgba(0, 0, 0, 0.45); border: 1px solid var(--line); padding: 2px 6px; cursor: pointer;
+        }
+        #clouds select option { background: #0b141a; }
+        #clouds button { min-width: 44px; }
+        #clouds button.on { color: var(--ok); border-color: var(--ok); }
+        #clouds button.off { color: var(--danger); border-color: var(--danger); }
         #toast { top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--warn); font-size: 16px; display: none; text-align: center; }
         #fallback { display: none; position: fixed; inset: 0; z-index: 50; align-items: center; justify-content: center; background: var(--bg); padding: 16px; }
         #fallback.show { display: flex; }
@@ -60,7 +68,7 @@
         h1 { margin: 4px 0 2px; font-size: 24px; letter-spacing: 0.04em; text-transform: uppercase; }
         .desc { margin: 0 0 12px; font-size: 14px; color: var(--muted); }
         #fallback pre { white-space: pre-wrap; font-family: 'Share Tech Mono', monospace; font-size: 12px; color: var(--danger); background: rgba(0,0,0,0.4); padding: 10px; margin: 10px 0 0; max-height: 40vh; overflow: auto; }
-        @media (max-width: 700px) { #help, #states { display: none; } #hud { font-size: 10px; min-width: 0; } }
+        @media (max-width: 700px) { #help, #states { display: none; } #hud { font-size: 10px; min-width: 0; } #clouds { top: auto; bottom: 12px; } }
     </style>
 </head>
 <body>
@@ -69,6 +77,7 @@
     <div id="hud" class="panel"></div>
     <div id="help" class="panel"></div>
     <div id="states" class="panel"></div>
+    <div id="clouds" class="panel"><span>cloud</span><select id="cloud-pick" title="persistent cloud"></select><button id="cloud-toggle" title="show / hide it (J)">on</button></div>
     <div id="toast" class="panel"></div>
     <div id="fallback">
         <div class="card">
@@ -4874,7 +4883,7 @@ class StormCell extends Entity {
         if (this.age > this.life[0] + this.life[1] + this.life[2]) this.dead = true;
         // lightning, in real time while mature
         const rate = (d.lightning || 0) * w.lightning / 60;
-        if (rate > 0 && this.mature && this.state.precip > 0.15) {
+        if (rate > 0 && !this.off && this.mature && this.state.precip > 0.15) {
             this.flashClock -= dt;
             if (this.flashClock <= 0) {
                 this.world.lightning.strike(this);
@@ -4885,7 +4894,7 @@ class StormCell extends Entity {
 
     cell() {
         const s = this.state;
-        if (s.coverage <= 0.005 && s.precip <= 0.005) return null;
+        if (this.off || (s.coverage <= 0.005 && s.precip <= 0.005)) return null;
         // the precipitation core sits on the downwind flank unless the definition places it
         const w = this.world.weather.cur.wind, wl = Math.hypot(w[0], w[1]) || 1;
         const off = this.def.coreOffset || [w[0] / wl * s.radius * 0.2, w[1] / wl * s.radius * 0.2];
@@ -4934,7 +4943,7 @@ class Supercell extends StormCell {
 
     features(out) {
         const d = this.def, s = this.state, base = this.world.weather.cur.base, [x, z] = this.updraft;
-        if (s.coverage < 0.05) return;
+        if (this.off || s.coverage < 0.05) return;
         out.ms.push([x, z, s.radius * (d.stackRadius ?? 0.8), this.spin,
             base - (d.stackDrop ?? 300), base + (d.stackHeight ?? 4500), d.plates ?? 6, d.twist ?? 0.5,
             d.wallCloud ?? 800, d.wallRadius ?? 0.3, smoothstep(0.1, 0.6, s.coverage), this.seed * 10]);
@@ -4988,6 +4997,7 @@ class SquallLine extends Entity {
     get focus() { const { a, b, c } = this.front; return [(a[0] + b[0]) / 4 + c[0] / 2, this.world.field.base, (a[1] + b[1]) / 4 + c[1] / 2]; }
 
     features(out) {
+        if (this.off) return;
         const d = this.def, { a, b, c, m } = this.front, depth = d.shelfDepth ?? 7000, pad = depth + 2000;
         const strength = (d.shelf ?? 1) * this.cells.reduce((sum, e) => sum + e.state.coverage, 0) / this.cells.length;
         if (strength < 0.02) return;
@@ -5639,6 +5649,7 @@ class World {
         this.structures = new Structures(this.field, scenario.buildings);
         for (const e of this.entities) e.build(this.structures);
         for (const e of [...this.entities]) e.spawn();
+        for (const e of this.persistent) this.setOff(e, true);     // hidden until the cloud picker (or a view on it) shows them
         this.rainZones = new RainZones(this);
     }
 
@@ -5655,6 +5666,18 @@ class World {
     get(id) { return this.byId.get(id); }
     get storms() { return this.entities.filter(e => e instanceof StormCell); }
     get spawner() { return this.entities.find(e => e instanceof Spawner); }
+
+    // the clouds the scenario places itself (supercells, squall lines, pinned or held cells), which the cloud picker
+    // can hide and show again; a squall line's own cells go with it
+    get persistent() {
+        const owned = new Set(this.entities.flatMap(e => e.cells || []));
+        return this.entities.filter(e => !owned.has(e) && (e instanceof SquallLine || (e instanceof StormCell && (e.def.pinned || e.def.hold))));
+    }
+
+    setOff(e, off) {
+        e.off = off;
+        for (const c of e.cells || []) c.off = off;
+    }
 
     // analytic storm structures for the GPU: motherships (12 floats each) and shelf lines (16 floats each)
     features() {
@@ -6228,6 +6251,7 @@ class Input {
         el.addEventListener('pointercancel', up);
         el.addEventListener('wheel', e => { e.preventDefault(); this.wheel += Math.sign(e.deltaY); }, { passive: false });
         window.addEventListener('keydown', e => {
+            if (e.target instanceof HTMLSelectElement) return;     // the cloud picker has the keys
             if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
             if (!e.repeat) this.pressed.push(e.code);
             this.keys.add(e.code);
@@ -6497,7 +6521,7 @@ class Hud {
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
             '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>N</b> rain: drizzle / light / medium / downpour / mixed   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
+            '<b>J</b> hide / show the cloud picked top right   <b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
             '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> open / shut a door, sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
             'drop a scenario .json on the page',
         ].join('\n');
@@ -6542,6 +6566,10 @@ class Hud {
         ];
         if (app.renderer.lastError) lines.push(`<span class="off">${app.renderer.lastError.slice(0, 90)}</span>`);
         this.el.innerHTML = lines.join('\n');
+        // the cloud picker sits under the radar (its size as in the radar shader, in device pixels)
+        const dpr = Math.min(window.devicePixelRatio || 1, 2), radar = Math.min(240, innerHeight * dpr * 0.3);
+        this.cloudsEl ??= document.getElementById('clouds');
+        this.cloudsEl.style.top = app.radar && innerWidth > 700 ? `${(radar + 16) / dpr + 8}px` : '';
     }
 
     drawLabels(app) {
@@ -6571,7 +6599,7 @@ class Hud {
         g.font = `${11 * dpr}px 'Share Tech Mono', monospace`;
         g.textBaseline = 'middle';
         for (const e of [...app.world.entities, ...app.world.buses]) {
-            if (!e.label || (e === app.rideBus && app.inBus)) continue;
+            if (!e.label || e.off || (e === app.rideBus && app.inBus)) continue;
             const storm = e instanceof StormCell;
             if (storm && e.state.coverage < 0.1) continue;
             const p = e.anchor;
@@ -6620,6 +6648,36 @@ class App {
         this.probe = { coverage: 0, top: 0, precip: 0, virga: 0, cover: 0 };
         this.groundSnowHint = 'none';
         this.reset = true;
+        // the persistent-cloud picker: choose one, then show / hide it (button or J)
+        this.cloudPick = document.getElementById('cloud-pick');
+        this.cloudToggle = document.getElementById('cloud-toggle');
+        this.cloudPick.addEventListener('change', () => { this.cloudPick.blur(); this.syncCloudPicker(); });
+        this.cloudToggle.addEventListener('click', () => { this.cloudToggle.blur(); this.toggleCloud(); });
+    }
+
+    // fills the picker with the scenario's persistent clouds
+    buildCloudPicker() {
+        this.persistent = this.world.persistent;
+        const kind = e => e instanceof Supercell ? 'mothership' : e instanceof SquallLine ? 'squall line' : e.def.pinned ? 'pinned cell' : 'held cell';
+        const name = e => e.def.label || e.id || e.def.type;
+        this.cloudPick.innerHTML = this.persistent.map((e, i) => `<option value="${i}">${name(e)}${name(e).toLowerCase() === kind(e) ? '' : ` · ${kind(e)}`}</option>`).join('');
+        document.getElementById('clouds').style.display = this.persistent.length ? '' : 'none';
+        this.syncCloudPicker();
+    }
+
+    syncCloudPicker() {
+        const e = this.persistent[+this.cloudPick.value];
+        this.cloudToggle.textContent = e?.off ? 'off' : 'on';
+        this.cloudToggle.className = e?.off ? 'off' : 'on';
+    }
+
+    toggleCloud() {
+        const e = this.persistent[+this.cloudPick.value];
+        if (!e) return;
+        this.world.setOff(e, !e.off);
+        this.reset = true;              // no ghost of it in the temporal history
+        this.syncCloudPicker();
+        this.hud.toast(`${e.def.label || e.id}: ${e.off ? 'hidden' : 'shown'}`);
     }
 
     async start() { await this.renderer.init(this.canvas); }
@@ -6635,6 +6693,7 @@ class App {
         this.timeScale = this.cfg.timeScale;
         this.renderer.setWorld(world);
         this.hud.setStates(world.weather);
+        this.buildCloudPicker();
         const L = scenario.lighting || {};
         this.lightPresets = L.presets || { default: {} };
         this.lightNames = Object.keys(this.lightPresets);
@@ -6656,6 +6715,13 @@ class App {
     jump(v) {
         const e = v.follow && this.world.get(v.follow);
         this.walker.active = false;
+        // a view on a hidden persistent cloud shows it, and picks it in the cloud picker
+        const pick = this.persistent.indexOf(e);
+        if (pick >= 0) {
+            if (e.off) this.world.setOff(e, false);
+            this.cloudPick.value = pick;
+            this.syncCloudPicker();
+        }
         if (v.spot === 'seat' && e instanceof BusLine) {
             // aboard the bus, in a seat
             this.walker.sit(this, e.buses[0]);
@@ -6759,6 +6825,7 @@ class App {
                 case 'KeyM': this.mode = (this.mode + 1) % RENDER_MODES.length; this.reset = true; this.hud.toast(`Render: ${RENDER_MODES[this.mode]}`); break;
                 case 'KeyQ': this.quality = (this.quality + 1) % QUALITY.length; this.reset = true; this.hud.toast(`Quality: ${QUALITY[this.quality].name}`); break;
                 case 'KeyV': if (this.views.length) { this.viewIndex = (this.viewIndex + 1) % this.views.length; this.jump(this.views[this.viewIndex]); } break;
+                case 'KeyJ': this.toggleCloud(); break;
                 case 'KeyL': this.hud.showLabels = !this.hud.showLabels; break;
                 case 'KeyP': this.paused = !this.paused; break;
                 case 'KeyH': this.hud.help.style.display = this.hud.help.style.display === 'none' ? '' : 'none'; break;
