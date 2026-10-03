@@ -40,7 +40,7 @@
             line-height: 1.35;
             pointer-events: none;
         }
-        #hud { top: 12px; left: 12px; min-width: 340px; max-width: calc(100vw - 24px); white-space: pre; overflow: hidden; }
+        #hud { top: 12px; left: 12px; max-width: calc(100vw - 24px); white-space: pre; overflow: hidden; }
         #hud .t { color: var(--accent); letter-spacing: 0.12em; }
         #hud .on { color: var(--ok); }
         #hud .off { color: var(--danger); }
@@ -49,20 +49,34 @@
         #hud .snow { color: #cfe6ff; }
         #help { bottom: 12px; left: 12px; white-space: pre; color: var(--muted); }
         #help b { color: var(--text); font-weight: normal; }
-        #states { bottom: 12px; right: 12px; white-space: pre; color: var(--muted); }
-        #states b { color: var(--accent); font-weight: normal; }
-        #states .sel { color: var(--warn); }
-        #clouds { top: 12px; right: 12px; pointer-events: auto; display: flex; gap: 6px; align-items: center; color: var(--muted); }
-        #clouds select, #clouds button {
-            font: inherit; color: var(--text); background: rgba(0, 0, 0, 0.45); border: 1px solid var(--line); padding: 2px 6px; cursor: pointer;
+        #menus { top: 12px; right: 12px; z-index: 5; padding: 6px; pointer-events: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; max-width: calc(100vw - 24px); }
+        #menus .row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+        .dd { position: relative; }
+        .dd > button {
+            font: inherit; color: var(--text); background: rgba(0, 0, 0, 0.45); border: 1px solid var(--line); padding: 2px 8px; cursor: pointer;
+            display: flex; gap: 6px; align-items: baseline; white-space: nowrap;
         }
-        #clouds select option { background: #0b141a; }
-        #clouds button { min-width: 44px; }
-        #cloud-ui, #tornado-ui, #hurricane-ui { display: flex; gap: 6px; align-items: center; }
-        #tornado-ui, #hurricane-ui { margin-left: 6px; }
-        #clouds { flex-wrap: wrap; justify-content: flex-end; max-width: calc(100vw - 24px); }
-        #clouds button.on { color: var(--ok); border-color: var(--ok); }
-        #clouds button.off { color: var(--danger); border-color: var(--danger); }
+        .dd > button .k { color: var(--muted); }
+        .dd > button .v { max-width: 13ch; overflow: hidden; text-overflow: ellipsis; }
+        .dd > button::after { content: '\25BE'; color: var(--muted); }
+        .dd.open > button { border-color: var(--accent); }
+        .dd-menu {
+            display: none; position: absolute; top: calc(100% + 4px); right: 0; z-index: 10; min-width: 100%; max-height: 60vh; overflow-y: auto;
+            background: #0b141a; border: 1px solid var(--line); padding: 4px 0; white-space: nowrap;
+        }
+        .dd.open .dd-menu { display: block; }
+        .dd-item { display: flex; gap: 8px; align-items: center; padding: 3px 10px 3px 8px; cursor: pointer; color: var(--text); }
+        .dd-item:hover { background: rgba(110, 220, 255, 0.12); }
+        .dd-item i { flex: none; width: 10px; height: 10px; border: 1px solid var(--muted); }
+        .dd-item.radio i { border-radius: 50%; }
+        .dd-item.on i { background: var(--accent); border-color: var(--accent); box-shadow: inset 0 0 0 2px #0b141a; }
+        .dd-item.on { color: var(--accent); }
+        .dd-item .key { margin-left: auto; padding-left: 16px; color: var(--muted); }
+        .dd-sep { height: 1px; margin: 4px 0; background: var(--line); }
+        .dd-item.info { cursor: default; color: var(--muted); padding-left: 26px; }
+        .dd-item.info:hover { background: none; }
+        .dd-item.info i { display: none; }
+        .dd-item.info .key { color: var(--text); }
         #toast { top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--warn); font-size: 16px; display: none; text-align: center; }
         #fallback { display: none; position: fixed; inset: 0; z-index: 50; align-items: center; justify-content: center; background: var(--bg); padding: 16px; }
         #fallback.show { display: flex; }
@@ -71,7 +85,10 @@
         h1 { margin: 4px 0 2px; font-size: 24px; letter-spacing: 0.04em; text-transform: uppercase; }
         .desc { margin: 0 0 12px; font-size: 14px; color: var(--muted); }
         #fallback pre { white-space: pre-wrap; font-family: 'Share Tech Mono', monospace; font-size: 12px; color: var(--danger); background: rgba(0,0,0,0.4); padding: 10px; margin: 10px 0 0; max-height: 40vh; overflow: auto; }
-        @media (max-width: 700px) { #help, #states { display: none; } #hud { font-size: 10px; min-width: 0; } #clouds { top: auto; bottom: 12px; } }
+        @media (max-width: 700px) {
+            #help { display: none; } #hud { font-size: 10px; min-width: 0; }
+            #menus { top: auto; bottom: 12px; } .dd-menu { top: auto; bottom: calc(100% + 4px); }
+        }
     </style>
 </head>
 <body>
@@ -79,8 +96,7 @@
     <canvas id="labels"></canvas>
     <div id="hud" class="panel"></div>
     <div id="help" class="panel"></div>
-    <div id="states" class="panel"></div>
-    <div id="clouds" class="panel"><span id="cloud-ui"><span>cloud</span><select id="cloud-pick" title="persistent cloud"></select><button id="cloud-toggle" title="show / hide it (J)">on</button></span><span id="tornado-ui"><span>tornado</span><select id="tornado-pick" title="tornado under the supercell's wall cloud"></select></span><span id="hurricane-ui"><span>hurricane</span><select id="hurricane-pick" title="hurricane with an eye (Saffir-Simpson category)"></select></span></div>
+    <div id="menus" class="panel"></div>
     <div id="toast" class="panel"></div>
     <div id="fallback">
         <div class="card">
@@ -756,7 +772,7 @@ const FRAME_LAYOUT = [
     ['tornado', 'array<vec4f, 4>'], // [x, z, ground, top] [radius at the ground, at the top, condensed share, flare] [lean x, z, debris radius, height] [strength (0 off), spin (rad/s), subvortices, seed]
     ['lod', 'vec4f'],       // march interleave (1, 2, 4), shadow map slices, slice this frame, detail distance (m)
     ['froxel', 'vec4f'],    // near, far (m), froxels on, -
-    ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, -, -
+    ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, radar top (fraction of the screen height), -
     ['blocks', 'vec4f'],    // structure boxes: count, lowest bottom, highest top (m), -
     ['blockBox', 'vec4f'],  // their bounds x0, z0, x1, z1, padded for the shadows and rain shadows they cast
     ['rain', 'vec4f'],      // drop size (0 drizzle .. 1 downpour), rain fall speed (m/s), genus layer precipitation scale, rain particles
@@ -3085,7 +3101,7 @@ fn radarColor(pr: f32, snow: bool) -> vec3f {
 
 fn radar(px: vec2f, col: vec3f) -> vec3f {
     let size = min(240.0, F.screen.y * 0.3);
-    let origin = vec2f(F.screen.x - size - 16.0, 16.0);
+    let origin = vec2f(F.screen.x - size - 16.0, max(16.0, F.post.z * F.screen.y));     // under the menu bar
     let q = (px - origin) / size;
     if (any(q < vec2f(0.0)) || any(q > vec2f(1.0))) { return col; }
     let range = 120000.0;
@@ -6536,7 +6552,7 @@ class Input {
         el.addEventListener('pointercancel', up);
         el.addEventListener('wheel', e => { e.preventDefault(); this.wheel += Math.sign(e.deltaY); }, { passive: false });
         window.addEventListener('keydown', e => {
-            if (e.target instanceof HTMLSelectElement) return;     // the cloud picker has the keys
+            if (e.code === 'Escape') Dropdown.open(null);
             if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
             if (!e.repeat) this.pressed.push(e.code);
             this.keys.add(e.code);
@@ -6792,29 +6808,66 @@ const rainName = (rate, drops) => drops < 0.2 && rate < 0.3 ? 'drizzle' : rate <
     : rate <= 1 ? 'heavy rain' : drops > 0.9 ? 'downpour' : 'torrential rain';
 const fmtKm = d => d < 1000 ? `${d.toFixed(0)} m` : `${(d / 1000).toFixed(d < 10000 ? 1 : 0)} km`;
 
+// a dropdown of the top-right menu bar: radio items (pick one; the menu closes) and check items (any number on; it stays
+// open). Its button never takes the focus, so the keys stay with the demo.
+class Dropdown {
+    constructor(bar, name, title) {
+        this.el = document.createElement('span');
+        this.el.className = 'dd';
+        this.el.innerHTML = `<button title="${title}"><span class="k">${name}</span><span class="v"></span></button><div class="dd-menu"></div>`;
+        [this.btn, this.menu] = this.el.children;
+        this.value = this.btn.lastChild;
+        this.items = [];
+        this.key = '';
+        for (const el of [this.btn, this.menu]) el.addEventListener('mousedown', e => e.preventDefault());
+        this.btn.addEventListener('click', () => Dropdown.open(Dropdown.current === this ? null : this));
+        this.menu.addEventListener('click', e => {
+            const it = this.items[e.target.closest('.dd-item')?.dataset.i];
+            if (!it?.pick) return;
+            if (it.kind === 'radio') Dropdown.open(null);
+            it.pick();
+        });
+        bar.appendChild(this.el);
+    }
+
+    static open(dd) {
+        Dropdown.current?.el.classList.remove('open');
+        Dropdown.current = dd;
+        dd?.el.classList.add('open');
+    }
+
+    // items: { label, kind: 'radio' | 'check', on, key (its shortcut), pick }, { label, kind: 'info', key (its value) } or
+    // { sep: true }; the DOM is only rebuilt
+    // when something shown changed
+    set(summary, items, shown = true) {
+        this.items = items;
+        const key = JSON.stringify([summary, shown, items]);
+        if (key === this.key) return;
+        this.key = key;
+        this.el.style.display = shown ? '' : 'none';
+        this.value.textContent = summary;
+        this.menu.innerHTML = items.map((it, i) => it.sep ? '<div class="dd-sep"></div>'
+            : `<div class="dd-item ${it.kind}${it.on ? ' on' : ''}" data-i="${i}"><i></i><span>${it.label}</span>${it.key ? `<span class="key">${it.key}</span>` : ''}</div>`).join('');
+    }
+}
+window.addEventListener('pointerdown', e => { if (!e.target.closest?.('.dd')) Dropdown.open(null); });
+
 class Hud {
     constructor() {
         this.el = document.getElementById('hud');
         this.help = document.getElementById('help');
-        this.statesEl = document.getElementById('states');
+        this.menusEl = document.getElementById('menus');
         this.toastEl = document.getElementById('toast');
         this.labels = document.getElementById('labels');
         this.lctx = this.labels.getContext('2d');
         this.showLabels = true;
         this.last = 0;
         this.help.innerHTML = [
-            '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed',
-            '<b>1-9</b> weather state   <b>0</b> auto cycle   <b>right click</b> (or Ctrl + click) grow a storm cell there',
-            '<b>N</b> rain: drizzle / light / medium / downpour / mixed   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>J</b> hide / show the cloud picked top right (<b>tornado</b> next to it: off / F1-F5 under the supercell; <b>hurricane</b>: off / Cat 1-5 with an eye)   <b>U</b> sound   <b>R</b> radar   <b>M</b> render mode   <b>Q</b> quality   <b>F</b> froxels   <b>G</b> cloud tiles   <b>V</b> next view   <b>L</b> labels   <b>P</b> pause   <b>H</b> help',
-            '<b>X</b> walk / fly   <b>B</b> next bus   <b>E</b> open / shut a door, sit / stand (aboard)   <b>hold Z</b> buses ×10   on foot: <b>WASD</b> walk, <b>Shift</b> run',
-            'drop a scenario .json on the page',
+            '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed   <b>right click</b> (or Ctrl + click) grow a storm cell there',
+            '<b>1-9</b> weather   <b>0</b> auto   <b>N</b> rain   <b>J</b> cloud   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
+            '<b>Q</b> quality   <b>M</b> render   <b>F</b> froxels   <b>G</b> tiles   <b>V</b> view   <b>B</b> bus   <b>hold Z</b> buses ×10   <b>R</b> radar   <b>L</b> labels   <b>U</b> sound   <b>P</b> pause   <b>H</b> help',
+            '<b>X</b> walk / fly   <b>E</b> open / shut a door, sit / stand (aboard)   on foot: <b>WASD</b> walk, <b>Shift</b> run   ·   drop a scenario .json on the page',
         ].join('\n');
-    }
-
-    setStates(weather) {
-        this.statesEl.innerHTML = weather.names.map((n, i) => `<b>${RAIN_VARIANTS.includes(n) ? 'N' : i < 9 ? i + 1 : '·'}</b> <span class="${n === weather.target ? 'sel' : ''}">${n}</span>`).join('\n')
-            + `\n<b>0</b> auto cycle ${weather.cycle.enabled ? '<span class="sel">on</span>' : 'off'}`;
     }
 
     toast(msg, ms = 2200) {
@@ -6834,27 +6887,21 @@ class Hud {
         const here = p.rain + p.snow < 0.01 ? (app.camera.pos[1] > c.base && app.probe.coverage > 0.5 ? '<span class="m">in cloud</span>' : '<span class="m">dry</span>')
             : p.snow > p.rain ? `<span class="snow">snow ${(p.snow * 100).toFixed(0)}%</span>` : `<span class="on">${rainName(p.rain, app.drops ?? c.drops)} ${(p.rain * 100).toFixed(0)}%</span>`;
         const zone = w.rainZones.variantAt(app.camera.pos[0], app.camera.pos[2]);
-        const q = QUALITY[app.quality], cw = app.renderer.cloudPass;
+        const cw = app.renderer.cloudPass, prof = app.renderer.profiler;
+        const fx = (v, d = 1) => (v / 1000).toFixed(d), pc = v => `${(v * 100).toFixed(0)}%`;
         const lines = [
-            `<span class="t">ENTITY CLOUD // ${w.scenario.name || 'scenario'}</span>`,
-            `weather   ${wx.blend < 1 ? `<span class="w">${wx.target} ${(wx.blend * 100).toFixed(0)}%</span>` : wx.target}${w.rainZones.fade > 0 && wx.cur.zones ? ` <span class="m">(${zone ? `${zone} here` : 'off the route'} · reshuffle in ${Math.max(0, w.rainZones.clock).toFixed(0)} s)</span>` : ''}${wx.cycle.enabled ? ' <span class="m">(auto)</span>' : ''} · ×${app.timeScale} time${app.paused ? ' <span class="w">paused</span>' : ''}`,
-            `layer     base ${(c.base / 1000).toFixed(1)} km · top ${(c.top / 1000).toFixed(1)} km · cover ${(c.coverage * 100).toFixed(0)}% · cirrus ${(c.cirrus * 100).toFixed(0)}%`,
-            `air       ${c.temperature.toFixed(0)} °C at sea level · freezing level ${(wx.freezingLevel / 1000).toFixed(1)} km · wind ${wind.toFixed(0)} m/s from ${from}`,
-            `clouds    ${w.clouds.active(c).map(([n, v]) => `${n} ${(v * 100).toFixed(0)}%`).join(' · ') || 'none'}`,
-            `storms    ${storms.length} cells · ${raining} raining · ${w.flashCount} flashes`,
-            `here      ${here}${app.sheltered || app.indoors ? ` <span class="w">${app.inBus ? 'in the bus' : app.indoors ? `indoors, storey ${Math.min(app.indoors.n, 1 + Math.floor((app.camera.pos[1] - app.indoors.floor) / app.indoors.H))} of ${app.indoors.n}` : 'sheltered'}</span>` : ''} · alt ${(app.camera.pos[1] / 1000).toFixed(2)} km · ground snow ${app.groundSnowHint}`,
-            ...(app.rideBus ? [`bus       ${app.rideBus.label} ${app.rideBus.describe()}${app.walker.active ? ` · <span class="w">${app.walker.seat ? 'seated' : app.walker.bus ? 'aboard' : 'on foot'}</span>` : ''}${w.busBoost > 1 ? ' <span class="w">×10</span>' : ''}`] : []),
-            `render    ${RENDER_MODES[app.mode]} · ${q.name} ${cw.w}×${cw.h}${q.interleave > 1 ? ` 1/${q.interleave} px` : ''}${q.blur ? ' blur' : ''}${app.tiles ? ' tiles' : ''} ${q.steps} steps · froxels ${app.froxels ? FROXEL.join('×') : 'off'} · ${app.lightName} · ${app.fps.toFixed(0)} fps`,
-            app.renderer.profiler.enabled
-                ? `gpu       ${app.renderer.profiler.total.toFixed(1)} ms · ${Object.entries(app.renderer.profiler.ms).map(([n, v]) => `${n} ${v.toFixed(1)}`).join(' · ')}`
-                : `gpu       <span class="m">no timestamp queries on this adapter</span>`,
+            `<span class="t">ENTITY CLOUD // ${w.scenario.name || 'scenario'}</span> <span class="m">· ${app.fps.toFixed(0)} fps${prof.enabled ? ` · gpu ${prof.total.toFixed(1)} ms` : ''} · ${cw.w}×${cw.h} · ${app.lightName}</span>`,
+            `weather ${wx.blend < 1 ? `<span class="w">${wx.target} ${pc(wx.blend)}</span>` : wx.target}${w.rainZones.fade > 0 && wx.cur.zones ? ` <span class="m">(${zone ? `${zone} here` : 'off the route'} · reshuffle ${Math.max(0, w.rainZones.clock).toFixed(0)} s)</span>` : ''}${wx.cycle.enabled ? ' <span class="m">(auto)</span>' : ''} · ×${app.timeScale}${app.paused ? ' <span class="w">paused</span>' : ''}`,
+            `sky     ${fx(c.base)}-${fx(c.top)} km · ${w.clouds.active(c).map(([n, v]) => `${n} ${pc(v)}`).join(' · ') || 'clear'}`,
+            `air     ${c.temperature.toFixed(0)} °C · freezing ${fx(wx.freezingLevel)} km · wind ${wind.toFixed(0)} m/s ${from} · ${storms.length} cells, ${raining} raining, ${w.flashCount} flashes`,
+            `here    ${here}${app.sheltered || app.indoors ? ` <span class="w">${app.inBus ? 'in the bus' : app.indoors ? `indoors, storey ${Math.min(app.indoors.n, 1 + Math.floor((app.camera.pos[1] - app.indoors.floor) / app.indoors.H))} of ${app.indoors.n}` : 'sheltered'}</span>` : ''} · alt ${fx(app.camera.pos[1], 2)} km · snow ${app.groundSnowHint}`,
+            ...(app.rideBus ? [`bus     ${app.rideBus.label} ${app.rideBus.describe()}${app.walker.active ? ` · <span class="w">${app.walker.seat ? 'seated' : app.walker.bus ? 'aboard' : 'on foot'}</span>` : ''}${w.busBoost > 1 ? ' <span class="w">×10</span>' : ''}`] : []),
         ];
         if (app.renderer.lastError) lines.push(`<span class="off">${app.renderer.lastError.slice(0, 90)}</span>`);
         this.el.innerHTML = lines.join('\n');
-        // the cloud picker sits under the radar (its size as in the radar shader, in device pixels)
-        const dpr = Math.min(window.devicePixelRatio || 1, 2), radar = Math.min(240, innerHeight * dpr * 0.3);
-        this.cloudsEl ??= document.getElementById('clouds');
-        this.cloudsEl.style.top = app.radar && innerWidth > 700 ? `${(radar + 16) / dpr + 8}px` : '';
+        // the menus follow the weather (auto cycle, views, keys); the radar sits under their bar (on a phone it is at the bottom)
+        app.syncMenus();
+        app.radarTop = innerWidth > 700 ? (this.menusEl.getBoundingClientRect().bottom + 6) / innerHeight : 0;
     }
 
     drawLabels(app) {
@@ -6933,75 +6980,222 @@ class App {
         this.probe = { coverage: 0, top: 0, precip: 0, virga: 0, cover: 0 };
         this.groundSnowHint = 'none';
         this.reset = true;
-        // the persistent-cloud picker: choose one, then show / hide it (button or J)
-        this.cloudPick = document.getElementById('cloud-pick');
-        this.cloudToggle = document.getElementById('cloud-toggle');
-        this.cloudPick.addEventListener('change', () => { this.cloudPick.blur(); this.syncCloudPicker(); });
-        this.cloudToggle.addEventListener('click', () => { this.cloudToggle.blur(); this.toggleCloud(); });
-        // the tornado picker: off or a category, under the supercell showing (off by default)
-        this.tornadoPick = document.getElementById('tornado-pick');
-        this.tornadoPick.innerHTML = TORNADO.map((k, i) => `<option value="${i}">${k ? `${k.name} · ${k.kmh} km/h` : 'off'}</option>`).join('');
-        this.tornadoPick.addEventListener('change', () => { this.tornadoPick.blur(); this.setTornado(+this.tornadoPick.value); });
-        // the hurricane picker: off or a category (off by default)
-        this.hurricanePick = document.getElementById('hurricane-pick');
-        this.hurricanePick.innerHTML = HURRICANE.map((k, i) => `<option value="${i}">${k ? `${k.name} · ${k.kmh} km/h` : 'off'}</option>`).join('');
-        this.hurricanePick.addEventListener('change', () => { this.hurricanePick.blur(); this.setHurricane(+this.hurricanePick.value); });
+        // the menu bar top right: weather and rain (pick one), the persistent clouds (show any of them), tornado and hurricane
+        // in two rows: the weather, then the view and the graphics
+        const row = () => document.getElementById('menus').appendChild(Object.assign(document.createElement('div'), { className: 'row' }));
+        let bar = row();
+        this.menus = {
+            weather: new Dropdown(bar, 'weather', 'weather state'),
+            rain: new Dropdown(bar, 'rain', 'rain variants'),
+            time: new Dropdown(bar, 'time', 'how fast the weather runs'),
+            clouds: new Dropdown(bar, 'clouds', 'persistent clouds to show'),
+            tornado: new Dropdown(bar, 'tornado', "tornado under the supercell's wall cloud"),
+            hurricane: new Dropdown(bar, 'hurricane', 'hurricane with an eye (Saffir-Simpson category)'),
+        };
+        bar = row();
+        Object.assign(this.menus, {
+            view: new Dropdown(bar, 'view', 'jump to a viewpoint'),
+            move: new Dropdown(bar, 'move', 'fly, or walk on the ground below'),
+            bus: new Dropdown(bar, 'bus', 'go to a bus'),
+            lighting: new Dropdown(bar, 'lighting', 'lighting preset'),
+            quality: new Dropdown(bar, 'quality', 'graphics quality'),
+            render: new Dropdown(bar, 'render', 'render mode'),
+            gpu: new Dropdown(bar, 'gpu', 'GPU features and timings'),
+        });
+        this.busFast = false;           // the buses' ×10 latched from the bus menu (else while Z is held)
+        this.cloudFocus = 0;            // the persistent cloud J hides / shows: the last one picked
+    }
+
+    syncMenus() {
+        const w = this.world;
+        if (!w) return;
+        const wx = w.weather, radio = (label, on, pick) => ({ label, kind: 'radio', on, pick });
+        const rain = RAIN_VARIANTS.filter(n => wx.states[n]), isRain = rain.includes(wx.target);
+        this.menus.weather.set(`${isRain ? 'rain' : wx.target}${wx.cycle.enabled ? ' (auto)' : ''}`, [
+            ...wx.names.filter(n => !rain.includes(n)).map(n => radio(n, n === wx.target, () => this.setWeather(n))),
+            { sep: true },
+            { label: 'auto cycle', kind: 'check', on: wx.cycle.enabled, pick: () => this.toggleCycle() },
+        ]);
+        this.menus.rain.set(isRain ? wx.target : 'none', rain.map(n => radio(n, n === wx.target, () => this.setWeather(n))), rain.length > 0);
+        this.menus.time.set(`×${this.timeScale}${this.paused ? ' (paused)' : ''}`, TIME_SCALES.map(t => radio(`×${t}`, t === this.timeScale, () => this.setTimeScale(t))));
+        const P = this.persistent, shown = P.filter(e => !e.off);
+        this.menus.clouds.set(shown.length === P.length ? 'all' : !shown.length ? 'none' : shown.length === 1 ? this.cloudName(shown[0]) : `${shown.length} of ${P.length}`,
+            P.map((e, i) => ({ label: this.cloudLabel(e), kind: 'check', on: !e.off, pick: () => this.setCloud(i, !!e.off) })), P.length > 0);
+        const cats = (list, cur, set) => list.map((k, i) => radio(k ? `${k.name} · ${k.kmh} km/h` : 'off', i === cur, () => set(i)));
+        this.menus.tornado.set(TORNADO[w.tornadoCat]?.name || 'off', cats(TORNADO, w.tornadoCat, c => this.setTornado(c)), w.entities.some(e => e instanceof Supercell));
+        this.menus.hurricane.set(HURRICANE[w.hurricaneCat]?.name || 'off', cats(HURRICANE, w.hurricaneCat, c => this.setHurricane(c)));
+
+        const views = this.views || [];             // (not yet while a scenario loads)
+        this.menus.view.set(views[this.viewIndex]?.name || 'none', views.map((v, i) => radio(v.name, i === this.viewIndex, () => this.setView(i))), views.length > 0);
+        this.menus.move.set(this.walker.active ? 'walk' : 'fly', [radio('fly', !this.walker.active, () => this.setWalk(false)), radio('walk', this.walker.active, () => this.setWalk(true))]);
+        const aboard = this.walker.active && this.walker.bus;
+        this.menus.bus.set(aboard ? aboard.label : 'none', [
+            ...w.buses.map((b, i) => radio(b.label, b === aboard, () => this.toBus(i))),
+            { sep: true },
+            { label: 'buses ×10', kind: 'check', on: this.busFast, pick: () => { this.busFast = !this.busFast; this.syncMenus(); } },
+        ], w.buses.length > 0);
+        const lights = this.lightNames || [];
+        this.menus.lighting.set(this.lightName, lights.map(n => radio(n, n === this.lightName, () => this.pickLight(n))), lights.length > 1);
+        this.menus.quality.set(QUALITY[this.quality].name, QUALITY.map((q, i) => radio(`${q.name} · ${q.scale * 100}% · ${q.steps} steps`, i === this.quality, () => this.setQuality(i))));
+        this.menus.render.set(RENDER_MODES[this.mode], RENDER_MODES.map((m, i) => radio(m, i === this.mode, () => this.setMode(i))));
+        const prof = this.renderer.profiler;
+        this.menus.gpu.set([this.froxels && 'froxels', this.tiles && 'tiles'].filter(Boolean).join(' + ') || 'basic', [
+            { label: `froxel lighting ${FROXEL.join('×')}`, kind: 'check', on: this.froxels, pick: () => this.toggleFroxels() },
+            { label: 'cloud tile pre-pass', kind: 'check', on: this.tiles, pick: () => this.toggleTiles() },
+            { sep: true },
+            ...(prof.enabled ? [['total', prof.total], ...Object.entries(prof.ms)].map(([n, v]) => ({ label: n, kind: 'info', key: `${v.toFixed(1)} ms` }))
+                : [{ label: 'no timestamp queries on this adapter', kind: 'info' }]),
+        ]);
+    }
+
+    setTimeScale(t) {
+        this.timeScale = t;
+        this.hud.toast(`Weather time ×${t}`);
+        this.syncMenus();
+    }
+
+    pickLight(name) {
+        this.setLight(name);
+        this.hud.toast(`Lighting: ${this.lightName}`);
+        this.syncMenus();
+    }
+
+    // walk from here (down on the ground below the camera), or fly again
+    setWalk(on) {
+        if (on === this.walker.active) return;
+        if (!on) { this.walker.active = false; this.walker.bus = null; this.hud.toast('Flying'); }
+        else {
+            const c = this.camera.pos, y = c[1] - WALK.eye, f = this.world.field;
+            this.walker.place(this, c[0], c[2], y - f.surface(c[0], c[2]) < 3 ? y : undefined);
+            this.camera.pitch = 0;
+            this.hud.toast('Walking');
+        }
+        this.reset = true;
+        this.syncMenus();
+    }
+
+    setView(i) {
+        if (!this.views[i]) return;
+        this.viewIndex = i;
+        this.jump(this.views[i]);
+        this.syncMenus();
+    }
+
+    setQuality(i) {
+        this.quality = i;
+        this.reset = true;
+        this.hud.toast(`Quality: ${QUALITY[i].name}`);
+        this.syncMenus();
+    }
+
+    setMode(i) {
+        this.mode = i;
+        this.reset = true;
+        this.hud.toast(`Render: ${RENDER_MODES[i]}`);
+        this.syncMenus();
+    }
+
+    toggleFroxels() {
+        this.froxels = !this.froxels;
+        this.hud.toast(`Froxel lighting: ${this.froxels ? 'on' : 'off'}`);
+        this.syncMenus();
+    }
+
+    toggleTiles() {
+        this.tiles = !this.tiles;
+        this.hud.toast(`Cloud tile pre-pass: ${this.tiles ? 'on' : 'off'}`);
+        this.syncMenus();
+    }
+
+    // to bus i: outside its front door while it stands at a stop, else aboard in the aisle
+    toBus(i) {
+        const bus = this.world.buses[i];
+        if (!bus) return;
+        this.busPick = i;
+        const doorX = BUS.bay0 + (BUS.doorBays[0] + 0.5) * BUS.bay;
+        if (bus.mode === 'dwell') {
+            const p = bus.toWorld([doorX, 0, BUS.hw + 1.2]);
+            this.walker.place(this, p[0], p[2], p[1]);
+            this.walker.eye(this);
+            this.camera.lookAt(bus.toWorld([doorX, 1.5, 0]));
+        } else {
+            this.walker.place(this, bus.pose.x, bus.pose.z);
+            Object.assign(this.walker, { bus, seat: null, feet: [-1.0, BUS.floor, 0], busYaw: bus.yaw });
+            this.camera.yaw = bus.yaw;
+        }
+        this.camera.pitch = 0;
+        this.reset = true;
+        this.hud.toast(`${bus.label}: ${bus.describe()}`);
+        this.syncMenus();
+    }
+
+    setWeather(name) {
+        this.world.weather.set(name);
+        this.hud.toast(`${RAIN_VARIANTS.includes(name) ? 'Rain' : 'Weather'}: ${this.world.weather.target}`);
+        this.syncMenus();
+    }
+
+    toggleCycle() {
+        const wx = this.world.weather;
+        wx.cycle.enabled = !wx.cycle.enabled;
+        wx.cycleClock = wx.cycle.hold;
+        this.hud.toast(`Auto weather ${wx.cycle.enabled ? 'on' : 'off'}`);
+        this.syncMenus();
     }
 
     setHurricane(cat) {
         this.world.hurricaneCat = cat;
-        this.hurricanePick.value = cat;
         this.reset = true;
+        this.syncMenus();
         this.hud.toast(cat ? `${HURRICANE[cat].name} hurricane, eye at ${this.world.hurricanePos.map(v => (v / 1000).toFixed(0)).join(', ')} km` : 'Hurricane: off');
     }
 
     setTornado(cat) {
         const w = this.world;
         w.tornadoCat = cat;
-        this.tornadoPick.value = cat;
+        this.syncMenus();
         if (!cat) { this.hud.toast('Tornado: off'); return; }
         // no supercell showing: show the first one the scenario places
         if (!w.tornadoHost) {
             const e = this.persistent.find(e => e instanceof Supercell);
-            if (e) {
-                w.setOff(e, false);
-                this.cloudPick.value = this.persistent.indexOf(e);
-                this.syncCloudPicker();
-                this.reset = true;
-            }
+            if (e) this.setCloud(this.persistent.indexOf(e), true, false);
         }
         const host = w.tornadoHost;
         this.hud.toast(host ? `${TORNADO[cat].name} tornado under ${host.def.label || host.id}` : `${TORNADO[cat].name} tornado: waiting for a supercell`);
     }
 
-    // fills the picker with the scenario's persistent clouds
+    // the clouds menu: the scenario's persistent clouds
     buildCloudPicker() {
         this.persistent = this.world.persistent;
-        const kind = e => e instanceof Supercell ? 'mothership' : e instanceof SquallLine ? 'squall line' : e.def.pinned ? 'pinned cell' : 'held cell';
-        const name = e => e.def.label || e.id || e.def.type;
-        this.cloudPick.innerHTML = this.persistent.map((e, i) => `<option value="${i}">${name(e)}${name(e).toLowerCase() === kind(e) ? '' : ` · ${kind(e)}`}</option>`).join('');
-        document.getElementById('cloud-ui').style.display = this.persistent.length ? '' : 'none';
+        this.cloudFocus = 0;
         this.world.hurricaneCat = 0;
-        this.hurricanePick.value = 0;
-        this.syncCloudPicker();
         this.world.tornadoCat = 0;
-        this.tornadoPick.value = 0;
-        document.getElementById('tornado-ui').style.display = this.world.entities.some(e => e instanceof Supercell) ? '' : 'none';
+        this.syncMenus();
     }
 
-    syncCloudPicker() {
-        const e = this.persistent[+this.cloudPick.value];
-        this.cloudToggle.textContent = e?.off ? 'off' : 'on';
-        this.cloudToggle.className = e?.off ? 'off' : 'on';
+    cloudName(e) { return e.def.label || e.id || e.def.type; }
+
+    cloudLabel(e) {
+        const kind = e instanceof Supercell ? 'mothership' : e instanceof SquallLine ? 'squall line' : e.def.pinned ? 'pinned cell' : 'held cell';
+        return `${this.cloudName(e)}${this.cloudName(e).toLowerCase() === kind ? '' : ` · ${kind}`}`;
+    }
+
+    // shows or hides persistent cloud i, which J then toggles
+    setCloud(i, show, toast = true) {
+        const e = this.persistent[i];
+        if (!e) return;
+        this.cloudFocus = i;
+        if (!e.off !== show) {
+            this.world.setOff(e, !show);
+            this.reset = true;              // no ghost of it in the temporal history
+        }
+        if (toast) this.hud.toast(`${this.cloudName(e)}: ${show ? 'shown' : 'hidden'}`);
+        this.syncMenus();
     }
 
     toggleCloud() {
-        const e = this.persistent[+this.cloudPick.value];
-        if (!e) return;
-        this.world.setOff(e, !e.off);
-        this.reset = true;              // no ghost of it in the temporal history
-        this.syncCloudPicker();
-        this.hud.toast(`${e.def.label || e.id}: ${e.off ? 'hidden' : 'shown'}`);
+        const e = this.persistent[this.cloudFocus];
+        if (e) this.setCloud(this.cloudFocus, !!e.off);
     }
 
     async start() { await this.renderer.init(this.canvas); }
@@ -7016,7 +7210,6 @@ class App {
         this.quality = clamp(this.cfg.quality, 0, QUALITY.length - 1);
         this.timeScale = this.cfg.timeScale;
         this.renderer.setWorld(world);
-        this.hud.setStates(world.weather);
         this.buildCloudPicker();
         const L = scenario.lighting || {};
         this.lightPresets = L.presets || { default: {} };
@@ -7039,13 +7232,9 @@ class App {
     jump(v) {
         const e = v.follow && this.world.get(v.follow);
         this.walker.active = false;
-        // a view on a hidden persistent cloud shows it, and picks it in the cloud picker
+        // a view on a hidden persistent cloud shows it, and J then toggles it
         const pick = this.persistent.indexOf(e);
-        if (pick >= 0) {
-            if (e.off) this.world.setOff(e, false);
-            this.cloudPick.value = pick;
-            this.syncCloudPicker();
-        }
+        if (pick >= 0) this.setCloud(pick, true, false);
         if (v.spot === 'seat' && e instanceof BusLine) {
             // aboard the bus, in a seat
             this.walker.sit(this, e.buses[0]);
@@ -7067,7 +7256,7 @@ class App {
         // on foot from there (`walk`)
         if (v.walk && !this.walker.active) { this.walker.place(this, this.camera.pos[0], this.camera.pos[2], this.camera.pos[1] - WALK.eye); this.walker.eye(this); }
         if (v.lighting && this.lightPresets[v.lighting]) this.setLight(v.lighting);
-        if (v.weather) { this.world.weather.set(v.weather); this.hud.setStates(this.world.weather); }
+        if (v.weather) this.world.weather.set(v.weather);
         if (v.hurricane !== undefined && v.hurricane !== this.world.hurricaneCat) this.setHurricane(v.hurricane);
         this.reset = true;
         this.hud.toast(v.name);
@@ -7079,9 +7268,8 @@ class App {
             const digit = code.match(/^(?:Digit|Numpad)(\d)$/);
             if (digit) {
                 const k = +digit[1];
-                if (k === 0) { wx.cycle.enabled = !wx.cycle.enabled; wx.cycleClock = wx.cycle.hold; this.hud.toast(`Auto weather ${wx.cycle.enabled ? 'on' : 'off'}`); }
-                else if (wx.names[k - 1]) { wx.set(wx.names[k - 1]); this.hud.toast(`Weather: ${wx.target}`); }
-                this.hud.setStates(wx);
+                if (k === 0) this.toggleCycle();
+                else if (wx.names[k - 1]) this.setWeather(wx.names[k - 1]);
                 continue;
             }
             switch (code) {
@@ -7094,62 +7282,30 @@ class App {
                 }
                 case 'Comma': case 'Period': {
                     const i = TIME_SCALES.indexOf(this.timeScale);
-                    const j = clamp((i < 0 ? 3 : i) + (code === 'Period' ? 1 : -1), 0, TIME_SCALES.length - 1);
-                    this.timeScale = TIME_SCALES[j];
-                    this.hud.toast(`Weather time ×${this.timeScale}`);
+                    this.setTimeScale(TIME_SCALES[clamp((i < 0 ? 3 : i) + (code === 'Period' ? 1 : -1), 0, TIME_SCALES.length - 1)]);
                     break;
                 }
-                case 'KeyT': {
-                    const i = (this.lightNames.indexOf(this.lightName) + 1) % this.lightNames.length;
-                    this.setLight(this.lightNames[i]);
-                    this.hud.toast(`Lighting: ${this.lightName}`);
-                    break;
-                }
+                case 'KeyT': this.pickLight(this.lightNames[(this.lightNames.indexOf(this.lightName) + 1) % this.lightNames.length]); break;
                 case 'KeyN': {
                     // step through the rain variants: drizzle, light rain, medium rain, downpour, mixed rain
                     const names = RAIN_VARIANTS.filter(n => wx.states[n]);
                     if (!names.length) { this.hud.toast('No rain variants in this scenario'); break; }
-                    wx.set(names[(names.indexOf(wx.target) + 1) % names.length]);
-                    this.hud.toast(`Rain: ${wx.target}`);
-                    this.hud.setStates(wx);
+                    this.setWeather(names[(names.indexOf(wx.target) + 1) % names.length]);
                     break;
                 }
-                case 'KeyX': {
-                    // walk from here (down on the ground below the camera), or fly again
-                    if (this.walker.active) { this.walker.active = false; this.walker.bus = null; this.hud.toast('Flying'); }
-                    else { const c = this.camera.pos, y = c[1] - WALK.eye; this.walker.place(this, c[0], c[2], y - w.field.surface(c[0], c[2]) < 3 ? y : undefined); this.camera.pitch = 0; this.hud.toast('Walking'); }
-                    this.reset = true;
-                    break;
-                }
-                case 'KeyB': {
-                    // to the next bus of the fleet (each press another): outside its front door while it stands at a
-                    // stop, else aboard in the aisle
+                case 'KeyX': this.setWalk(!this.walker.active); break;
+                case 'KeyB':
+                    // to the next bus of the fleet (each press another)
                     if (!w.buses.length) { this.hud.toast('No bus in this scenario'); break; }
-                    this.busPick = ((this.busPick ?? -1) + 1) % w.buses.length;
-                    const bus = w.buses[this.busPick];
-                    const doorX = BUS.bay0 + (BUS.doorBays[0] + 0.5) * BUS.bay;
-                    if (bus.mode === 'dwell') {
-                        const p = bus.toWorld([doorX, 0, BUS.hw + 1.2]);
-                        this.walker.place(this, p[0], p[2], p[1]);
-                        this.walker.eye(this);
-                        this.camera.lookAt(bus.toWorld([doorX, 1.5, 0]));
-                    } else {
-                        this.walker.place(this, bus.pose.x, bus.pose.z);
-                        Object.assign(this.walker, { bus, seat: null, feet: [-1.0, BUS.floor, 0], busYaw: bus.yaw });
-                        this.camera.yaw = bus.yaw;
-                    }
-                    this.camera.pitch = 0;
-                    this.reset = true;
-                    this.hud.toast(`${bus.label}: ${bus.describe()}`);
+                    this.toBus(((this.busPick ?? -1) + 1) % w.buses.length);
                     break;
-                }
                 case 'KeyU': this.hud.toast(`Sound ${this.sound.toggle() ? 'on' : 'off'}`); break;
                 case 'KeyR': this.radar = !this.radar; break;
-                case 'KeyG': this.tiles = !this.tiles; this.hud.toast(`Cloud tile pre-pass: ${this.tiles ? 'on' : 'off'}`); break;
-                case 'KeyF': this.froxels = !this.froxels; this.hud.toast(`Froxel lighting: ${this.froxels ? 'on' : 'off'}`); break;
-                case 'KeyM': this.mode = (this.mode + 1) % RENDER_MODES.length; this.reset = true; this.hud.toast(`Render: ${RENDER_MODES[this.mode]}`); break;
-                case 'KeyQ': this.quality = (this.quality + 1) % QUALITY.length; this.reset = true; this.hud.toast(`Quality: ${QUALITY[this.quality].name}`); break;
-                case 'KeyV': if (this.views.length) { this.viewIndex = (this.viewIndex + 1) % this.views.length; this.jump(this.views[this.viewIndex]); } break;
+                case 'KeyG': this.toggleTiles(); break;
+                case 'KeyF': this.toggleFroxels(); break;
+                case 'KeyM': this.setMode((this.mode + 1) % RENDER_MODES.length); break;
+                case 'KeyQ': this.setQuality((this.quality + 1) % QUALITY.length); break;
+                case 'KeyV': if (this.views.length) this.setView((this.viewIndex + 1) % this.views.length); break;
                 case 'KeyJ': this.toggleCloud(); break;
                 case 'KeyL': this.hud.showLabels = !this.hud.showLabels; break;
                 case 'KeyP': this.paused = !this.paused; break;
@@ -7266,7 +7422,7 @@ class App {
         F.set('lod', [q.interleave, full ? 1 : SHADOW_SLICES, full ? 0 : this.frameNo % SHADOW_SLICES, q.detail]);
         this.shadowSlices = full ? 1 : SHADOW_SLICES;
         F.set('froxel', [FROXEL_NEAR, cfg.maxDistance, this.froxels ? 1 : 0, 0]);
-        F.set('post', [q.blur || 0, this.tiles ? 1 : 0, 0, 0]);
+        F.set('post', [q.blur || 0, this.tiles ? 1 : 0, this.radarTop || 0, 0]);
         // heavy rain: up to three times the drops (big drops, past intensity 0.6)
         const drops = this.drops = w.rainZones.drops(cam.pos[0], cam.pos[2], c.drops);
         this.rainParticles = Math.round(cfg.particles * (1 + 2 * sat01((this.near.rain - 0.6) / 0.8) * drops));
@@ -7321,7 +7477,7 @@ class App {
 
         const wdt = this.paused ? 0 : dt * this.timeScale;
         if (!this.paused) { this.time += dt; this.weatherTime += wdt; }
-        w.busBoost = this.input.keys.has('KeyZ') ? 10 : 1;          // hold Z: the bus runs ten times as fast
+        w.busBoost = this.busFast || this.input.keys.has('KeyZ') ? 10 : 1;     // hold Z (or the bus menu): the buses run ten times as fast
         w.update(this.paused ? 0 : dt, wdt, this.time);
         if (!this.paused) w.lightning.around(w, this.camera.pos, dt);
         // on foot after the bus has moved, so a rider's eye is where the bus is this frame
