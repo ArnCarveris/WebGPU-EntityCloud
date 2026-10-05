@@ -114,7 +114,9 @@
     render    quality (0-3), shapeScale / detailScale (m per noise tile), detailStrength, maxTop (m, top of the cloud slab),
               maxDistance (m), weatherSize (m, weather map around the camera), rainExtinction / snowExtinction (1/m at full intensity),
               slant (how far the wind blows falling precipitation), fallSpeed (m/s, streak scroll), timeScale (weather s per real s),
-              particles (near-field rain drops / snow flakes)
+              particles (near-field rain drops / snow flakes), bloom (strength, 0 off), bloomThreshold / bloomKnee (exposed radiance
+              where the glow starts, and how softly), bloomBolt (how much more
+              the lightning bolts glow)
     clouds    cloud genus layers besides cumulus (max 4): { name, kind (heap | sheet | cellular), base, top (m), density (1/m),
               mapScale (m, coverage patches), shapeScale (m), stretch (along the wind; < 1 makes rolls across it), erosion,
               ambient (light scale, < 1 darker), precip (drizzle at full coverage) }
@@ -412,7 +414,9 @@ const SHADOW_SLICES = 4;             // the cloud shadow map refreshes 1/4 of it
 const RENDER_DEFAULTS = {
     quality: 1, shapeScale: 11000, detailScale: 1700, detailStrength: 0.32, maxTop: 12500, maxDistance: 60000, weatherSize: 128000,
     rainExtinction: 0.0011, snowExtinction: 0.0026, slant: 0.09, fallSpeed: 40, timeScale: 20, particles: 24000,
+    bloom: 1.5, bloomThreshold: 1.0, bloomKnee: 0.5, bloomBolt: 0.1,
 };
+const BLOOM_LEVELS = 6;              // bloom mip chain from half resolution down (fewer where the screen is small)
 const WEATHER_DEFAULTS = {
     coverage: 0.3, base: 3000, top: 4500, density: 0.04, cirrus: 0.2, wind: [8, 0], temperature: 20, haze: 1,
     drizzle: 0, storms: 1, power: 1, lightning: 1, layers: {}, rain: 1, drops: 0.8,
@@ -780,7 +784,8 @@ const FRAME_LAYOUT = [
     ['tornado', 'array<vec4f, 4>'], // [x, z, ground, top] [radius at the ground, at the top, condensed share, flare] [lean x, z, debris radius, height] [strength (0 off), spin (rad/s), subvortices, seed]
     ['lod', 'vec4f'],       // march interleave (1, 2, 4), shadow map slices, slice this frame, detail distance (m)
     ['froxel', 'vec4f'],    // near, far (m), froxels on, -
-    ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, radar top (fraction of the screen height), -
+    ['post', 'vec4f'],      // cloud blur radius (volumetric texels), cloud tile pre-pass on, radar top (fraction of the screen height), bolt bloom gain
+    ['bloom', 'vec4f'],     // strength (0 off), threshold, soft knee (exposed radiance), levels in the chain
     ['blocks', 'vec4f'],    // structure boxes: count, lowest bottom, highest top (m), -
     ['blockBox', 'vec4f'],  // their bounds x0, z0, x1, z1, padded for the shadows and rain shadows they cast
     ['rain', 'vec4f'],      // drop size (0 drizzle .. 1 downpour), rain fall speed (m/s), genus layer precipitation scale, rain particles
@@ -3341,6 +3346,7 @@ const WGSL_FINAL = /* wgsl */`
 @group(1) @binding(0) var cloudTex: texture_2d<f32>;
 @group(1) @binding(1) var hdrTex: texture_2d<f32>;                 // alpha: the rain surface code (WGSL_TERRAIN)
 @group(1) @binding(2) var depthTex: texture_depth_2d;              // read-only in the final pass (the splashes look at it)
+@group(1) @binding(3) var bloomTex: texture_2d<f32>;               // the bloom chain's top level (WGSL_BLOOM), half resolution
 
 struct FsIn { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 
@@ -3420,6 +3426,7 @@ fn cloudAt(uv: vec2f) -> vec4f {
     let c = cloudAt(i.uv);
     var col = hdr * c.a + c.rgb;
     if (i32(F.ground.w) == 1) { col = hdr; }
+    if (F.bloom.x > 0.0) { col += textureSampleLevel(bloomTex, clampSamp, i.uv, 0.0).rgb * F.bloom.x / F.bloom.w; }
     // a flash close by lights everything up and floods the eye: the dark storm scene goes near white for an instant
     let fv = F.ambient.w;
     col = col * (1.0 + 3.0 * fv) + FLASH_COLOR * fv * 1.5 / max(F.sunCol.w, 0.2);
@@ -3823,6 +3830,106 @@ struct PaneOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @loca
 @fragment fn fsBolt(i: LineOut) -> @location(0) vec4f {
     let core = pow(1.0 - abs(i.uv.y), 1.5);
     return vec4f(tonemap(i.col.rgb * core), core);
+}
+
+// the bolts into the bloom chain's top level (Renderer.encodeBloom) before it is filtered, added (blend one, one): their
+// HDR light times F.post.w, so they glow far wider than their own pixels and the threshold would give. The chain is half
+// resolution and has no depth attachment, so the depth test against the scene is done here (reversed z)
+@fragment fn fsBoltGlow(i: LineOut) -> @location(0) vec4f {
+    let pix = min(vec2i(i.pos.xy * 2.0), vec2i(F.screen.xy) - 1);
+    if (i.pos.z < textureLoad(depthTex, pix, 0)) { discard; }
+    let core = pow(1.0 - abs(i.uv.y), 1.5);
+    return vec4f(i.col.rgb * core * F.post.w, 1.0);
+}
+`;
+
+// Bloom (Renderer.encodeBloom): the composite's HDR colour (scene behind the volumetrics, as fsComposite adds them)
+// above a soft threshold in exposed radiance goes into a mip chain at half resolution, is filtered down level by level
+// with a 13-tap box filter (the first one averaging its groups by 1 / (1 + luma), so a single bright pixel, a sun glint
+// or a lamp, cannot flicker as the view moves), then filtered back up with a 3x3 tent, each level adding onto the one
+// above. fsComposite adds the top level (the sum of the levels) times F.bloom.x / levels before the tonemap. Group 1:
+// the source level (the cloud history for the prefilter) and the scene's HDR colour.
+const WGSL_BLOOM = /* wgsl */`
+@group(1) @binding(0) var srcTex: texture_2d<f32>;
+@group(1) @binding(1) var hdrTex: texture_2d<f32>;
+
+struct FsIn { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
+
+@vertex fn vsBloom(@builtin(vertex_index) vi: u32) -> FsIn {
+    let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+    var o: FsIn;
+    o.pos = vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = vec2f(p.x, 1.0 - p.y);
+    return o;
+}
+
+fn bloomLuma(c: vec3f) -> f32 { return dot(c, vec3f(0.2126, 0.7152, 0.0722)); }
+
+// the composite's colour at uv, as fsComposite makes it before the bloom and the flash veil (clamped: no infinities)
+fn compositeAt(uv: vec2f) -> vec3f {
+    let hdr = textureSampleLevel(hdrTex, clampSamp, uv, 0.0).rgb;
+    let c = textureSampleLevel(srcTex, clampSamp, uv, 0.0);
+    let col = select(hdr * c.a + c.rgb, hdr, i32(F.ground.w) == 1);
+    return min(col, vec3f(6.0e4));
+}
+
+// 13 bilinear taps around uv, d apart (one source texel): the centre 2x2 box at weight 0.5, the four corner boxes at
+// 0.125 each. karis: each box weighted by 1 / (1 + luma) of its exposed colour
+fn down13(uv: vec2f, d: vec2f, pre: bool) -> vec3f {
+    var s: array<vec3f, 13>;
+    let offs = array<vec2f, 13>(
+        vec2f(-2.0, -2.0), vec2f(0.0, -2.0), vec2f(2.0, -2.0),
+        vec2f(-2.0, 0.0), vec2f(0.0, 0.0), vec2f(2.0, 0.0),
+        vec2f(-2.0, 2.0), vec2f(0.0, 2.0), vec2f(2.0, 2.0),
+        vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(1.0, 1.0));
+    for (var k = 0; k < 13; k++) {
+        let u = uv + offs[k] * d;
+        if (pre) { s[k] = compositeAt(u); } else { s[k] = textureSampleLevel(srcTex, clampSamp, u, 0.0).rgb; }
+    }
+    var boxes = array<vec3f, 5>(
+        (s[9] + s[10] + s[11] + s[12]) * 0.25,
+        (s[0] + s[1] + s[3] + s[4]) * 0.25,
+        (s[1] + s[2] + s[4] + s[5]) * 0.25,
+        (s[3] + s[4] + s[6] + s[7]) * 0.25,
+        (s[4] + s[5] + s[7] + s[8]) * 0.25);
+    var sum = vec3f(0.0);
+    var wsum = 0.0;
+    for (var k = 0; k < 5; k++) {
+        var w = select(0.125, 0.5, k == 0);
+        if (pre) { w /= 1.0 + bloomLuma(boxes[k]) * F.sunCol.w; }
+        sum += boxes[k] * w;
+        wsum += w;
+    }
+    return sum / wsum;
+}
+
+// full resolution composite into the top level, keeping what is brighter than the threshold (F.bloom.y, exposed) with a
+// quadratic soft knee F.bloom.z wide
+@fragment fn fsBloomPre(i: FsIn) -> @location(0) vec4f {
+    let c = down13(i.uv, 1.0 / F.screen.xy, true);
+    let br = max(c.r, max(c.g, c.b)) * F.sunCol.w;
+    let th = F.bloom.y;
+    let knee = max(F.bloom.z, 1e-4);
+    var rq = clamp(br - th + knee, 0.0, 2.0 * knee);
+    rq = rq * rq / (4.0 * knee);
+    return vec4f(c * max(rq, br - th) / max(br, 1e-4), 1.0);
+}
+
+@fragment fn fsBloomDown(i: FsIn) -> @location(0) vec4f {
+    return vec4f(down13(i.uv, 1.0 / vec2f(textureDimensions(srcTex, 0)), false), 1.0);
+}
+
+// the level below, a 3x3 tent of bilinear taps one of its texels apart, added onto this level (blend one, one)
+@fragment fn fsBloomUp(i: FsIn) -> @location(0) vec4f {
+    let d = 1.0 / vec2f(textureDimensions(srcTex, 0));
+    var sum = vec3f(0.0);
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let w = f32((2 - abs(x)) * (2 - abs(y)));
+            sum += textureSampleLevel(srcTex, clampSamp, i.uv + vec2f(f32(x), f32(y)) * d, 0.0).rgb * w;
+        }
+    }
+    return vec4f(sum / 16.0, 1.0);
 }
 `;
 
@@ -6614,12 +6721,15 @@ class GpuProfiler {
         this.reads = [0, 1, 2].map(() => ({ buf: device.createBuffer({ size: n * 8, usage: B.COPY_DST | B.MAP_READ }), busy: false }));
     }
 
-    // timestampWrites for a pass descriptor
-    writes(name) {
-        if (!this.enabled) return undefined;
+    // timestampWrites for a pass descriptor; a name spanning several passes passes first on its first one and last on its
+    // last one (both on a single pass)
+    writes(name, first = true, last = true) {
+        if (!this.enabled || !(first || last)) return undefined;
         this.ran.add(name);
-        const i = this.names.indexOf(name);
-        return { querySet: this.set, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 };
+        const i = this.names.indexOf(name), w = { querySet: this.set };
+        if (first) w.beginningOfPassWriteIndex = i * 2;
+        if (last) w.endOfPassWriteIndex = i * 2 + 1;
+        return w;
     }
 
     resolve(enc) {
@@ -6658,7 +6768,7 @@ class Renderer {
         const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
         if (!adapter) throw new Error('No WebGPU adapter available');
         this.device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('timestamp-query') ? ['timestamp-query'] : [] });
-        this.profiler = new GpuProfiler(this.device, ['weather', 'ground', 'scene', 'froxel', 'tiles', 'march', 'resolve', 'final']);
+        this.profiler = new GpuProfiler(this.device, ['weather', 'ground', 'scene', 'froxel', 'tiles', 'march', 'resolve', 'bloom', 'final']);
         this.device.lost.then(info => { if (info.reason !== 'destroyed') this.onError?.(new Error(`GPU device lost: ${info.message}`)); });
         this.device.addEventListener('uncapturederror', e => { console.error(e.error.message); this.lastError = e.error.message; });
         this.canvas = canvas;
@@ -6688,7 +6798,7 @@ class Renderer {
 
     createPipelines() {
         const d = this.device;
-        this.screenLayout = makeLayout(d, GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, ['tex', 'tex', 'depth']);
+        this.screenLayout = makeLayout(d, GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, ['tex', 'tex', 'depth', 'tex']);
         const scene = d.createShaderModule({ label: 'scene', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, WGSL_TERRAIN, wgslBus(1), WGSL_SCENE) });
         const final = d.createShaderModule({ label: 'final', code: shaderSource(this.worldSet, WGSL_SKY, WGSL_WEATHER_SAMPLE, WGSL_SHADOW_SAMPLE, WGSL_SHELTER, WGSL_BUILDING, WGSL_TERRAIN, wgslBus(2), WGSL_FINAL) });
         const layoutA = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout] });
@@ -6725,6 +6835,27 @@ class Renderer {
         this.pGlass = pipe(layoutGlass, final, 'vsGlass', 'fsGlass', this.format, { write: false, compare: 'greater' }, blendAlpha, structVerts);
         this.pPrecip = pipe(layoutB, final, 'vsPrecip', 'fsPrecip', this.format, { write: false, compare: 'greater' }, blendAlpha);
         this.pBolt = pipe(layoutB, final, 'vsBolt', 'fsBolt', this.format, { write: false, compare: 'greater' }, blendAdd);
+        // bloom (WGSL_BLOOM): fullscreen passes into the levels of this.bloom, no depth
+        this.bloomLayout = makeLayout(d, GPUShaderStage.FRAGMENT, ['tex', 'tex']);
+        const bloom = d.createShaderModule({ label: 'bloom', code: shaderSource(this.worldSet, WGSL_BLOOM) });
+        const layoutBloom = d.createPipelineLayout({ bindGroupLayouts: [this.worldSet.layout, this.bloomLayout] });
+        const bloomPipe = (fs, blend) => d.createRenderPipeline({
+            label: fs, layout: layoutBloom,
+            vertex: { module: bloom, entryPoint: 'vsBloom' },
+            fragment: { module: bloom, entryPoint: fs, targets: [{ format: 'rgba16float', blend }] },
+            primitive: { topology: 'triangle-list' },
+        });
+        this.pBloomPre = bloomPipe('fsBloomPre');
+        this.pBloomDown = bloomPipe('fsBloomDown');
+        const blendOne = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
+        this.pBloomUp = bloomPipe('fsBloomUp', blendOne);
+        // the bolts into its top level (fsBoltGlow)
+        this.pBoltGlow = d.createRenderPipeline({
+            label: 'fsBoltGlow', layout: layoutB,
+            vertex: { module: final, entryPoint: 'vsBolt' },
+            fragment: { module: final, entryPoint: 'fsBoltGlow', targets: [{ format: 'rgba16float', blend: blendOne }] },
+            primitive: { topology: 'triangle-list' },
+        });
     }
 
     setWorld(world) {
@@ -6796,12 +6927,47 @@ class Renderer {
         this.hdrView = this.hdr.createView();
         this.depthView = this.depth.createView();
         this.cloudPass.resize(Math.max(1, Math.ceil(w * scale)), Math.max(1, Math.ceil(h * scale)), this.depthView);
-        this.screenGroups = this.cloudPass.histViews.map((hv, k) => makeGroup(this.device, this.screenLayout, [hv, this.hdrView, this.depthView], `screen-${k}`));
+        // the bloom chain: half resolution down to no less than 4 texels a side
+        const bw = Math.max(1, w >> 1), bh = Math.max(1, h >> 1);
+        const levels = Math.max(1, Math.min(BLOOM_LEVELS, Math.floor(Math.log2(Math.min(bw, bh) / 4)) + 1));
+        this.bloom?.destroy();
+        this.bloom = this.device.createTexture({ size: [bw, bh], mipLevelCount: levels, format: 'rgba16float', usage: U.RENDER_ATTACHMENT | U.TEXTURE_BINDING });
+        this.bloomViews = Array.from({ length: levels }, (_, k) => this.bloom.createView({ baseMipLevel: k, mipLevelCount: 1 }));
+        this.bloomGroups = this.bloomViews.map((v, k) => makeGroup(this.device, this.bloomLayout, [v, this.hdrView], `bloom-${k}`));
+        this.bloomPreGroups = this.cloudPass.histViews.map((hv, k) => makeGroup(this.device, this.bloomLayout, [hv, this.hdrView], `bloom-pre-${k}`));
+        this.screenGroups = this.cloudPass.histViews.map((hv, k) => makeGroup(this.device, this.screenLayout, [hv, this.hdrView, this.depthView, this.bloomViews[0]], `screen-${k}`));
+        // for the bolts drawn into level 0: any other view in the bloom slot (unread there)
+        this.bloomSpare ??= this.device.createTexture({ size: [1, 1], format: 'rgba16float', usage: U.TEXTURE_BINDING });
+        const spare = levels > 1 ? this.bloomViews[1] : this.bloomSpare.createView();
+        this.boltGlowGroups = this.cloudPass.histViews.map((hv, k) => makeGroup(this.device, this.screenLayout, [hv, this.hdrView, this.depthView, spare], `bolt-glow-${k}`));
         return true;
     }
 
     // volumetrics false (render mode 'no volumetrics'): no froxel, march or resolve; the composite shows the scene only
-    render(enc, probeTexel, particles, bolts, interleave, shadowSlices, froxels, volumetrics = true, tiles = true) {
+    // bloom (WGSL_BLOOM): prefilter the composite into level 0 and add the lightning bolts (fsBoltGlow), filter down level
+    // by level, then back up, each level adding onto the one above it
+    encodeBloom(enc, hist, bolts) {
+        const prof = this.profiler, n = this.bloomViews.length, passes = 2 * n - 1 + (bolts ? 1 : 0);
+        let p = 0;
+        const pass = (pipeline, group, k, load, count = 3, instances = 1) => {
+            const r = enc.beginRenderPass({
+                label: 'bloom', timestampWrites: prof.writes('bloom', p === 0, p === passes - 1),
+                colorAttachments: [{ view: this.bloomViews[k], loadOp: load ? 'load' : 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+            });
+            r.setBindGroup(0, this.worldGroup);
+            r.setBindGroup(1, group);
+            r.setPipeline(pipeline);
+            r.draw(count, instances);
+            r.end();
+            p++;
+        };
+        pass(this.pBloomPre, this.bloomPreGroups[hist], 0, false);
+        if (bolts) pass(this.pBoltGlow, this.boltGlowGroups[hist], 0, true, 6, bolts);
+        for (let k = 1; k < n; k++) pass(this.pBloomDown, this.bloomGroups[k - 1], k, false);
+        for (let k = n - 2; k >= 0; k--) pass(this.pBloomUp, this.bloomGroups[k + 1], k, true);
+    }
+
+    render(enc, probeTexel, particles, bolts, interleave, shadowSlices, froxels, volumetrics = true, tiles = true, bloom = true) {
         const q = this.device.queue, prof = this.profiler;
         q.writeBuffer(this.frameBuf, 0, this.frame.data);
         q.writeBuffer(this.cellBuf, 0, this.cellData);
@@ -6848,6 +7014,7 @@ class Renderer {
 
         if (froxels && volumetrics) this.froxelPass.encode(enc, prof);
         const hist = volumetrics ? this.cloudPass.encode(enc, prof, interleave, tiles) : this.cloudPass.cur;
+        if (bloom) this.encodeBloom(enc, hist, bolts);
 
         const b = enc.beginRenderPass({
             label: 'final', timestampWrites: prof.writes('final'),
@@ -7219,7 +7386,7 @@ class Hud {
         this.help.innerHTML = [
             '<b>drag</b> look   <b>WASD</b> move   <b>Space/C</b> up/down   <b>Shift</b> ×5   <b>wheel</b> speed   <b>right click</b> (or Ctrl + click) grow a storm cell there',
             '<b>1-9</b> weather   <b>0</b> auto   <b>N</b> rain   <b>J</b> cloud   <b>K</b> lightning   <b>, .</b> weather time scale   <b>T</b> lighting   <b>arrows</b> move the sun',
-            '<b>Q</b> quality   <b>M</b> render   <b>F</b> froxels   <b>G</b> tiles   <b>V</b> view   <b>B</b> bus   <b>hold Z</b> buses ×10   <b>R</b> radar   <b>L</b> flashlight   <b>I</b> labels   <b>U</b> sound   <b>P</b> pause   <b>H</b> help',
+            '<b>Q</b> quality   <b>M</b> render   <b>F</b> froxels   <b>G</b> tiles   <b>O</b> bloom   <b>V</b> view   <b>B</b> bus   <b>hold Z</b> buses ×10   <b>R</b> radar   <b>L</b> flashlight   <b>I</b> labels   <b>U</b> sound   <b>P</b> pause   <b>H</b> help',
             '<b>X</b> walk / fly   <b>E</b> open / shut a door, sit / stand (aboard)   on foot: <b>WASD</b> walk, <b>Shift</b> run   ·   drop a scenario .json on the page',
         ].join('\n');
     }
@@ -7324,6 +7491,7 @@ class App {
         this.flashlight = false;     // L: a torch in hand, along the view
         this.froxels = true;
         this.tiles = true;
+        this.bloom = true;           // O
         this.viewProj = new Float32Array(16);
         this.prevViewProj = null;
         this.frameNo = 0;
@@ -7394,9 +7562,10 @@ class App {
         this.menus.quality.set(QUALITY[this.quality].name, QUALITY.map((q, i) => radio(`${q.name} · ${q.scale * 100}% · ${q.steps} steps`, i === this.quality, () => this.setQuality(i))));
         this.menus.render.set(RENDER_MODES[this.mode], RENDER_MODES.map((m, i) => radio(m, i === this.mode, () => this.setMode(i))));
         const prof = this.renderer.profiler;
-        this.menus.gpu.set([this.froxels && 'froxels', this.tiles && 'tiles'].filter(Boolean).join(' + ') || 'basic', [
+        this.menus.gpu.set([this.froxels && 'froxels', this.tiles && 'tiles', this.bloom && 'bloom'].filter(Boolean).join(' + ') || 'basic', [
             { label: `froxel lighting ${FROXEL.join('×')}`, kind: 'check', on: this.froxels, pick: () => this.toggleFroxels() },
             { label: 'cloud tile pre-pass', kind: 'check', on: this.tiles, pick: () => this.toggleTiles() },
+            { label: 'bloom', kind: 'check', on: this.bloom, pick: () => this.toggleBloom() },
             { sep: true },
             ...(prof.enabled ? [['total', prof.total], ...Object.entries(prof.ms)].map(([n, v]) => ({ label: n, kind: 'info', key: `${v.toFixed(1)} ms` }))
                 : [{ label: 'no timestamp queries on this adapter', kind: 'info' }]),
@@ -7459,6 +7628,12 @@ class App {
     toggleTiles() {
         this.tiles = !this.tiles;
         this.hud.toast(`Cloud tile pre-pass: ${this.tiles ? 'on' : 'off'}`);
+        this.syncMenus();
+    }
+
+    toggleBloom() {
+        this.bloom = !this.bloom;
+        this.hud.toast(`Bloom: ${this.bloom ? 'on' : 'off'}`);
         this.syncMenus();
     }
 
@@ -7658,6 +7833,7 @@ class App {
                 case 'KeyU': this.hud.toast(`Sound ${this.sound.toggle() ? 'on' : 'off'}`); break;
                 case 'KeyR': this.radar = !this.radar; break;
                 case 'KeyG': this.toggleTiles(); break;
+                case 'KeyO': this.toggleBloom(); break;
                 case 'KeyF': this.toggleFroxels(); break;
                 case 'KeyM': this.setMode((this.mode + 1) % RENDER_MODES.length); break;
                 case 'KeyQ': this.setQuality((this.quality + 1) % QUALITY.length); break;
@@ -7842,7 +8018,8 @@ class App {
         F.set('lod', [q.interleave, full ? 1 : SHADOW_SLICES, full ? 0 : this.frameNo % SHADOW_SLICES, q.detail]);
         this.shadowSlices = full ? 1 : SHADOW_SLICES;
         F.set('froxel', [FROXEL_NEAR, cfg.maxDistance, this.froxels ? 1 : 0, 0]);
-        F.set('post', [q.blur || 0, this.tiles ? 1 : 0, this.radarTop || 0, 0]);
+        F.set('post', [q.blur || 0, this.tiles ? 1 : 0, this.radarTop || 0, cfg.bloomBolt]);
+        F.set('bloom', [this.bloom ? cfg.bloom : 0, cfg.bloomThreshold, cfg.bloomKnee, r.bloomViews?.length || 1]);
         // heavy rain: up to three times the drops (big drops, past intensity 0.6)
         const drops = this.drops = w.rainZones.drops(cam.pos[0], cam.pos[2], c.drops);
         this.rainParticles = Math.round(cfg.particles * (1 + 2 * sat01((this.near.rain - 0.6) / 0.8) * drops));
@@ -7934,7 +8111,7 @@ class App {
         const enc = r.device.createCommandEncoder();
         const total = this.near.rain + this.near.snow;
         const particles = total > 0.005 ? this.splashStart + (this.near.rain > 0.02 ? SPLASH_PARTICLES : 0) : 0;
-        r.render(enc, this.probeTexel, particles, w.lightning.count, QUALITY[this.quality].interleave, this.shadowSlices, this.froxels, this.mode !== 1, this.tiles);
+        r.render(enc, this.probeTexel, particles, w.lightning.count, QUALITY[this.quality].interleave, this.shadowSlices, this.froxels, this.mode !== 1, this.tiles, this.bloom && this.cfg.bloom > 0);
         r.device.queue.submit([enc.finish()]);
         r.weatherPass.afterSubmit();
         r.profiler.afterSubmit();

@@ -145,8 +145,16 @@ Each frame runs these passes. All distances are metres and heights are above sea
 
    A **temporal resolve** reprojects the history using the transmittance-weighted depth, clips it to
    the variance of the pixels marched this frame nearby, and blends.
-7. **Final** (`WGSL_FINAL`):
-   - Composite and ACES tonemap.
+7. **Bloom** (`WGSL_BLOOM`, `Renderer.encodeBloom`): the composite's HDR colour above a soft threshold (`bloomThreshold`,
+   in exposed radiance, with a quadratic knee `bloomKnee` wide) goes into a mip chain at half resolution (up to 6 levels,
+   none smaller than 4 texels). The first downsample is a 13-tap filter whose boxes are averaged by 1 / (1 + luma), so a
+   single bright pixel (a sun glint, a lamp) cannot flicker as the view moves. The chain is filtered down level by level,
+   then back up with a 3 × 3 tent, each level adding onto the one above it. Lamps, lit pavement at night, the sun and
+   sunlit cloud edges get a soft glow. The lightning bolts are drawn into the top level too (`fsBoltGlow`, their HDR
+   light times `bloomBolt`, depth tested against the scene by hand), so they get a wide halo of their own. About 0.7 ms on the test machine. `O` or the **gpu** menu switches it off.
+8. **Final** (`WGSL_FINAL`):
+   - Composite, plus the bloom (its top level times `bloom` / the number of levels), and ACES tonemap. The near-field
+     particles and window glass are drawn after it, so they do not bloom.
    - Near-field rain streaks and snowflakes in a box that wraps around the camera. Their amount comes
      from a one-texel GPU readback of the weather map and the shadow map's low cloud above the camera. How the rain
      looks follows the state's drop size (see **Rain variants**), and rain runs off the roof edges near the camera.
@@ -218,7 +226,7 @@ and from 25–28 ms to 10–12 ms at high.
 | N | rain variants: drizzle, light rain, medium rain, downpour, mixed rain (see **Rain variants**) |
 | 1–9 | weather states: clear, fair cumulus, mackerel sky, warm front, stratus deck, showers, thunderstorm, snow squalls, overcast rain (they blend over `transition` seconds). A 10th, severe storms, is reached by auto-cycle and by the shelf and mothership views |
 | 0 | auto-cycle the weather states |
-| menu bar (top right, above the radar) | first row: **weather** (pick one state, plus an **auto cycle** check), **rain** (pick one rain variant), **time** (the weather time scale), **clouds** (check any of the persistent clouds to show them), **tornado** and **hurricane** (pick off or a category). Second row: **view** (jump to one), **move** (fly or walk), **bus** (go to one, plus a latched **buses ×10** check), **lighting** (the scenario's presets), **quality**, **render** mode, and **gpu** (froxel lighting and the cloud tile pre-pass as checks, with the GPU timings per pass). Pick-one menus close on a pick; menus of checks stay open. Esc or a click elsewhere closes a menu; the keys below do the same as the menus and the menus follow them |
+| menu bar (top right, above the radar) | first row: **weather** (pick one state, plus an **auto cycle** check), **rain** (pick one rain variant), **time** (the weather time scale), **clouds** (check any of the persistent clouds to show them), **tornado** and **hurricane** (pick off or a category). Second row: **view** (jump to one), **move** (fly or walk), **bus** (go to one, plus a latched **buses ×10** check), **lighting** (the scenario's presets), **quality**, **render** mode, and **gpu** (froxel lighting, the cloud tile pre-pass and bloom as checks, with the GPU timings per pass). Pick-one menus close on a pick; menus of checks stay open. Esc or a click elsewhere closes a menu; the keys below do the same as the menus and the menus follow them |
 | K | lightning from the nearest raining cell |
 | J | hide / show the persistent cloud last picked in the **clouds** menu: the scenario's supercells (motherships), squall lines and pinned or held cells. They start hidden; a view that follows one (Mothership, Shelf cloud) shows it. A hidden cloud drops out of the weather map, the analytic structures, lightning and the labels; it keeps evolving, so it comes back where it would be |
 | tornado menu | next to the clouds menu (only with a supercell in the scenario): **off** (the default) or a tornado of category **F1-F5** under the wall cloud of the supercell showing (it shows the scenario's first supercell if none is). F1 is a leaning rope whose funnel only condenses part way down, over a small debris whirl; up the scale the funnel widens into a cone and, at F4-F5, a wedge with subvortices and a broad debris cloud. It touches down over a few seconds and is marched on its own, so even a rope a few tens of metres across stays solid at a distance |
@@ -228,6 +236,7 @@ and from 25–28 ms to 10–12 ms at high.
 | R | radar inset |
 | F | froxel lighting on / off |
 | G | cloud tile pre-pass on / off |
+| O | bloom on / off |
 | M | render mode: shaded, no volumetrics (skips the volumetric passes), clouds only, precipitation only |
 | Q | quality: low / medium / high / ultra (volumetric resolution, steps, light steps, interleave, detail distance, cloud blur) |
 | V, I, P, H | next view, labels, pause weather, help |
@@ -481,7 +490,7 @@ the same way. Their tops get more sky light than their undersides, which is what
 | Key | Contents |
 |---|---|
 | `terrain` | `size` (m), `resolution`, `base` height, `fieldSize` (m, farm sections), `pivots` (chance of a centre-pivot circle per section) |
-| `render` | `quality` (0–3), `shapeScale` / `detailScale` (m per noise tile), `detailStrength`, `maxTop` (top of the cloud slab), `maxDistance`, `weatherSize` (m), `rainExtinction` / `snowExtinction` (1/m at full intensity), `slant` (s/m), `fallSpeed` (streak scroll, m/s), `timeScale`, `particles` |
+| `render` | `quality` (0–3), `shapeScale` / `detailScale` (m per noise tile), `detailStrength`, `maxTop` (top of the cloud slab), `maxDistance`, `weatherSize` (m), `rainExtinction` / `snowExtinction` (1/m at full intensity), `slant` (s/m), `fallSpeed` (streak scroll, m/s), `timeScale`, `particles`, `bloom` (strength, 0 off; default 1.5), `bloomThreshold` / `bloomKnee` (exposed radiance where the glow starts and how softly; 1, 0.5), `bloomBolt` (how much the lightning bolts add to the bloom; 0.1) |
 | `clouds` | up to 4 cloud genus layers (below) |
 | `weather` | `start`, `transition` (s), `cycle` { `enabled`, `hold` }, `states` { name: state } |
 | `entities` | `{ type, id, label, ... }`, where `type` maps to a class in `ENTITY_TYPES` (below), applied in order |
@@ -631,7 +640,7 @@ WGSL_OCCUPANCY, WGSL_NOISE, WGSL_WEATHER,  compute: occupancy grid, noise volume
 WGSL_SHADOW, WGSL_GROUND                   ground state
 WGSL_FROXEL, WGSL_SKIP_SAMPLE,             compute: froxel lighting, occupancy / tile lookups, cloud tile pre-pass,
 WGSL_TILES, WGSL_MARCH, WGSL_RESOLVE       volumetric march, temporal resolve
-WGSL_SCENE, WGSL_FINAL                     render: sky / terrain; composite, precipitation particles, bolts, radar
+WGSL_SCENE, WGSL_FINAL, WGSL_BLOOM         render: sky / terrain; composite, precipitation particles, bolts, radar; bloom
 WGSL_SHELTER                               structure boxes: rain shadows, sun shadows, sky occlusion, enclosed interiors; the bus cabin;
                                            the lights (lightAt, lightSeen, lampsAt, lampsOnDrop, lampScatter)
 WGSL_BUILDING                              building records: frames, storeys, window layout, sun through a window, lamps
