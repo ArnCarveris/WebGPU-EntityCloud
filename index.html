@@ -128,6 +128,8 @@
               dry { state, count } }: those states' rain at once, in stretches along the bus route, with `count` dry
               stretches under the `dry` state's sky (the deck opens there), reshuffled after a random hold } }
     hurricane { pos [x, z] }: where the eye of a hurricane picked in the hurricane dropdown sits (default [0, 0])
+    streetLights { pos [x, z] (default the hurricane's), radius, density }: a town painted there whose street grid is lit by
+              night with fake lamps (World.buildFarLights); the other towns stay dark
     entities  { type, id, label, ... }, type in ENTITY_TYPES, applied in order:
               terrain  tilt { dir, drop } | hills { amplitude, scale, octaves, seed, ridged } | mountain { pos, radius, height, roughness }
                        range { path, width, height, roughness, seed } | river { path, width, depth, bank } | lake { pos, radius, level }
@@ -292,6 +294,7 @@
     },
 
     "hurricane": { "pos": [2000, -8000] },
+    "streetLights": { "radius": 4000, "density": 0.95 },
 
     "views": [
         { "name": "Airliner (photo view)", "pos": [9000, 7400, 22000], "look": [3200, 2500, 0] },
@@ -367,6 +370,18 @@ const MAX_LIGHTS = 64;               // point and spot lights in the frame unifo
 const LIGHT_RANGE = 700;             // m: lights further from the camera than this (less their reach) are left out
 const LIGHT_GRID = 32;               // cells per side over the lights' reach, each listing the lights that reach into it (2 x 32 bits)
 const LIGHT_CABIN = 1, LIGHT_SPOT = 2;  // light flags: a bus's cabin glow (not on the cabin's own surfaces), a spot (cone)
+// distant lights by night (World.buildFarLights, WGSL_FAR): every lamp as a glowing point sprite, lighting nothing
+// per far light: [x, y, z, size (m)] [rgb intensity, fake] [axis, cos of the cone's edge (-2 none)] [cos of its core, range (m), ground height, -]
+const FAR_FLOATS = 16;
+const POOL_ALBEDO = [0.15, 0.165, 0.14];  // the ground under a real lamp far off (asphalt and verge), as its pool decal (vsFarPool) takes it
+const MAX_FAR_DYN = 32;              // slots after the static ones, rewritten each frame: the buses' lights
+const TOWN_BLOCK = 120, FAR_LAMP_PITCH = 40;  // m: townColor's street grid, and the fake street lamps' spacing along it
+const FAR_LAMP_SIDE = 5, FAR_LAMP_H = 7, FAR_LAMP_REACH = 1.5;     // m: their heads off the street's centre line (alternate sides), above the ground
+const ROAD_LAMP_STEP = 100;          // m between the pairs of street lamps along the bus road (BusLine.build)
+const POLE_DRAW = 1000;              // m: the fake lamps' poles and heads are drawn this close (instanced, World.nearPoles)
+const MAX_POLES = 2048;
+const MAX_GLOWS = 6;                 // light-pollution domes (cityGlow): the towns, and clusters of the structures' lamps
+const GLOW_GAIN = 6;                 // light pollution: the lamps' uplight (off the ground, out of the fixtures), as bright as it looks
 const MAX_RAIN_ZONES = 64;           // points along the bus route with their own rain rate (RainZones, mixed rain)
 const ZONE_STEP = 300, ZONE_RADIUS = 380;  // m between them, how far each one's rain reaches
 const CLEAR_RADIUS = 450, CLEAR_WIDE = 3;   // a clear stretch's opening: m past its ends along the route, x that across it
@@ -572,6 +587,13 @@ const fromHalf = h => {
 };
 
 // -------------------------------------------------------------------------------------------------- noise
+// WGSL's pcg, bit for bit
+function pcg32(v) {
+    const s = (Math.imul(v >>> 0, 747796405) + 2891336453) >>> 0;
+    const w = Math.imul(((s >>> ((s >>> 28) + 4)) ^ s) >>> 0, 277803737) >>> 0;
+    return ((w >>> 22) ^ w) >>> 0;
+}
+
 function hash2(ix, iy, seed) {
     let h = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(seed, 1442695041)) | 0;
     h = Math.imul(h ^ (h >>> 13), 1274126177);
@@ -635,6 +657,7 @@ class Heightfield {
         this.base = base;
         this.h = new Float32Array(n * n).fill(base);
         this.land = new Float32Array(n * n * 3);
+        this.lamp = new Float32Array(n * n);   // share of the fake street lamps kept (World.buildFarLights), landTex's alpha
         this.min = base;
         this.max = base;
     }
@@ -666,11 +689,11 @@ class Heightfield {
 
     paint(idx, channel, value) { const k = idx * 3 + channel; this.land[k] = Math.max(this.land[k], value); }
 
-    // land use channel (0 town, 1 forest, 2 water) at x, z, filtered like the GPU's landTex
+    // land use channel (0 town, 1 forest, 2 water, 3 the lamp share) at x, z, filtered like the GPU's landTex
     landAt(x, z, ch) {
         const n = this.n, fx = clamp(this.ci(x), 0, n - 1), fz = clamp(this.ci(z), 0, n - 1);
         const i = Math.min(Math.floor(fx), n - 2), j = Math.min(Math.floor(fz), n - 2), tx = fx - i, tz = fz - j, L = this.land;
-        const at = (a, b) => L[(b * n + a) * 3 + ch];
+        const at = ch === 3 ? (a, b) => this.lamp[b * n + a] : (a, b) => L[(b * n + a) * 3 + ch];
         return lerp(lerp(at(i, j), at(i + 1, j), tx), lerp(at(i, j + 1), at(i + 1, j + 1), tx), tz);
     }
 
@@ -721,7 +744,7 @@ class Heightfield {
             out[k * 4] = clamp(this.land[k * 3], 0, 1) * 255;
             out[k * 4 + 1] = clamp(this.land[k * 3 + 1], 0, 1) * 255;
             out[k * 4 + 2] = clamp(this.land[k * 3 + 2], 0, 1) * 255;
-            out[k * 4 + 3] = 255;
+            out[k * 4 + 3] = clamp(this.lamp[k], 0, 1) * 255;
         }
         return out;
     }
@@ -798,7 +821,7 @@ const FRAME_LAYOUT = [
     ['blockGrid', `array<vec4u, ${BLOCK_GRID * BLOCK_GRID}>`], // per cell of blockBox: bit k set if box k can shade a point in it
     // the bus nearest the camera, or the one ridden (BusLine): world to its frame (each bus is drawn with its own, wgslBus)
     ['busInv', 'mat4x4f'],
-    ['lightInfo', 'vec4f'], // lights in lights, lamps on (night), -, the air's scattering for their halos and beams (1/m)
+    ['lightInfo', 'vec4f'], // lights in lights, lamps on (night), the distance their fade ends (m, farLampReal), the air's scattering for their halos and beams (1/m)
     // [x, y, z, range (m)] [rgb intensity (adapted to the exposure), cos of the cone's edge] [cone axis, cos of its full core]
     ['lights', `array<vec4f, ${MAX_LIGHTS * 4}>`],    // ... [flags, size squared (m^2: softens the falloff close to it), -, -]
     ['lightMask', `array<vec4u, ${MAX_LIGHTS}>`],
@@ -806,6 +829,8 @@ const FRAME_LAYOUT = [
     ['lightGrid', `array<vec4u, ${LIGHT_GRID * LIGHT_GRID / 2}>`], // per cell of lightBox (two to a vec4u): bit k set if light k reaches into it // per light: bit k set if box k of blockers can stand between it and what it lights
     ['cabinLo', 'vec4f'],   // its body in its frame (inCabin): min corner, bus on
     ['cabinHi', 'vec4f'],   // max corner, -
+    ['glowInfo', 'vec4f'],  // light-pollution domes in glows (0 by day), their gain (adapted to the exposure), -, -
+    ['glows', `array<vec4f, ${MAX_GLOWS}>`], // x, z, radius (m), total intensity of their lamps
 ];
 
 class FrameBlock {
@@ -984,6 +1009,21 @@ fn skyColor(dir: vec3f) -> vec3f {
 }
 
 const FLASH_COLOR = vec3f(0.75, 0.82, 1.0);
+
+// Light pollution by night (World.buildFarLights): the light a town's lamps send up, off the ground and out of the
+// fixtures, reaching p (the cloud base, the haze, the rain over it). Each dome is a disc of lamps of its radius on
+// the ground, seen from p as one source at its centre softened by that radius. No shadows, no cloud in between.
+const GLOW_COLOR = vec3f(1.0, 0.66, 0.36);
+fn cityGlow(p: vec3f) -> vec3f {
+    var e = 0.0;
+    let h = max(p.y - F.misc.z, 0.0);
+    for (var k = 0; k < i32(F.glowInfo.x); k++) {
+        let g = F.glows[k];
+        let d = p.xz - g.xy;
+        e += g.w / (g.z * g.z + dot(d, d) + h * h);
+    }
+    return GLOW_COLOR * e * F.glowInfo.y;
+}
 
 `;
 
@@ -2265,7 +2305,7 @@ fn inject(@builtin(global_invocation_id) gid: vec3u) {
         }
         sh.x *= exp(-od * 0.5);                                       // 0.5: the curtains fill about half the shaft
     }
-    textureStore(froxelOut, gid, vec4f(sh, min(flashLit(p), 60000.0), 0.0));
+    textureStore(froxelOut, gid, vec4f(sh, min(flashLit(p), 60000.0), cityGlow(p).r));   // w: GLOW_COLOR.r is 1
 }
 `;
 
@@ -2351,15 +2391,15 @@ fn tileMask(px: vec2u) -> vec2u {
     return m | up | down;
 }
 
-// sun transmittance, sky light and lightning at p, from the froxel volume
-fn froxelAt(p: vec3f) -> vec3f {
+// sun transmittance, sky light, lightning and the towns' glow (its strength, cityGlow / GLOW_COLOR) at p, from the froxel volume
+fn froxelAt(p: vec3f) -> vec4f {
     let v = p - F.cam.xyz;
     let z = max(dot(v, F.fwd.xyz), F.froxel.x);
     let r = F.right.xyz;
     let u = F.up.xyz;
     let uvw = vec3f(dot(v, r) / (dot(r, r) * z) * 0.5 + 0.5, dot(v, u) / (dot(u, u) * z) * 0.5 + 0.5,
                     log(z / F.froxel.x) / log(F.froxel.y / F.froxel.x));
-    return textureSampleLevel(froxelTex, clampSamp, uvw, 0.0).xyz;
+    return textureSampleLevel(froxelTex, clampSamp, uvw, 0.0);
 }
 
 fn hazeDensity(y: f32) -> f32 { return F.zenith.w * exp(-max(y - F.misc.z, 0.0) / F.horizon.w); }
@@ -2415,7 +2455,10 @@ fn cloudLight(p: vec3f, mu: f32, dirY: f32, w: vec4f, lightSteps: i32, stepScale
     let amb = F.ambient.rgb * mix(deep, surface, side) * ambScale;
     // light the ground bounces up into the base, where the sun reaches the ground below
     let bounce = F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.03 * (1.0 - h) * mix(ca.y, 1.0, side);
-    return F.sunCol.rgb * sun + amb + bounce + FLASH_COLOR * flashLit(p) * 0.05;
+    // by night the towns' light from below, into the base (the light pollution that tints overcast orange)
+    var glow = vec3f(0.0);
+    if (F.glowInfo.x > 0.0) { glow = cityGlow(p) * (1.0 - h) * (1.0 - h); }
+    return F.sunCol.rgb * sun + amb + bounce + glow + FLASH_COLOR * flashLit(p) * 0.05;
 }
 
 // The spray rain throws up where it hits the ground (rain extinction, 1/m, over the march step [ta, tb] of the ray from
@@ -2718,9 +2761,11 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                 // in the bus: sheltered, nothing to take
             } else if (p.y < base + 700.0) {
                 // light from the froxel volume, or evaluated here (z < 0: lightning not looked up yet)
-                var fx = vec3f(0.0, 0.0, -1.0);
-                if (froxels) { fx = froxelAt(p); } else { fx = vec3f(shadowAt(p), -1.0); }
+                var fx = vec4f(0.0, 0.0, -1.0, -1.0);
+                if (froxels) { fx = froxelAt(p); } else { fx = vec4f(shadowAt(p), -1.0, -1.0); }
                 let sh = fx.xy;
+                var glow = vec3f(0.0);
+                if (F.glowInfo.x > 0.0) { if (froxels) { glow = GLOW_COLOR * fx.w; } else { glow = cityGlow(p); } }
                 if (doPrecip) {
                     let src = precipSourceAt(p);
                     var pd = precipDensity(p, src);
@@ -2731,7 +2776,7 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                         // and what the ground bounces up where the sun reaches it
                         // (deep in the rain), or with sky from the side near a shaft's edge seen from outside (side)
                         let deepAmb = sh.y * diffuseLook((sh.y - 0.12) / 0.88, dir.y);
-                        let amb = F.ambient.rgb * mix(deepAmb, 0.25 + 0.75 * sh.y, side) + F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.02 * sh.x;
+                        let amb = F.ambient.rgb * mix(deepAmb, 0.25 + 0.75 * sh.y, side) + F.sunCol.rgb * max(F.sunDir.y, 0.0) * 0.02 * sh.x + glow;
                         S += pd.x * (F.sunCol.rgb * sh.x * rainPhase + amb * 0.85) * 0.9;
                         S += pd.y * (F.sunCol.rgb * sh.x * snowPhase * 0.6 + amb * 1.25) * 0.95;
                         // the spray: fine droplets, lit from all round, whiter than the falling rain
@@ -2747,12 +2792,13 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
                     let hd = hazeDensity(p.y);
                     var fl = fx.z;
                     if (fl < 0.0) { fl = flashLit(p); }
-                    S += hd * (hazeLight(mu, sh) + FLASH_COLOR * fl * 0.05);   // the air under a storm lights up too
+                    S += hd * (hazeLight(mu, sh) + glow + FLASH_COLOR * fl * 0.05);   // the air under a storm lights up too
                     sigma += hd;
                 }
             } else if (doHaze) {
                 let hd = hazeDensity(p.y);
                 S += hd * hazeLight(mu, vec2f(1.0));
+                if (F.glowInfo.x > 0.0) { S += hd * cityGlow(p); }
                 sigma += hd;
             }
             if (medium < 1e-5) { airSeen = true; odIn = 0.0; } else { odIn += medium * ds; }
@@ -2783,7 +2829,9 @@ fn march(@builtin(global_invocation_id) gid: vec3u) {
         let a = max(t1, 0.0);
         let od = hazeOD(ro.y + dir.y * a, ro.y + dir.y * sceneT, sceneT - a);
         let tr = exp(-od);
-        col += T * hazeLight(mu, vec2f(1.0)) * (1.0 - tr);
+        var glow = vec3f(0.0);
+        if (F.glowInfo.x > 0.0) { glow = cityGlow(ro + dir * mix(a, sceneT, 0.5)); }   // the domes over the far towns
+        col += T * (hazeLight(mu, vec2f(1.0)) + glow) * (1.0 - tr);
         T *= tr;
     }
 
@@ -3082,6 +3130,71 @@ fn townColor(xz: vec2f, px: f32) -> vec3f {
     return mix(c, vec3f(0.36, 0.36, 0.35), s);
 }
 
+// The fake street lamps (World.buildFarLights): on townColor's street grid, one every ${FAR_LAMP_PITCH} m, 7 m up, kept by
+// the same hash as there against the lamp share (landTex's alpha); a quarter of the districts have white LEDs
+fn farLampKey(c: vec2i) -> u32 { return pcg(u32(c.x + 65536) * 196613u + u32(c.y + 65536)); }
+fn farLampColor(xz: vec2f) -> vec3f {
+    let d = vec2i(floor(xz / 600.0)) + 1000;
+    if (f32(pcg(u32(d.x) * 4099u + u32(d.y))) / 4294967295.0 < 0.25) { return vec3f(0.90, 0.94, 1.0) * 55.0; }   // LAMPS.led
+    return vec3f(1.0, 0.58, 0.24) * 85.0;                                                                         // LAMPS.sodium
+}
+// how much of fake lamp at q is a real light now (App.writeLights takes the ones near the camera, nearest first, and
+// fades them out toward the furthest taken, F.lightInfo.z): its pool here gives way by as much, so the switch cannot show
+fn farLampReal(q: vec3f) -> f32 {
+    let cut = F.lightInfo.z;
+    return 1.0 - smoothstep(cut * 0.7, cut, max(distance(q, F.cam.xyz) - 34.0, 0.0));   // LAMPS.sodium.range
+}
+// the light of lamp c (grid point, in units of the pitch; its head off the street along side) at the ground point p,
+// with normal n, seen along v: as lampsAt shades a real light (lightAt: windowed inverse square, softened by its size)
+fn farLampPool(p: vec3f, n: vec3f, v: vec3f, shin: f32, c: vec2i, side: vec2f, share: f32) -> Lamps {
+    var o = Lamps(vec3f(0.0), vec3f(0.0));
+    if (f32(farLampKey(c)) / 4294967295.0 >= share) { return o; }
+    let q = vec3f(vec2f(c) * ${FAR_LAMP_PITCH}.0 + side * ${FAR_LAMP_SIDE}.0, p.y + ${FAR_LAMP_H}.0).xzy;
+    let d = q - p;
+    let d2 = dot(d, d);
+    let r2 = 34.0 * 34.0;                                          // LAMPS: range, size
+    if (d2 >= r2) { return o; }
+    let l = d * inverseSqrt(d2);
+    let nl = dot(n, l);
+    if (nl <= 0.0) { return o; }
+    let x = d2 / r2;
+    let win = sat(1.0 - x * x);
+    let col = farLampColor(vec2f(c) * ${FAR_LAMP_PITCH}.0) * win * win / (d2 + 0.36) * nl * (1.0 - farLampReal(q));
+    o.d = col;
+    let h = normalize(l + v);
+    o.s = col * pow(max(dot(n, h), 0.0), shin) * (shin + 8.0) / (8.0 * PI);
+    return o;
+}
+// their light on the town's ground by night (adapted to the exposure as the lights are): the nearest lamps on the two
+// streets nearest p, those not taken as real lights yet; far off, where a pixel spans several lamps, their mean
+// (5 lamps per block). Heads alternate sides along a street: + on even lamps
+fn streetGlow(p: vec3f, n: vec3f, v: vec3f, shin: f32, px: f32, share: f32) -> Lamps {
+    var o = Lamps(vec3f(0.0), vec3f(0.0));
+    if (F.lightInfo.y < 0.5 || share < 0.004) { return o; }
+    let P = ${FAR_LAMP_PITCH}.0;
+    let m = ${TOWN_BLOCK / FAR_LAMP_PITCH};
+    let far = smoothstep(3.0, 20.0, px);
+    if (far < 1.0) {
+        let a = vec2i(i32(round(p.x / (P * f32(m)))) * m, i32(round(p.z / P)));     // along the nearest street along z
+        let b = vec2i(i32(round(p.x / P)), i32(round(p.z / (P * f32(m)))) * m);     // along the nearest street along x
+        for (var k = -1; k <= 1; k++) {
+            let ca = a + vec2i(0, k);
+            let la = farLampPool(p, n, v, shin, ca, vec2f(select(1.0, -1.0, (ca.y & 1) != 0), 0.0), share);
+            o.d += la.d; o.s += la.s;
+            let cb = b + vec2i(k, 0);
+            if (cb.x % m != 0) {
+                let lb = farLampPool(p, n, v, shin, cb, vec2f(0.0, select(1.0, -1.0, (cb.x & 1) != 0)), share);
+                o.d += lb.d; o.s += lb.s;
+            }
+        }
+    }
+    let mean = farLampColor(p.xz) * share * ${(5 * 2 * Math.PI / (TOWN_BLOCK * TOWN_BLOCK)).toFixed(6)} * (1.0 - farLampReal(p + vec3f(0.0, ${FAR_LAMP_H}.0, 0.0)));
+    let e = 1.0 / max(F.sunCol.w, 0.2);
+    o.d = mix(o.d, mean, far) * e;
+    o.s *= (1.0 - far) * e;
+    return o;
+}
+
 @fragment fn fsTerrain(i: TerrOut) -> @location(0) vec4f {
     let p = i.world;
     let px = max(length(fwidth(p.xz)), 0.05);
@@ -3089,8 +3202,8 @@ fn townColor(xz: vec2f, px: f32) -> vec3f {
     let inside = all(uv > vec2f(0.0)) && all(uv < vec2f(1.0));
     let th = terrainHeight(p.xz);
     let n = th.yzw;
-    var land = textureSampleLevel(landTex, clampSamp, uv, 0.0).xyz;
-    if (!inside) { land = vec3f(0.0); }
+    let land4 = select(vec4f(0.0), textureSampleLevel(landTex, clampSamp, uv, 0.0), inside);
+    let land = land4.xyz;
     var alb = fieldColor(p.xz, px);
     alb = mix(alb, townColor(p.xz, px), sat(land.x * (0.6 + 0.8 * vnoise2(p.xz / 700.0)) * 1.4 - 0.2));
     let forest = sat(land.y * (0.4 + vnoise2(p.xz / 300.0)) * 1.3);
@@ -3121,7 +3234,10 @@ fn townColor(xz: vec2f, px: f32) -> vec3f {
 
     let v = normalize(F.cam.xyz - p);
     // the lights: a sharp highlight on puddles and water, a broad one on the wet film (the long streaks of a wet road)
-    let lp = lampsAt(p + n * 0.05, nw, v, mix(60.0, 900.0, pool), 0u);
+    var lp = lampsAt(p + n * 0.05, nw, v, mix(60.0, 900.0, pool), 0u);
+    let sg = streetGlow(p + n * 0.05, nw, v, mix(60.0, 900.0, pool), px, land4.w);
+    lp.d += sg.d;
+    lp.s += sg.s;
     var col = alb * (F.sunCol.rgb * max(dot(n, s), 0.0) * sh.x * sl.x + F.ambient.rgb * sh.y * sl.z * (0.55 + 0.45 * n.y) + FLASH_COLOR * flashLit(p) * 0.03 + lp.d);
     // wet ground and open water reflect the sky
     let r = reflect(-v, nw);
@@ -3338,6 +3454,91 @@ fn shadeStruct(p: vec3f, nIn: vec3f, colIn: vec3f, mat: i32) -> vec4f {
     }
     let kind = select(select(2.0, 3.0, mat == 3), 4.0, mat == 6);
     return vec4f(col, select(0.0, kind + 0.45 * puddle, rainNow > 0.0 && n.y > 0.7 && !glass));
+}
+
+// Distant lights by night (World.buildFarLights, FAR_FLOATS per instance): each lamp a point sprite added into the scene
+// before the volumetrics, so the haze, rain and cloud in front dim it and the bloom spreads it. It carries the lamp's
+// light reaching the eye (intensity over distance squared) spread over at least a pixel or so, so it fades with
+// distance instead of flickering; near, the real lamp (its diffuser, its light) takes over as the sprite outgrows that.
+// Lighting nothing, it costs one small quad per lamp.
+struct FarOut { @builtin(position) pos: vec4f, @location(0) col: vec3f, @location(1) uv: vec2f };
+
+@vertex fn vsFar(@builtin(vertex_index) vi: u32, @location(0) a: vec4f, @location(1) b: vec4f, @location(2) c: vec4f, @location(3) e: vec4f) -> FarOut {
+    var o: FarOut;
+    o.pos = vec4f(0.0, 0.0, -1.0, 1.0);                                 // dropped (behind the far plane of reversed Z)
+    let clip = F.viewProj * vec4f(a.xyz, 1.0);
+    if (clip.w < 1.0) { return o; }
+    let v = a.xyz - F.cam.xyz;
+    let d = length(v);
+    let pxPerM = F.screen.y * 0.5 / (length(F.up.xyz) * clip.w);
+    let rPhys = a.w * pxPerM;                                           // the lamp's glowing part, radius in pixels
+    // near, the lamp shows itself (its diffuser, lampGlow; a fake one's within POLE_DRAW, vsFarPole) as it grows past a pixel
+    var k = 1.0 - smoothstep(1.0, 2.5, rPhys);
+    if (b.w > 0.5 && d > ${POLE_DRAW}.0) { k = 1.0; }
+    // a narrow beam (headlights) glares inside its cone; outside it only the lamp's housing shows
+    if (c.w > 0.5) { k *= mix(0.08, 1.0, smoothstep(c.w, 1.0, dot(-v / d, c.xyz))); }
+    if (k <= 0.0) { return o; }
+    // half-size R px, profile exp(-4 u^2) (u = 0 .. 1 over R), which sums to ~0.77 R^2 pixels
+    let R = 2.0 * max(rPhys, 0.8);
+    let pixSA = pow(2.0 * length(F.up.xyz) / F.screen.y, 2.0);         // solid angle of a pixel
+    let L = b.rgb * k / (max(F.sunCol.w, 0.2) * d * d * 0.77 * R * R * pixSA);
+    o.col = min(L, vec3f(60.0));
+    var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+    o.uv = corners[vi];
+    o.pos = clip + vec4f(o.uv * R * 2.0 / F.screen.xy * clip.w, 0.0, 0.0);
+    return o;
+}
+
+@fragment fn fsFar(i: FarOut) -> @location(0) vec4f {
+    return vec4f(i.col * exp(-4.0 * dot(i.uv, i.uv)), 0.0);
+}
+
+// A real lamp's pool of light on the ground beyond the lights App.writeLights takes (lampsAt): a decal over its reach,
+// lit as lightAt lights the ground (window, softening, cone) on ground of POOL_ALBEDO, giving way by as much as its real
+// light has come in (farLampReal: the same fade toward F.lightInfo.z), so the pool neither pops in nor doubles
+struct PoolOut { @builtin(position) pos: vec4f, @location(0) world: vec3f, @location(1) col: vec3f, @location(2) @interpolate(flat) lamp: vec4f,
+                 @location(3) @interpolate(flat) axis: vec4f, @location(4) @interpolate(flat) cone: vec2f };
+
+@vertex fn vsFarPool(@builtin(vertex_index) vi: u32, @location(0) a: vec4f, @location(1) b: vec4f, @location(2) c: vec4f, @location(3) e: vec4f) -> PoolOut {
+    var o: PoolOut;
+    o.pos = vec4f(0.0, 0.0, -1.0, 1.0);
+    let fade = smoothstep(F.lightInfo.z * 0.7, F.lightInfo.z, max(distance(a.xyz, F.cam.xyz) - e.y, 0.0));
+    if (F.lightInfo.y < 0.5 || fade <= 0.0 || a.y - e.z > e.y) { return o; }
+    var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+    o.world = vec3f(a.x + corners[vi].x * e.y, e.z + 0.2, a.z + corners[vi].y * e.y);
+    // drawn a little toward the eye (0.5% of the way), so roads lifted over the terrain and its bumps do not hide it
+    o.pos = F.viewProj * vec4f(mix(o.world, F.cam.xyz, 0.005), 1.0);
+    o.col = b.rgb * fade * vec3f(${POOL_ALBEDO}) / max(F.sunCol.w, 0.2);
+    o.lamp = vec4f(a.xyz, e.y);
+    o.axis = vec4f(c.xyz, c.w);
+    o.cone = vec2f(e.x, a.w * a.w);
+    return o;
+}
+
+@fragment fn fsFarPool(i: PoolOut) -> @location(0) vec4f {
+    let d = i.lamp.xyz - i.world;
+    let d2 = dot(d, d);
+    let r2 = i.lamp.w * i.lamp.w;
+    if (d2 >= r2) { discard; }
+    let l = d * inverseSqrt(d2);
+    let x = d2 / r2;
+    let win = sat(1.0 - x * x);
+    var k = win * win / (d2 + i.cone.y) * max(l.y, 0.0);
+    if (i.axis.w > -1.5) { let cc = smoothstep(i.axis.w, i.cone.x, dot(-l, i.axis.xyz)); k *= cc * cc; }
+    return vec4f(i.col * k, 0.0);
+}
+
+// a fake street lamp near the camera (World.nearPoles): the street lamp mesh (Renderer.poleMesh, as Structures.lamp builds
+// one) per instance, at its pole's foot [x, ground, z, yaw], its diffuser (material 7) in the lamp's colour; shaded by fsStruct
+@vertex fn vsFarPole(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec4f, @location(3) at: vec4f, @location(4) glow: vec4f) -> StructOut {
+    let cs = cos(at.w);
+    let sn = sin(at.w);
+    var o: StructOut;
+    o.world = vec3f(at.x + p.x * cs - p.z * sn, at.y + p.y, at.z + p.x * sn + p.z * cs);
+    o.n = vec3f(n.x * cs - n.z * sn, n.y, n.x * sn + n.z * cs);
+    o.col = select(c, vec4f(glow.rgb, c.a), i32(c.a + 0.5) == 7);
+    o.pos = F.viewProj * vec4f(o.world, 1.0);
+    return o;
 }
 `;
 
@@ -4550,7 +4751,7 @@ class Structures {
     // off its axis; none: all round)
     light(kind, pos, dir = null, o = {}) {
         const L = { ...LAMPS[kind], ...o }, cone = L.cone && dir ? [Math.cos(L.cone[0] * DEG), Math.cos(L.cone[1] * DEG)] : null;
-        this.lights.push({ pos, color: L.color, intensity: L.intensity, range: L.range, size: L.size, dir: dir ? v3.norm(dir) : [0, -1, 0], cone });
+        this.lights.push({ pos, color: L.color, intensity: L.intensity, range: L.range, size: L.size, dir: dir ? v3.norm(dir) : [0, -1, 0], cone, tag: L.tag });
     }
 
     // a street lamp standing at [x, z], its arm reaching `reach` m along `toward` ([x, z], over the road): a pole, the arm
@@ -5220,6 +5421,20 @@ class BusLine extends Entity {
         const roadPts = [];
         for (const p of road) { roadPts.push(p); if (dist(p, E1) < 3) break; }
         S.ribbon(roadPts, 3.6, C2.asphalt);
+        // street lamps along the open road, a pair facing each other across it every ROAD_LAMP_STEP m, their arms over it
+        // (lights near the camera, distant sprites further: App.writeLights, World.buildFarLights)
+        for (let k = 0, run = ROAD_LAMP_STEP / 2; k + 1 < roadPts.length; k++) {
+            const a = roadPts[k], b = roadPts[k + 1], len = dist(a, b), t = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+            for (; run < len; run += ROAD_LAMP_STEP) {
+                const c = [a[0] + t[0] * run, a[1] + t[1] * run];
+                if (dist(c, sc) < 200 || dist(c, V.c) < V.R + 40) continue;
+                for (const sd of [-1, 1]) {
+                    const o = [-t[1] * sd, t[0] * sd];
+                    S.lamp(c[0] + o[0] * 4.8, c[1] + o[1] * 4.8, [-o[0], -o[1]], 'sodium', { light: { tag: 'road' } });
+                }
+            }
+            run -= len;
+        }
         for (let k = 0; k + 1 < roadPts.length; k++) {
             const a = roadPts[k], b = roadPts[k + 1];
             if (k % 3 === 0 && dist(a, sc) > 150) S.strip(a, [lerp(a[0], b[0], 0.75), lerp(a[1], b[1], 0.75)], 0.08, C2.paint, 0, 0.17);
@@ -6387,9 +6602,88 @@ class World {
         this.hurricanePos = scenario.hurricane?.pos || [0, 0];
         this.hurricaneCat = 0;
         for (const e of this.entities) e.build(this.structures);
+        // the lit town (streetLights): painted like a town entity, its streets given the fake lamps
+        const sl = scenario.streetLights;
+        this.streetLights = sl ? { pos: sl.pos || this.hurricanePos, radius: sl.radius || 4000, density: sl.density ?? 0.95 } : null;
+        if (this.streetLights) new Town(this.streetLights, this).stamp(this.field);
+        this.buildFarLights();
         for (const e of [...this.entities]) e.spawn();
         for (const e of this.persistent) this.setOff(e, true);     // hidden until the cloud picker (or a view on it) shows them
         this.rainZones = new RainZones(this);
+    }
+
+    // Distant lights by night, fake and cheap (WGSL_FAR): the towns are only painted on the terrain (townColor), so their
+    // street lamps are points on its 120 m street grid, one every FAR_LAMP_PITCH m, kept where the town is dense enough
+    // (with a hash, so its edges thin out), never on water nor near the structures' real lamps. The field's lamp channel
+    // holds that share for the terrain's light pools (streetGlow). farLights: those and the structures' lamps as sprites
+    // (FAR_FLOATS each); glows: the light-pollution domes (cityGlow), each town and each cluster of real lamps
+    buildFarLights() {
+        const f = this.field, S = this.structures, n = f.n, real = new Set();
+        for (const l of S.lights) real.add(clamp(Math.round(f.ci(l.pos[2])), 0, n - 1) * n + clamp(Math.round(f.ci(l.pos[0])), 0, n - 1));
+        const L0 = this.streetLights;
+        f.eachAll((idx, x, z) => {
+            const lit = L0 && Math.hypot(x - L0.pos[0], z - L0.pos[1]) < L0.radius;
+            f.lamp[idx] = !lit || real.has(idx) ? 0 : sat01(f.land[idx * 3] * 1.6 - 0.35) * (1 - sat01(f.land[idx * 3 + 2] * 3));
+        });
+        const out = [], glows = [], seen = new Set(), fake = [], B = TOWN_BLOCK, P = FAR_LAMP_PITCH;
+        const put = (l, fake) => out.push(...l.pos, l.size ?? 0.5, ...l.color.map(c => c * l.intensity), fake ? 1 : 0, ...(l.dir || [0, -1, 0]), l.cone ? l.cone[0] : -2,
+            l.cone ? l.cone[1] : 1, l.range, f.surface(l.pos[0], l.pos[2]), 0);
+        for (const t of L0 ? [L0] : []) {
+            const [cx, cz] = t.pos, r = t.radius;
+            let sum = 0;
+            // lamp at grid point (x, z) of a street along z (alongZ) or x: its pole at the kerb on alternate sides, the
+            // arm over the road, the head FAR_LAMP_SIDE m off the centre line (farLampHead in WGSL)
+            const lamp = (x, z, alongZ) => {
+                if (seen.has(x * 65536 + z)) return;
+                seen.add(x * 65536 + z);
+                if (pcg32(Math.imul(x / P + 65536, 196613) + z / P + 65536) / 4294967295 >= f.landAt(x, z, 3)) return;
+                // a quarter of the districts have newer white LED lamps (farLampColor)
+                const L = LAMPS[pcg32((Math.floor(x / 600) + 1000) * 4099 + Math.floor(z / 600) + 1000) / 4294967295 < 0.25 ? 'led' : 'sodium'];
+                const sd = ((alongZ ? z : x) / P) & 1 ? -1 : 1, ax = alongZ ? [sd, 0] : [0, sd];
+                const pole = [x + ax[0] * (FAR_LAMP_SIDE + FAR_LAMP_REACH), z + ax[1] * (FAR_LAMP_SIDE + FAR_LAMP_REACH)], g = f.surface(...pole);
+                const l = { pos: [x + ax[0] * FAR_LAMP_SIDE, g + FAR_LAMP_H, z + ax[1] * FAR_LAMP_SIDE], color: L.color, intensity: L.intensity,
+                    range: L.range, size: L.size, dir: [0, -1, 0], cone: null,
+                    pole: [pole[0], g, pole[1], Math.atan2(-ax[1], -ax[0]), ...L.color.map(c => 0.55 + 0.45 * c), 0] };
+                put(l, true);
+                fake.push(l);
+                sum += L.intensity;
+            };
+            for (let i = Math.ceil((cx - r) / B); i <= Math.floor((cx + r) / B); i++)
+                for (let z = Math.ceil((cz - r) / P) * P; z <= cz + r; z += P) lamp(i * B, z, true);
+            for (let j = Math.ceil((cz - r) / B); j <= Math.floor((cz + r) / B); j++)
+                for (let x = Math.ceil((cx - r) / P) * P; x <= cx + r; x += P) if (x % B) lamp(x, j * B, false);
+            if (sum) glows.push([cx, cz, r * 0.7, sum]);
+        }
+        // the structures' lamps (a bus's are written each frame, writeFarLights), and a dome per 1.5 km cluster of them
+        this.realFar = [out.length / FAR_FLOATS, S.lights.length];      // their first instance and count (vsFarPool)
+        const cl = new Map();
+        for (const l of S.lights) {
+            put(l, false);
+            if (l.tag === 'road') continue;                              // a country road's lamps light no sky
+            const k = Math.floor(l.pos[0] / 1500) * 65536 + Math.floor(l.pos[2] / 1500), c = cl.get(k) || { x: 0, z: 0, i: 0, n: 0 };
+            c.x += l.pos[0] * l.intensity; c.z += l.pos[2] * l.intensity; c.i += l.intensity; c.n++;
+            cl.set(k, c);
+        }
+        for (const c of cl.values()) if (c.n > 4) glows.push([c.x / c.i, c.z / c.i, 400, c.i]);
+        this.farLights = new Float32Array(out);
+        this.glows = glows.sort((a, b) => b[3] - a[3]).slice(0, MAX_GLOWS);
+        // the fake lamps by FAKE_CELL m cells, for the ones near the camera: real lights (App.writeLights) and poles
+        this.fakeLamps = new Map();
+        for (const l of fake) {
+            const k = this.fakeCell(l.pos[0], l.pos[2]);
+            if (!this.fakeLamps.has(k)) this.fakeLamps.set(k, []);
+            this.fakeLamps.get(k).push(l);
+        }
+    }
+
+    fakeCell(x, z) { return Math.floor(x / 250) * 65536 + Math.floor(z / 250); }
+
+    // the fake street lamps within r (m, horizontally) of p, into out
+    nearFakeLamps(p, r, out) {
+        for (let i = Math.floor((p[0] - r) / 250); i <= Math.floor((p[0] + r) / 250); i++)
+            for (let j = Math.floor((p[2] - r) / 250); j <= Math.floor((p[2] + r) / 250); j++)
+                for (const l of this.fakeLamps.get(i * 65536 + j) || []) if (Math.hypot(l.pos[0] - p[0], l.pos[2] - p[2]) < r) out.push(l);
+        return out;
     }
 
     add(def, spawn = true) {
@@ -6830,6 +7124,24 @@ class Renderer {
         this.pInterior = pipe(layoutA, scene, 'vsStruct', 'fsInterior', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
         this.pDoor = pipe(layoutA, scene, 'vsStruct', 'fsDoor', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
         this.pPane = pipe(layoutA, scene, 'vsStruct', 'fsPane', 'rgba16float', { write: true, compare: 'greater' }, undefined, structVerts);
+        // the distant lights (vsFar): a quad per instance, added
+        const farVerts = [{ arrayStride: FAR_FLOATS * 4, stepMode: 'instance', attributes: [0, 1, 2, 3].map(k => ({ shaderLocation: k, offset: k * 16, format: 'float32x4' })) }];
+        const blendSum = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } };
+        this.pFar = pipe(layoutA, scene, 'vsFar', 'fsFar', 'rgba16float', { write: false, compare: 'greater' }, blendSum, farVerts);
+        this.pFarPool = pipe(layoutA, scene, 'vsFarPool', 'fsFarPool', 'rgba16float', { write: false, compare: 'greater' }, blendSum, farVerts);
+        const poleVerts = [structVerts[0], { arrayStride: 32, stepMode: 'instance', attributes: [3, 4].map((k, i) => ({ shaderLocation: k, offset: i * 16, format: 'float32x4' })) }];
+        this.pFarPole = pipe(layoutA, scene, 'vsFarPole', 'fsStruct', 'rgba16float', { write: true, compare: 'greater' }, undefined, poleVerts);
+        // one street lamp in its own frame (as Structures.lamp builds it, head FAR_LAMP_H up), for every fake one drawn
+        const T = new Structures(null), f = new GroundFrame([0, 0], 0), h = FAR_LAMP_H + 0.3, reach = FAR_LAMP_REACH, C = STRUCT_COLORS;
+        T.cur = [];
+        T.prism(f, 0, 0, 0.08, 0.08, -0.3, h, C.metal, 4);
+        T.prism(f, reach / 2, 0, reach / 2, 0.04, h - 0.07, h, C.metal, 4);
+        T.prism(f, reach, 0, 0.34, 0.15, h - 0.14, h + 0.04, C.metal, 4);
+        T.prism(f, reach, 0, 0.29, 0.12, h - 0.19, h - 0.14, [1, 1, 1], 7);
+        const pm = new Float32Array(T.cur);
+        this.poleMesh = { n: pm.length / STRUCT_FLOATS, buf: makeBuffer(d, pm.byteLength, GPUBufferUsage.VERTEX, pm) };
+        this.poleBuf = makeBuffer(d, MAX_POLES * 32, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+        this.poleCount = 0;
         this.pWindow = pipe(layoutB, final, 'vsWindow', 'fsWindow', this.format, { write: false, compare: 'greater' }, blendAlpha, structVerts);
         this.pComposite = pipe(layoutB, final, 'vsFull', 'fsComposite', this.format, { write: false, compare: 'always' });
         this.pGlass = pipe(layoutGlass, final, 'vsGlass', 'fsGlass', this.format, { write: false, compare: 'greater' }, blendAlpha, structVerts);
@@ -6887,6 +7199,13 @@ class Renderer {
         S.buildings.forEach((b, i) => rec.set(b.record, i * BUILDING_FLOATS));
         this.buildingBuf = makeBuffer(d, rec.byteLength, GPUBufferUsage.STORAGE, rec);
         this.interiorDraws = [];
+        // the distant lights: the static ones (World.buildFarLights), then MAX_FAR_DYN slots for the buses' (writeFarLights)
+        this.farBuf?.destroy();
+        this.farStatic = world.farLights.length / FAR_FLOATS;
+        this.farBuf = makeBuffer(d, (this.farStatic + MAX_FAR_DYN) * FAR_FLOATS * 4, GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST);
+        if (this.farStatic) d.queue.writeBuffer(this.farBuf, 0, world.farLights);
+        this.farCount = 0;
+        this.realFar = world.realFar;
         // the buses, each in its own frame: opaque mesh and glass, and its uniforms (busData, BUS_UNIFORM bytes each); the
         // app lists the ones to draw this frame in busDraws, nearest first
         for (const m of this.busMeshes || []) { m.buf?.destroy(); m.glass?.destroy(); }
@@ -7010,6 +7329,18 @@ class Renderer {
         }
         if (this.doorV.n) { a.setPipeline(this.pDoor); a.setVertexBuffer(0, this.doorV.buf); a.draw(this.doorV.n); }
         if (this.paneV.n) { a.setPipeline(this.pPane); a.setVertexBuffer(0, this.paneV.buf); a.draw(this.paneV.n); }
+        if (this.poleCount) {
+            a.setPipeline(this.pFarPole);
+            a.setVertexBuffer(0, this.poleMesh.buf);
+            a.setVertexBuffer(1, this.poleBuf);
+            a.draw(this.poleMesh.n, this.poleCount);
+        }
+        if (this.farCount) {
+            a.setVertexBuffer(0, this.farBuf);
+            if (this.realFar[1]) { a.setPipeline(this.pFarPool); a.draw(6, this.realFar[1], 0, this.realFar[0]); }
+            a.setPipeline(this.pFar);
+            a.draw(6, this.farCount);
+        }
         a.end();
 
         if (froxels && volumetrics) this.froxelPass.encode(enc, prof);
@@ -7895,6 +8226,7 @@ class App {
         }
         if (night) {
             all.push(...w.structures.lights);
+            w.nearFakeLamps(cam, LIGHT_RANGE + LAMPS.sodium.range, all);    // the fake street lamps near: real lights now
             for (const b of w.buses) if (Math.hypot(b.pose.x - cam[0], b.pose.z - cam[2]) < LIGHT_RANGE + 80) b.lights(all);
         }
         const reach = l => l.first ? -1 : Math.max(v3.len(v3.sub(l.pos, cam)) - l.range, 0);
@@ -7940,7 +8272,38 @@ class App {
         const sigma = 0.0004 + 0.0005 * (c.haze ?? 1) + (out ? 0.012 * this.near.rain + 0.025 * this.near.snow : 0);
         F.set('lights', data);
         F.setBits('lightMask', mask);
-        F.set('lightInfo', [Math.min(list.length, MAX_LIGHTS), night ? 1 : 0, 0, sigma]);
+        F.set('lightInfo', [Math.min(list.length, MAX_LIGHTS), night ? 1 : 0, cut, sigma]);
+        this.writeFarLights(F, night, adapt);
+    }
+
+    // the fake street lamps' poles within POLE_DRAW (vsFarPole), day and night: re-listed when the camera has moved 20 m
+    writePoles() {
+        const r = this.renderer, cam = this.camera.pos, last = this.poleAt;
+        if (last && Math.hypot(cam[0] - last[0], cam[2] - last[2]) < 20 && r.poleWorld === this.world) return;
+        this.poleAt = [...cam];
+        r.poleWorld = this.world;
+        const near = this.world.nearFakeLamps(cam, POLE_DRAW + 20, []).slice(0, MAX_POLES);
+        const data = this.poleData ??= new Float32Array(MAX_POLES * 8);
+        near.forEach((l, i) => data.set(l.pole, i * 8));
+        if (near.length) r.device.queue.writeBuffer(r.poleBuf, 0, data, 0, near.length * 8);
+        r.poleCount = near.length;
+    }
+
+    // the distant lights by night (WGSL_FAR, cityGlow): the buses' lights into the slots after the static ones, the
+    // light-pollution domes into the frame; none by day
+    writeFarLights(F, night, adapt) {
+        const r = this.renderer, w = this.world;
+        this.writePoles();
+        if (!night) { r.farCount = 0; F.set('glowInfo', [0, 0, 0, 0]); return; }
+        const bl = [];
+        for (const b of w.buses) b.lights(bl);
+        const n = Math.min(bl.length, MAX_FAR_DYN), dyn = this.farDyn ??= new Float32Array(MAX_FAR_DYN * FAR_FLOATS);
+        bl.slice(0, n).forEach((l, i) => dyn.set([...l.pos, l.size ?? 0.5, ...l.color.map(c => c * l.intensity), 0, ...l.dir, l.cone ? l.cone[0] : -2,
+            l.cone ? l.cone[1] : 1, l.range, l.pos[1], 0], i * FAR_FLOATS));
+        if (n) r.device.queue.writeBuffer(r.farBuf, r.farStatic * FAR_FLOATS * 4, dyn, 0, n * FAR_FLOATS);
+        r.farCount = r.farStatic + n;
+        F.set('glows', w.glows.flat());
+        F.set('glowInfo', [w.glows.length, GLOW_GAIN / Math.PI * adapt, 0, 0]);
     }
 
     writeFrame(dt, wdt) {

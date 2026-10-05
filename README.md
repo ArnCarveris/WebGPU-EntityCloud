@@ -444,6 +444,8 @@ ride or else the nearest, as one box in its frame (`busInv`, `cabinLo`, `cabinHi
 With a night lighting preset (`moon`), the street lamps come on, and the buses drive with their lights. Each is a point or
 spot light (`LAMPS` holds their colours, intensities, reach and cones):
 
+- **Bus road**: a pair of sodium street lamps every 100 m along the open road between the station and the village, one on
+  each kerb, their arms over the road (`ROAD_LAMP_STEP`).
 - **Village**: sodium street lamps on poles every 34 m along both streets, on alternate kerbs, their arms over the road
   (none on the bridge, at the junction or by the shelter), and a light strip under the bus shelter's roof.
 - **Bus station**: LED lamp posts round the forecourt (clear of the buses' way in), the canopy's soffit strips glowing
@@ -477,6 +479,42 @@ only loops over those. They light everything:
 
 At night the rods wash colours out to a cold grey (`tonemap`), less where a lamp lights the scene brightly enough, so a
 sodium pool stays orange.
+
+#### Distant lights
+
+Lights beyond that 700 m are faked, at about 0.1 ms of GPU time (none by day), and become ordinary lights as the camera
+nears them without the switch showing:
+
+- **Town street lamps** (`World.buildFarLights`): the scenario's `streetLights` paints a town centred on the hurricane's
+  position (or its own `pos`), with `radius` and `density`, and lights its streets. The other towns stay dark. The towns
+  are only painted on the terrain, so these lamps are points every 40 m along `townColor`'s 120 m street grid. Each one's pole stands at a kerb, on alternate sides, and its head
+  is 7 m up and 5 m off the centre line. A hash keeps a share of them that falls off toward the town's edge. None are
+  placed on water or in the field texels that hold real lamps. A quarter of the districts get white LEDs instead of
+  sodium. The share is the land texture's alpha.
+- **Sprites** (`vsFar` / `fsFar`): every lamp, real or fake, and the buses' lights are drawn as an instanced quad,
+  added into the scene before the volumetrics. Haze, rain and cloud in front of a lamp dim it, and the bloom spreads it.
+  Each sprite carries the lamp's intensity over the distance squared, spread over at least about a pixel, so far lamps
+  fade instead of flickering. As the lamp grows past a pixel, its own diffuser takes over. Headlights glare only inside
+  their cone.
+- **Poles** (`vsFarPole`): within 1 km, the fake lamps get the street lamp mesh, instanced. Each instance has the
+  diffuser in the lamp's colour and is shaded like any structure, so up close they look the same as the village's
+  lamps.
+- **Light pools** (`streetGlow`): the terrain under the fake lamps is lit by the nearest lamp on each of the two nearest
+  streets, using the same hash and the same falloff, highlight and size as a real light (`lightAt`, `lampsAt`), so
+  each pool sits under its lamp and wet roads reflect it. Far off, where a pixel spans many lamps, it uses their mean
+  instead.
+- **Becoming real lights**: `App.writeLights` also takes the fake lamps near the camera, so they compete for the 64
+  slots with the structures' lamps. Those taken then light everything, cast shadows, and get halos in rain. The furthest
+  ones fade out toward the cut, which goes to the frame (`lightInfo.z`). A lamp's pool (`farLampReal`) gives way by
+  exactly the weight its real light fades in, so the ground looks the same either way. An A/B of the two differs no
+  more than two frames of the same setting do.
+- **Far pools of real lamps** (`vsFarPool` / `fsFarPool`): past the lights `writeLights` takes, a real lamp (the bus
+  road's, the village's, the station's) keeps its pool as a decal on the ground. The decal is lit with the same falloff
+  and cone, on ground of `POOL_ALBEDO`, and fades in as the lamp's real light fades out, so a pool neither pops nor
+  doubles as you approach. It is drawn 0.5 % of the way toward the eye, so the lifted road does not hide it.
+- **Light pollution** (`cityGlow`): each town, and each cluster of real lamps, is a disc of lamps on the ground of its
+  radius. It lights the cloud base from below, along with the haze and the rain over it, which tints overcast warm over
+  a town and puts a glowing dome over the horizon. The froxel volume holds it under the cloud base in its spare channel.
 
 ### Analytic storm structures
 
