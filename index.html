@@ -84,6 +84,8 @@
         .tag { font-family: 'Share Tech Mono', monospace; font-size: 11px; letter-spacing: 0.12em; color: var(--danger); }
         h1 { margin: 4px 0 2px; font-size: 24px; letter-spacing: 0.04em; text-transform: uppercase; }
         .desc { margin: 0 0 12px; font-size: 14px; color: var(--muted); }
+        .gpu-pick { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-family: 'Share Tech Mono', monospace; font-size: 12px; color: var(--muted); }
+        .gpu-pick select { flex: 1; min-width: 0; background: #0a141a; color: var(--text); border: 1px solid var(--line); font: inherit; padding: 2px 4px; cursor: pointer; }
         #fallback pre { white-space: pre-wrap; font-family: 'Share Tech Mono', monospace; font-size: 12px; color: var(--danger); background: rgba(0,0,0,0.4); padding: 10px; margin: 10px 0 0; max-height: 40vh; overflow: auto; }
         @media (max-width: 700px) {
             #help { display: none; } #hud { font-size: 10px; min-width: 0; }
@@ -7054,12 +7056,121 @@ class GpuProfiler {
 }
 
 // =====================================================================================================
+// GPU choice
+// =====================================================================================================
+// WebGPU cannot list the adapters, a page can only ask for one by power preference (or for the software
+// fallback), so those are the choices. The pick is kept in localStorage (?gpu=<id> in the URL overrides it) and takes
+// effect on a reload: every GPU resource belongs to the device made from the adapter.
+
+const GpuChoice = {
+    CHOICES: [
+        { id: 'default', label: 'browser default', options: {} },
+        { id: 'high-performance', label: 'high performance', options: { powerPreference: 'high-performance' } },
+        { id: 'low-power', label: 'low power', options: { powerPreference: 'low-power' } },
+        { id: 'fallback', label: 'software', options: { forceFallbackAdapter: true } },
+    ],
+    INITIAL: 'high-performance',     // until something is picked
+    STORAGE_KEY: 'webgpu-entity.gpu',
+    names: null,                     // { id: adapter name | null } once probed
+
+    get id() {
+        let id = new URLSearchParams(location.search).get('gpu');
+        if (!id) try { id = localStorage.getItem(this.STORAGE_KEY); } catch { /* storage blocked */ }
+        return this.CHOICES.some(c => c.id === id) ? id : this.INITIAL;
+    },
+
+    // the adapter of the current choice, or the browser default when that choice has none
+    async requestAdapter() {
+        const choice = this.CHOICES.find(c => c.id === this.id);
+        let adapter = await navigator.gpu.requestAdapter(choice.options);
+        if (!adapter && choice.id !== 'default') {
+            console.warn(`GPU choice '${choice.label}' has no adapter, using the browser default`);
+            adapter = await navigator.gpu.requestAdapter();
+        }
+        return adapter;
+    },
+
+    // The GPU's product name, as Task Manager shows it. WebGPU only gives it with the browser's WebGPU developer features
+    // on (else just vendor + architecture, "nvidia ampere"), so it is taken from WebGL's renderer string for the same
+    // power preference when that names a GPU of the adapter's vendor.
+    describe(adapter, options = {}) {
+        const info = adapter.info || {};
+        if (info.description) return info.description;
+        if (info.isFallbackAdapter) return 'software (CPU)';
+        const vendor = info.vendor || '';
+        const aliases = { amd: ['amd', 'ati', 'radeon'], qualcomm: ['qualcomm', 'adreno'] }[vendor] || [vendor];
+        const gl = this.webglRenderer(options.powerPreference);
+        if (gl && vendor && aliases.some(a => gl.toLowerCase().includes(a))) return gl;
+        return [vendor, info.architecture].filter(Boolean).join(' ') || 'unknown GPU';
+    },
+
+    // "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 Ti Laptop GPU (0x000025A0) Direct3D11 vs_5_0 ps_5_0, D3D11)" ->
+    // "NVIDIA GeForce RTX 3050 Ti Laptop GPU"; null where the browser hides it
+    webglRenderer(powerPreference = 'default') {
+        try {
+            const gl = document.createElement('canvas').getContext('webgl', { powerPreference });
+            const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+            const s = ext && gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+            gl?.getExtension('WEBGL_lose_context')?.loseContext();
+            if (!s) return null;
+            const angle = /^ANGLE \((.*)\)$/.exec(s);
+            const name = angle ? angle[1].split(', ').slice(1, -1).join(', ') || angle[1] : s;
+            return name.replace(/^ANGLE \w+ Renderer: /, '').replace(/\s*\(0x[0-9a-f]+\).*$|\s+(Direct3D|OpenGL|Vulkan|Metal)\b.*$/i, '').trim() || null;
+        } catch {
+            return null;
+        }
+    },
+
+    // which GPU each choice gets on this machine
+    probe() {
+        return this.probing ||= Promise.all(this.CHOICES.map(c => navigator.gpu
+            ? navigator.gpu.requestAdapter(c.options).then(a => a && this.describe(a, c.options), () => null) : null))
+            .then(names => this.names = Object.fromEntries(this.CHOICES.map((c, i) => [c.id, names[i]])));
+    },
+
+    pick(id) {
+        if (id === this.id) return;
+        try { localStorage.setItem(this.STORAGE_KEY, id); } catch { /* storage blocked: the URL still carries it */ }
+        const url = new URL(location.href);
+        url.searchParams.set('gpu', id);
+        location.replace(url);
+    },
+
+    // a <select> of the choices, each labelled with the adapter it gets; picking one reloads the page
+    select() {
+        const sel = document.createElement('select');
+        sel.title = 'GPU adapter (picking one reloads the page)';
+        sel.innerHTML = this.CHOICES.map(c => `<option value="${c.id}">${c.label}</option>`).join('');
+        sel.value = this.id;
+        sel.addEventListener('change', () => this.pick(sel.value));
+        sel.addEventListener('keydown', e => e.stopPropagation());     // keep the demo's keys out of the open list
+        this.probe().then(names => {
+            for (const o of sel.options) {
+                const c = this.CHOICES.find(c => c.id === o.value);
+                o.textContent = `${c.label} · ${names[c.id] || 'none'}`;
+                o.disabled = !names[c.id] && !o.selected;
+            }
+        });
+        return sel;
+    },
+
+    // <label>GPU <select></label>
+    panel() {
+        const el = document.createElement('label');
+        el.className = 'gpu-pick';
+        el.innerHTML = '<span>GPU</span>';
+        el.appendChild(this.select());
+        return el;
+    },
+};
+
+// =====================================================================================================
 // Renderer
 // =====================================================================================================
 class Renderer {
     async init(canvas) {
         if (!navigator.gpu) throw new Error('navigator.gpu is undefined');
-        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        const adapter = await GpuChoice.requestAdapter();
         if (!adapter) throw new Error('No WebGPU adapter available');
         this.device = await adapter.requestDevice({ requiredFeatures: adapter.features.has('timestamp-query') ? ['timestamp-query'] : [] });
         this.profiler = new GpuProfiler(this.device, ['weather', 'ground', 'scene', 'froxel', 'tiles', 'march', 'resolve', 'bloom', 'final']);
@@ -7892,8 +8003,12 @@ class App {
         this.menus.lighting.set(this.lightName, lights.map(n => radio(n, n === this.lightName, () => this.pickLight(n))), lights.length > 1);
         this.menus.quality.set(QUALITY[this.quality].name, QUALITY.map((q, i) => radio(`${q.name} · ${q.scale * 100}% · ${q.steps} steps`, i === this.quality, () => this.setQuality(i))));
         this.menus.render.set(RENDER_MODES[this.mode], RENDER_MODES.map((m, i) => radio(m, i === this.mode, () => this.setMode(i))));
-        const prof = this.renderer.profiler;
+        const prof = this.renderer.profiler, names = GpuChoice.names || {};
         this.menus.gpu.set([this.froxels && 'froxels', this.tiles && 'tiles', this.bloom && 'bloom'].filter(Boolean).join(' + ') || 'basic', [
+            // the adapter (picking one reloads the page), each with the GPU it gets here; one with none can't be picked
+            ...GpuChoice.CHOICES.map(c => names[c.id] === null ? { label: c.label, kind: 'info', key: 'none' }
+                : { label: c.label, kind: 'radio', on: c.id === GpuChoice.id, key: names[c.id] || '', pick: () => GpuChoice.pick(c.id) }),
+            { sep: true },
             { label: `froxel lighting ${FROXEL.join('×')}`, kind: 'check', on: this.froxels, pick: () => this.toggleFroxels() },
             { label: 'cloud tile pre-pass', kind: 'check', on: this.tiles, pick: () => this.toggleTiles() },
             { label: 'bloom', kind: 'check', on: this.bloom, pick: () => this.toggleBloom() },
@@ -8059,7 +8174,10 @@ class App {
         if (e) this.setCloud(this.cloudFocus, !!e.off);
     }
 
-    async start() { await this.renderer.init(this.canvas); }
+    async start() {
+        GpuChoice.probe();
+        await this.renderer.init(this.canvas);
+    }
 
     load(scenario) {
         const world = new World(scenario);
@@ -8490,6 +8608,8 @@ class App {
 function showFallback(e) {
     console.error(e);
     document.getElementById('error-message').textContent = String(e && (e.stack || e.message) || e);
+    const card = document.querySelector('#fallback .card');
+    if (!card.querySelector('.gpu-pick')) card.appendChild(GpuChoice.panel());
     document.getElementById('fallback').classList.add('show');
 }
 
